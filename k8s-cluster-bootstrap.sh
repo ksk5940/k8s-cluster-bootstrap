@@ -43,7 +43,7 @@ UPGRADE_MODE=false
 RESET_MODE=false
 DESTROY_MODE=false
 
-TOTAL_STEPS=16
+TOTAL_STEPS=20
 CURRENT_STEP=0
 
 K8S_VERSION_FILE="/etc/kubernetes/k8s-version.txt"
@@ -214,9 +214,9 @@ parse_arguments() {
 # ════════════════════════════════════════════════════════════════════════════
 check_root() {
   if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}╔═════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}║  ⚠️  ROOT ACCESS REQUIRED                                ║${NC}"
-    echo -e "${RED}╚═════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${RED}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║  ⚠️  ROOT ACCESS REQUIRED                                        ║${NC}"
+    echo -e "${RED}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo -e "${YELLOW}Run as: ${WHITE}sudo ./k8s-cluster-bootstrap.sh $*${NC}"
     exit 1
   fi
@@ -318,26 +318,36 @@ run_cmd() {
 
 progress() {
   CURRENT_STEP=$((CURRENT_STEP + 1))
-  local PCT=$((CURRENT_STEP * 100 / TOTAL_STEPS))
-  local FILLED=$CURRENT_STEP
-  local EMPTY=$((48 - CURRENT_STEP))
+  local PCT=$(( CURRENT_STEP * 100 / TOTAL_STEPS ))
+  local BAR_WIDTH=50
+  local FILLED=$(( PCT * BAR_WIDTH / 100 ))
+  local EMPTY=$(( BAR_WIDTH - FILLED ))
   [[ $EMPTY -lt 0 ]] && EMPTY=0
-  local BAR; BAR=$(printf "%${FILLED}s" | tr ' ' '█')
+  local BAR; BAR=$(printf '%0.s█' $(seq 1 $FILLED 2>/dev/null) 2>/dev/null || printf "%${FILLED}s" | tr ' ' '█')
   local SPC; SPC=$(printf "%${EMPTY}s")
-  printf "\n${CYAN}╔═════════════════════════════════════════════════════════╗${NC}\n"
-  printf "${CYAN}║${NC} ${YELLOW}Progress: [%3d%%] %s%s${CYAN}║${NC}\n" "$PCT" "$BAR" "$SPC"
-  printf "${CYAN}╚═════════════════════════════════════════════════════════╝${NC}\n"
+  printf "\n${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}\n"
+  printf "${CYAN}║${NC}  ${YELLOW}Progress:${NC} ${WHITE}[%3d%%]${NC} ${GREEN}%s${DIM}%s${NC}  ${CYAN}║${NC}\n" "$PCT" "$BAR" "$SPC"
+  printf "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
+}
+
+progress_complete() {
+  local BAR; BAR=$(printf '%0.s█' $(seq 1 50))
+  printf "\n${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}\n"
+  printf "${CYAN}║${NC}  ${YELLOW}Progress:${NC} ${WHITE}[100%%]${NC} ${GREEN}%s${NC}  ${CYAN}║${NC}\n" "$BAR"
+  printf "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
 }
 
 print_header() {
   local title="$1"
-  local pad=$(( 57 - ${#title} ))
+  local BOX_INNER=64          # characters between the ║ borders
+  local title_len=${#title}
+  local pad=$(( BOX_INNER - title_len - 2 ))   # 2 = leading spaces
   [[ $pad -lt 0 ]] && pad=0
   local spc; spc=$(printf "%${pad}s")
   echo ""
-  echo -e "${BLUE}╔═════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════╗${NC}"
   echo -e "${BLUE}║${NC}  ${BOLD}${CYAN}${title}${NC}${spc}${BLUE}║${NC}"
-  echo -e "${BLUE}╚═════════════════════════════════════════════════════════╝${NC}"
+  echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════╝${NC}"
   echo ""
 }
 
@@ -400,9 +410,9 @@ configure_timezone() {
     systemctl enable --now systemd-timesyncd
     systemctl restart systemd-timesyncd
   elif [[ "$OS" =~ (rhel|rocky|centos|almalinux) ]]; then
-    command -v chronyd &>/dev/null || $PKG_INSTALL chrony
-    systemctl enable --now chronyd
-    chronyc makestep
+    command -v chronyd &>/dev/null || $PKG_INSTALL chrony >> "$LOG_FILE" 2>&1
+    systemctl enable --now chronyd >> "$LOG_FILE" 2>&1
+    chronyc makestep >> "$LOG_FILE" 2>&1
   fi
 }
 
@@ -764,7 +774,7 @@ gpgcheck=1
 gpgkey=https://pkgs.k8s.io/core:/stable:/v${minor}/rpm/repodata/repomd.xml.key
 exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
 REOF
-    dnf makecache --disablerepo="*" --enablerepo="kubernetes"
+    dnf makecache --disablerepo="*" --enablerepo="kubernetes" >> "$LOG_FILE" 2>&1
     echo -e "${GREEN}   ✓ DNF repo → pkgs.k8s.io/core:/stable:/v${minor}/rpm/${NC}"
   fi
 }
@@ -775,7 +785,7 @@ REOF
 show_static_version_table() {
   echo ""
   echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BLUE}║${NC}         ${BOLD}${WHITE}KUBERNETES VERSION SELECTION${NC}                         ${BLUE}║${NC}"
+  echo -e "${BLUE}║${NC}         ${BOLD}${WHITE}KUBERNETES VERSION SELECTION${NC}                           ${BLUE}║${NC}"
   echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════╝${NC}"
   echo ""
   echo -e "${CYAN}  Supported stable versions from pkgs.k8s.io:${NC}"
@@ -875,9 +885,9 @@ select_k8s_version() {
 
   if [[ "$_ALL_PRESENT" == true ]]; then
     echo ""
-    echo -e "${GREEN}╔═════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║  ✔  KUBERNETES ALREADY INSTALLED                        ║${NC}"
-    echo -e "${GREEN}╚═════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${GREEN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║  ✔  KUBERNETES ALREADY INSTALLED                                 ║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "  ${CYAN}Installed versions:${NC}"
     echo -e "   ${GREEN}✓${NC} kubeadm  : ${WHITE}v${KUBEADM_VER}${NC}"
@@ -930,10 +940,22 @@ select_k8s_version() {
   # ── NO TOOLS INSTALLED: fresh install — ask user ─────────────────────────
   show_static_version_table
 
+  local _DEFAULT_VER="1.30.2"
+  echo -e "  ${DIM}⏱  Auto-selecting ${WHITE}${_DEFAULT_VER}${DIM} (LTS default) in ${WHITE}30s${DIM} if no input...${NC}"
+  echo ""
+
   while true; do
-    prompt_input "Enter Kubernetes version (e.g. 1.32.3): " K8S_VERSION
+    local _INPUT=""
+    # Read with 30-second timeout; on timeout use default
+    if read -r -t 30 -p "$(printf "${CYAN}Enter Kubernetes version (e.g. 1.32.3): ${NC}")" _INPUT; then
+      K8S_VERSION="${_INPUT:-${_DEFAULT_VER}}"
+    else
+      echo ""
+      echo -e "  ${YELLOW}⏱  No input — using default: ${WHITE}${_DEFAULT_VER}${NC}"
+      K8S_VERSION="$_DEFAULT_VER"
+    fi
     K8S_VERSION="${K8S_VERSION#v}"
-    [[ -z "$K8S_VERSION" ]] && { echo -e "${RED}  ❌ Cannot be empty${NC}"; continue; }
+    [[ -z "$K8S_VERSION" ]] && K8S_VERSION="$_DEFAULT_VER"
     [[ ! "$K8S_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
       { echo -e "${RED}  ❌ Invalid format — use x.y.z (e.g. 1.32.3)${NC}"; continue; }
 
@@ -1015,7 +1037,15 @@ setup_container_runtime() {
   echo -e "    ${WHITE}1${NC}) containerd  ${GREEN}(default — most stable, recommended)${NC}"
   echo -e "    ${WHITE}2${NC}) CRI-O       ${DIM}(OCI-native, Kubernetes-focused)${NC}"
   echo ""
-  local RC; prompt_input "  Choice (1/2, default 1): " RC "1"
+  echo -e "  ${DIM}⏱  Auto-selecting ${WHITE}containerd${DIM} in ${WHITE}30s${DIM} if no input...${NC}"
+  echo ""
+  local RC=""
+  if ! read -r -t 30 -p "$(printf "${CYAN}  Choice (1/2, default 1): ${NC}")" RC; then
+    echo ""
+    echo -e "  ${YELLOW}⏱  No input — using default: containerd${NC}"
+    RC="1"
+  fi
+  RC="${RC:-1}"
 
   if [[ "$RC" == "2" ]]; then
     local CM="${K8S_VERSION%.*}" COK=false
@@ -1157,15 +1187,15 @@ DCEOF
 
     # Import GPG key into RPM keyring so gpgcheck=1 passes without prompting
     echo -e "${CYAN}    ⬇  Importing Docker GPG key...${NC}"
-    rpm --import https://download.docker.com/linux/centos/gpg || true
+    rpm --import https://download.docker.com/linux/centos/gpg >> "$LOG_FILE" 2>&1 || true
 
     # Refresh metadata for the docker repo only
     echo -e "${CYAN}    ⬇  Refreshing Docker repo metadata...${NC}"
-    dnf makecache --enablerepo="docker-ce-stable" || true
+    dnf makecache --enablerepo="docker-ce-stable" >> "$LOG_FILE" 2>&1 || true
 
     # Install containerd.io — the Docker-packaged build with runc bundled
     echo -e "${CYAN}    ⬇  Installing containerd.io from Docker repo (this may take a minute)...${NC}"
-    dnf install -y --enablerepo="docker-ce-stable" containerd.io
+    dnf install -y -q --enablerepo="docker-ce-stable" containerd.io >> "$LOG_FILE" 2>&1
 
     # ── Fallback 1: EPEL containerd package ──────────────────────────────────
     # If Docker repo install failed (e.g. firewall, proxy), try EPEL which
@@ -1175,17 +1205,17 @@ DCEOF
       log "Fallback: installing containerd from EPEL"
       if ! rpm -q epel-release &>/dev/null; then
         echo -e "${CYAN}    ⬇  Installing EPEL release...${NC}"
-        dnf install -y epel-release || true
+        dnf install -y -q epel-release >> "$LOG_FILE" 2>&1 || true
       fi
       echo -e "${CYAN}    ⬇  Installing containerd from EPEL (this may take a minute)...${NC}"
-      dnf install -y --enablerepo="epel" containerd || true
+      dnf install -y -q --enablerepo="epel" containerd >> "$LOG_FILE" 2>&1 || true
     fi
 
     # ── Fallback 2: distro containerd (AppStream / BaseOS) ───────────────────
     if ! command -v containerd &>/dev/null; then
       echo -e "${YELLOW}    ⚠️  EPEL containerd not available — trying distro containerd...${NC}"
       log "Fallback: installing containerd from distro repos"
-      dnf install -y containerd || true
+      dnf install -y -q containerd >> "$LOG_FILE" 2>&1 || true
     fi
 
     # ── Final check — hard exit if nothing worked ─────────────────────────────
@@ -1206,8 +1236,8 @@ DCEOF
 ensure_versionlock_plugin() {
   # Install plugin if not present
   if ! dnf versionlock --help &>/dev/null 2>&1; then
-    dnf install -y "dnf-plugin-versionlock" || \
-      dnf install -y "python3-dnf-plugin-versionlock" || true
+    dnf install -y -q "dnf-plugin-versionlock" >> "$LOG_FILE" 2>&1 || \
+      dnf install -y -q "python3-dnf-plugin-versionlock" >> "$LOG_FILE" 2>&1 || true
   fi
   # Create the versionlock list file if it doesn't exist yet —
   # dnf versionlock errors with ENOENT if the file is absent even after plugin install
@@ -1229,8 +1259,8 @@ pin_k8s_packages() {
   else
     ensure_versionlock_plugin
     for pkg in "${pkgs[@]}"; do
-      dnf versionlock delete "$pkg" || true
-      dnf versionlock add    "$pkg"
+      dnf versionlock delete "$pkg" >> "$LOG_FILE" 2>&1 || true
+      dnf versionlock add    "$pkg" >> "$LOG_FILE" 2>&1
       echo -e "   ${GREEN}✓ $pkg — locked${NC}"
     done
   fi
@@ -1744,9 +1774,9 @@ wait_for_master_pods_ready() {
 
     if [[ "$all_ready" == true ]]; then
       echo ""
-      echo -e "${GREEN}╔═════════════════════════════════════════════════════════╗${NC}"
-      echo -e "${GREEN}║  ${BOLD}✔  ALL CLUSTER PODS READY${NC}                              ${GREEN}║${NC}"
-      echo -e "${GREEN}╚═════════════════════════════════════════════════════════╝${NC}"
+      echo -e "${GREEN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+      echo -e "${GREEN}║  ${BOLD}✔  ALL CLUSTER PODS READY${NC}                                        ${GREEN}║${NC}"
+      echo -e "${GREEN}╚══════════════════════════════════════════════════════════════════╝${NC}"
       echo ""
       _pod_status_line "CoreDNS"    $DNS_RDY   $DNS_TOT
       _pod_status_line "kube-proxy" $PROXY_RDY $PROXY_TOT
@@ -1903,7 +1933,15 @@ select_and_deploy_cni() {
   echo -e "  ${CYAN}1${NC}) Calico  ${DIM}(VXLAN=Always · IPIP=Never · BGP=Never · bird=none)${NC}"
   echo -e "  ${CYAN}2${NC}) Flannel ${DIM}(VXLAN · Port 8472 · CIDR 10.244.0.0/16)${NC}"
   echo ""
-  local CS; prompt_input "  Choice (1 or 2, default 1): " CS "1"
+  echo -e "  ${DIM}⏱  Auto-selecting ${WHITE}Calico${DIM} in ${WHITE}30s${DIM} if no input...${NC}"
+  echo ""
+  local CS=""
+  if ! read -r -t 30 -p "$(printf "${CYAN}  Choice (1 or 2, default 1): ${NC}")" CS; then
+    echo ""
+    echo -e "  ${YELLOW}⏱  No input — using default: Calico${NC}"
+    CS="1"
+  fi
+  CS="${CS:-1}"
   case "$CS" in
     2) CNI_CHOICE="flannel"; echo -e "${GREEN}✓ CNI: Flannel (VXLAN, Port 8472)${NC}" ;;
     *) CNI_CHOICE="calico";  echo -e "${GREEN}✓ CNI: Calico (VXLAN=Always · IPIP=Never · BGP=Never)${NC}" ;;
@@ -2418,17 +2456,37 @@ resolvConf: ${RESOLV_CONF}
 KCFG_EOF
 
     # ── Pre-flight: verify hostname resolves to HOST_ONLY_IP, not loopback ───
-    # If 127.0.1.1 → hostname exists above the real entry, kubeadm init will
-    # bind the API server to 127.0.1.1 and the cluster will be unreachable.
+    # getent hosts on Rocky/RHEL may return IPv6 link-local (fe80::) first.
+    # Use getent ahostsv4 to force IPv4-only resolution, then fall back to
+    # /etc/hosts direct grep if ahostsv4 is unavailable.
     local _RESOLVED_IP
-    _RESOLVED_IP=$(getent hosts "$(hostname)" 2>/dev/null | awk '{print $1}' | head -1)
+    if getent ahostsv4 "$(hostname)" &>/dev/null 2>&1; then
+      _RESOLVED_IP=$(getent ahostsv4 "$(hostname)" 2>/dev/null \
+        | awk '{print $1}' | grep -v '^127\.' | head -1)
+    else
+      _RESOLVED_IP=$(getent hosts "$(hostname)" 2>/dev/null \
+        | awk '{print $1}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+        | grep -v '^127\.' | head -1)
+    fi
     if [[ "$_RESOLVED_IP" != "$MASTER_IP" ]]; then
-      echo -e "${RED}❌ Hostname '$(hostname)' resolves to '${_RESOLVED_IP}' — expected '${MASTER_IP}'${NC}"
-      echo -e "${YELLOW}   Fixing /etc/hosts: removing stale loopback alias...${NC}"
-      sed -i "/^127\.0\.1\.1[[:space:]]\+$(hostname)/d" /etc/hosts
-      _RESOLVED_IP=$(getent hosts "$(hostname)" 2>/dev/null | awk '{print $1}' | head -1)
+      echo -e "${RED}❌ Hostname '$(hostname)' resolves to '${_RESOLVED_IP:-none}' — expected '${MASTER_IP}'${NC}"
+      echo -e "${YELLOW}   Fixing /etc/hosts: removing stale entries for $(hostname)...${NC}"
+      # Remove ALL stale hostname entries (loopback, wrong IP, IPv6-only aliases)
+      sed -i "/[[:space:]]\+$(hostname)\([[:space:]]\|$\)/d" /etc/hosts
+      # Write the correct entry
+      printf "%s\t%s\n" "${MASTER_IP}" "$(hostname)" >> /etc/hosts
+      log "/etc/hosts: replaced stale entries for $(hostname) with ${MASTER_IP}"
+      # Re-verify with IPv4-only lookup
+      if getent ahostsv4 "$(hostname)" &>/dev/null 2>&1; then
+        _RESOLVED_IP=$(getent ahostsv4 "$(hostname)" 2>/dev/null \
+          | awk '{print $1}' | grep -v '^127\.' | head -1)
+      else
+        _RESOLVED_IP=$(getent hosts "$(hostname)" 2>/dev/null \
+          | awk '{print $1}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+          | grep -v '^127\.' | head -1)
+      fi
       if [[ "$_RESOLVED_IP" != "$MASTER_IP" ]]; then
-        echo -e "${RED}❌ Still resolves to '${_RESOLVED_IP}' — check /etc/hosts manually${NC}"
+        echo -e "${RED}❌ Still resolves to '${_RESOLVED_IP:-none}' — check /etc/hosts manually${NC}"
         cat /etc/hosts
         exit 1
       fi
@@ -2491,12 +2549,14 @@ KCFG_EOF
   # to /etc/cni/net.d/ BEFORE any other pod (coredns, calico-kube-controllers)
   # is allowed to schedule.  If we remove the taint first, coredns races with
   # calico-node init and gets stuck with "cni plugin not initialized".
+  progress
   select_and_deploy_cni
 
   # ── Wait for calico-node to be 1/1 Ready AND CNI conflist on disk ───────────
   # The node won't go Ready until calico-node writes /etc/cni/net.d/*.conflist.
   # We gate on BOTH conditions so there is zero race between CNI init and
   # coredns/calico-kube-controllers being scheduled after taint removal.
+  progress
   echo -e "${YELLOW}⏳ Waiting for calico-node Ready and CNI plugin initialized...${NC}"
   local _CW=0 _CMAX=300
   while [[ $_CW -lt $_CMAX ]]; do
@@ -2537,21 +2597,38 @@ KCFG_EOF
     sleep 5; W=$((W+5))
   done
 
-  # ── NOW remove control-plane taint — CNI is fully ready, safe to schedule ───
-  # coredns and calico-kube-controllers will be scheduled only after this point,
-  # guaranteeing the network plugin is initialized before any pod needs it.
-  echo -e "${CYAN}  Removing control-plane scheduling taint...${NC}"
-  kubectl taint node "$NN" node-role.kubernetes.io/control-plane:NoSchedule- \
+  # ── Patch CoreDNS + calico-kube-controllers tolerations instead of removing taint ─
+  progress
+  # The control-plane taint (node-role.kubernetes.io/control-plane:NoSchedule)
+  # is intentionally KEPT on the master node — removing it is unsafe and
+  # unnecessary. Calico DaemonSets already tolerate it (operator: Exists).
+  # CoreDNS and calico-kube-controllers do NOT tolerate it by default, so we
+  # patch their Deployments to add the specific toleration — same result as
+  # taint removal but without exposing the master to arbitrary workloads.
+  echo -e "${CYAN}  Patching CoreDNS tolerations for control-plane scheduling...${NC}"
+  kubectl patch deployment coredns -n kube-system --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/tolerations/-","value":{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}}]' \
     >> "$LOG_FILE" 2>&1 || true
-  log "Removed control-plane:NoSchedule taint from ${NN}"
-  echo -e "${GREEN}  ✓ control-plane taint removed — coredns and CNI controllers can now schedule${NC}"
+  echo -e "${GREEN}  ✓ CoreDNS toleration added${NC}"
 
-  # node.kubernetes.io/not-ready is managed by kubelet automatically.
-  # It is removed by kubelet itself once the node condition is True.
-  # We do NOT forcibly remove it here — that would be a no-op or race.
+  echo -e "${CYAN}  Patching calico-kube-controllers tolerations...${NC}"
+  kubectl patch deployment calico-kube-controllers -n kube-system --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/tolerations/-","value":{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}}]' \
+    >> "$LOG_FILE" 2>&1 || true
+  echo -e "${GREEN}  ✓ calico-kube-controllers toleration added${NC}"
 
-  wait_for_master_pods_ready && print_bootstrap_complete_master || \
-    { echo -e "${RED}❌ Cluster not fully ready — check $LOG_FILE${NC}"; exit 1; }
+  # Restart pods so they re-schedule with the new tolerations
+  kubectl rollout restart deployment/coredns -n kube-system >> "$LOG_FILE" 2>&1 || true
+  kubectl rollout restart deployment/calico-kube-controllers -n kube-system >> "$LOG_FILE" 2>&1 || true
+  echo -e "${GREEN}  ✓ control-plane taint preserved — pods patched to tolerate it${NC}"
+  log "control-plane taint kept; CoreDNS + calico-kube-controllers patched with toleration"
+
+  if wait_for_master_pods_ready; then
+    progress_complete
+    print_bootstrap_complete_master
+  else
+    echo -e "${RED}❌ Cluster not fully ready — check $LOG_FILE${NC}"; exit 1
+  fi
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2625,24 +2702,28 @@ bootstrap_worker() {
   #   2. Patches resolvConf on Rocky/RHEL if needed
   #   3. Waits for CNI agent (calico-node/flannel) Running via crictl --state running
   #   4. Checks vxlan.calico interface after CNI confirmed
-  wait_for_worker_pods_ready && print_bootstrap_complete_worker || \
-    { echo -e "${RED}❌ Worker not fully ready — check: journalctl -u kubelet -n 50${NC}"; exit 1; }
+  if wait_for_worker_pods_ready; then
+    progress_complete
+    print_bootstrap_complete_worker
+  else
+    echo -e "${RED}❌ Worker not fully ready — check: journalctl -u kubelet -n 50${NC}"; exit 1
+  fi
 }
 
 # ════════════════════════════════════════════════════════════════════════════
 # CREDITS
 # ════════════════════════════════════════════════════════════════════════════
 print_credits() {
-  echo -e "${DIM}╔════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${DIM}║${NC}                   ${CYAN}Script Information${NC}                       ${DIM}║${NC}"
-  echo -e "${DIM}╠════════════════════════════════════════════════════════════╣${NC}"
-  echo -e "${DIM}║${NC}  ${WHITE}Author  :${NC} ${CYAN}Sreekanth K${NC}                                     ${DIM}║${NC}"
-  echo -e "${DIM}║${NC}  ${WHITE}Email   :${NC} ${CYAN}ksk5940@gmail.com${NC}                               ${DIM}║${NC}"
-  echo -e "${DIM}║${NC}  ${WHITE}Script  :${NC} k8s-cluster-bootstrap.sh                       ${DIM}║${NC}"
-  echo -e "${DIM}║${NC}  ${WHITE}Version :${NC} 1.0.0                                          ${DIM}║${NC}"
-  echo -e "${DIM}║${NC}  ${WHITE}Supports:${NC} Ubuntu · Debian · Rocky · RHEL · AlmaLinux     ${DIM}║${NC}"
-  echo -e "${DIM}║${NC}  ${WHITE}CNI     :${NC} Calico (VXLAN) · Flannel                       ${DIM}║${NC}"
-  echo -e "${DIM}╚════════════════════════════════════════════════════════════╝${NC}"
+  echo -e "${DIM}╔══════════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${DIM}║${NC}                     ${CYAN}Script Information${NC}                         ${DIM}║${NC}"
+  echo -e "${DIM}╠══════════════════════════════════════════════════════════════════╣${NC}"
+  echo -e "${DIM}║${NC}  ${WHITE}Author  :${NC} ${CYAN}Sreekanth K${NC}                                           ${DIM}║${NC}"
+  echo -e "${DIM}║${NC}  ${WHITE}Email   :${NC} ${CYAN}ksk5940@gmail.com${NC}                                     ${DIM}║${NC}"
+  echo -e "${DIM}║${NC}  ${WHITE}Script  :${NC} k8s-cluster-bootstrap.sh                             ${DIM}║${NC}"
+  echo -e "${DIM}║${NC}  ${WHITE}Version :${NC} 1.0.0                                                ${DIM}║${NC}"
+  echo -e "${DIM}║${NC}  ${WHITE}Supports:${NC} Ubuntu · Debian · Rocky · RHEL · AlmaLinux           ${DIM}║${NC}"
+  echo -e "${DIM}║${NC}  ${WHITE}CNI     :${NC} Calico (VXLAN) · Flannel                             ${DIM}║${NC}"
+  echo -e "${DIM}╚══════════════════════════════════════════════════════════════════╝${NC}"
   echo ""
 }
 
@@ -2849,6 +2930,29 @@ _cleanup_iptables_kube() {
 # --reset
 # ════════════════════════════════════════════════════════════════════════════
 run_reset() {
+  # Reset has its own step counter — isolated from --init's CURRENT_STEP
+  local RESET_STEP=0
+  local RESET_TOTAL=6
+  _reset_progress() {
+    RESET_STEP=$(( RESET_STEP + 1 ))
+    local PCT=$(( RESET_STEP * 100 / RESET_TOTAL ))
+    local BAR_WIDTH=50
+    local FILLED=$(( PCT * BAR_WIDTH / 100 ))
+    local EMPTY=$(( BAR_WIDTH - FILLED ))
+    [[ $EMPTY -lt 0 ]] && EMPTY=0
+    local BAR; BAR=$(printf "%${FILLED}s" | tr ' ' '█')
+    local SPC; SPC=$(printf "%${EMPTY}s")
+    printf "\n${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}\n"
+    printf "${CYAN}║${NC}  ${YELLOW}Reset: [%3d%%]${NC} ${GREEN}%s${DIM}%s${NC}  ${CYAN}║${NC}\n" "$PCT" "$BAR" "$SPC"
+    printf "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
+  }
+  _reset_progress_complete() {
+    local BAR; BAR=$(printf "%50s" | tr ' ' '█')
+    printf "\n${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}\n"
+    printf "${CYAN}║${NC}  ${YELLOW}Reset: [100%%]${NC} ${GREEN}%s${NC}  ${CYAN}║${NC}\n" "$BAR"
+    printf "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
+  }
+
   print_header "CLUSTER RESET (packages preserved)"
 
   # ── Detect OS early — needed for OS-specific path decisions ──────────────
@@ -2876,16 +2980,8 @@ run_reset() {
   fi
 
   # ── Detect installed runtime ──────────────────────────────────────────────
-  # Five methods in priority order — stops at first match:
-  #   1. Package manager (works even when service is stopped)
-  #   2. Binary in PATH  (manually installed, not tracked by pkg manager)
-  #   3. Live socket     (runtime running, no pkg entry)
-  #   4. systemd unit    (last resort — may miss non-standard installs)
-  #
   # Rocky-specific: containerd installed from Docker's repo is packaged as
   # "containerd.io" (rpm name), not "containerd".  Both are checked.
-  # Ubuntu master: containerd is stopped by step [1/6] before this block,
-  # so socket-based detection fails — pkg manager check handles it correctly.
   local RRT=""
   if [[ "$PKG_MANAGER" == "apt" ]]; then
     dpkg-query -W -f='${Status}' containerd    2>/dev/null | grep -q "ok installed" && RRT="containerd"
@@ -2897,13 +2993,10 @@ run_reset() {
     rpm -q containerd.io &>/dev/null && RRT="containerd"
     [[ -z "$RRT" ]] && rpm -q cri-o &>/dev/null && RRT="crio"
   fi
-  # Binary fallback (manually installed, not tracked by pkg manager)
   [[ -z "$RRT" ]] && command -v containerd &>/dev/null && RRT="containerd"
   [[ -z "$RRT" ]] && command -v crio       &>/dev/null && RRT="crio"
-  # Live socket fallback (runtime running but pkg not tracked)
   [[ -z "$RRT" && -S /run/containerd/containerd.sock ]] && RRT="containerd"
   [[ -z "$RRT" && -S /var/run/crio/crio.sock          ]] && RRT="crio"
-  # systemd unit fallback (last resort)
   [[ -z "$RRT" ]] && systemctl list-unit-files 2>/dev/null | grep -q "^containerd" && RRT="containerd"
   [[ -z "$RRT" ]] && systemctl list-unit-files 2>/dev/null | grep -q "^crio"       && RRT="crio"
 
@@ -2923,7 +3016,7 @@ run_reset() {
   echo -e "${GREEN}      ✔ PRESERVED: repos, GPG keys, kernel modules, sysctl, firewall rules${NC}"
   echo -e "${GREEN}      ✔ PRESERVED: /opt/cni/bin, containerd/crio config, k8sadmins group${NC}"
   echo ""
-  printf "${YELLOW}  Type 'yes' to confirm: ${NC}"
+  printf "${YELLOW}  Type 'yes' to confirm reset: ${NC}"
   local CONF; read -r CONF
   [[ "$CONF" != "yes" ]] && { echo -e "${YELLOW}  Cancelled.${NC}"; exit 0; }
   echo ""
@@ -2938,10 +3031,11 @@ run_reset() {
   # ════════════════════════════════════════════════════════════════════════
   # [1/6] Stop services
   # ════════════════════════════════════════════════════════════════════════
+  _reset_progress
   echo -e "${YELLOW}  [1/6] Stopping kubelet and runtime...${NC}"
   systemctl stop kubelet 2>/dev/null || true
   [[ -n "$RRT" ]] && systemctl stop "$RRT" 2>/dev/null || true
-  echo -e "${GREEN}  ✓${NC}"
+  echo -e "${GREEN}  ✓ Services stopped${NC}"
 
   # ════════════════════════════════════════════════════════════════════════
   # [2/6] kubeadm reset
@@ -2950,6 +3044,7 @@ run_reset() {
   #         scheduler.conf (all under /etc/kubernetes/).
   # Does NOT remove packages or repos.
   # ════════════════════════════════════════════════════════════════════════
+  _reset_progress
   echo -e "${YELLOW}  [2/6] Running kubeadm reset...${NC}"
   if command -v kubeadm &>/dev/null; then
     kubeadm reset -f --ignore-preflight-errors=all >> "$LOG_FILE" 2>&1 || true
@@ -2960,75 +3055,23 @@ run_reset() {
 
   # ════════════════════════════════════════════════════════════════════════
   # [3/6] Cluster state, certs and configs
+  # IMPORTANT: Worker stale-node deletion MUST happen BEFORE /etc/kubernetes
+  # is removed — the kubeconfig lives there and is needed to talk to the master.
   # ════════════════════════════════════════════════════════════════════════
+  _reset_progress
   echo -e "${YELLOW}  [3/6] Removing cluster state, certs and configs...${NC}"
 
-  # ── Common (master + worker) ───────────────────────────────────────────
-  # /etc/kubernetes: certs, manifests, kubelet.conf, bootstrap-kubelet.conf,
-  #                  admin.conf (master), k8s-version.txt, cni-*.txt (this script)
-  rm -rf /etc/kubernetes
-
-  # kubelet working dir: pod logs, volumes, device plugins, checkpoint state
-  rm -rf /var/lib/kubelet
-
-  # Runtime socket state dirs (runtime itself stays — just clear leftover run dirs)
-  # /run/containerd and /run/crio are recreated when the runtime service starts
-  rm -rf /var/run/kubernetes
-  umount -l /run/calico/cgroup 2>/dev/null || true
-  # Unmount only pod sandbox overlay/shm mounts.
-  # IMPORTANT: do NOT include /var/lib/containers/storage or /var/lib/containerd
-  # here — those paths hold the image cache and must survive reset.
-  # We only unmount active pod/container mounts under /var/lib/kubelet/pods
-  # and the containerd/crio sandbox shm mounts so rm -rf /var/lib/kubelet works.
-  for _mnt in $(mount 2>/dev/null \
-      | awk '{print $3}' \
-      | grep -E '^/run/containerd/io\.containerd\.runtime|^/run/crio/[a-f0-9]|^/var/lib/kubelet/pods' \
-      | sort -r); do
-    umount -l "$_mnt" 2>/dev/null || true
-  done
-
-  # crictl config: points to the runtime socket + kubeadm init re-writes it
-  rm -f /etc/crictl.yaml
-
-  # kubelet --node-ip extra-args: re-written by --init detect_network_interfaces
-  #   Ubuntu/Debian : /etc/default/kubelet
-  #   Rocky/RHEL    : /etc/sysconfig/kubelet
-  rm -f /etc/default/kubelet /etc/sysconfig/kubelet
-
-  # This script's own tracking files (version, CNI choice, iface) —
-  # --init will ask fresh questions and recreate them
-  rm -f "$K8S_VERSION_FILE" "$CNI_CONFIG_FILE" "$CNI_IFACE_FILE"
-
-  # Script-generated fstab backups (swap disable step)
-  rm -f /etc/fstab.backup-*
-
-  # Temp manifests written by deploy_calico() / deploy_flannel()
-  rm -f /tmp/calico*.yaml /tmp/kube-flannel.yaml
-
-  # ── Master-only ────────────────────────────────────────────────────────
-  if [[ "$RNT" == "master" ]]; then
-    # etcd data — must be empty for kubeadm init to create a fresh cluster
-    rm -rf /var/lib/etcd
-    # kubeconfigs — re-created by bootstrap_master after kubeadm init
-    rm -rf /root/.kube
-    for _d in /home/*; do [[ -d "${_d}/.kube" ]] && rm -rf "${_d}/.kube"; done
-    # kubeadm init config written to /root — re-generated on --init
-    rm -f /root/kubeadm-config.yaml
-    echo -e "${CYAN}    ✓ Master: etcd, kubeconfigs, kubeadm-config.yaml${NC}"
-  fi
-
-  # ── Worker-only: remove stale node object from master ─────────────────
+  # ── Worker-only: remove stale node object from master FIRST ───────────
   # When a worker is reset, its node object stays in etcd on the master.
-  # On re-join with the same hostname, the new kubelet inherits the stale
-  # node — Calico finds a conflicting node record in its datastore and
-  # stalls marking the node Ready, causing the not-ready taint to persist
-  # and blocking calico-kube-controllers/coredns from scheduling.
-  # Fix: delete the node from the master BEFORE the worker re-joins.
-  # Best-effort — master may be unreachable or kubeconfig absent.
+  # On re-join with the same hostname the new kubelet inherits the stale node —
+  # Calico finds a conflicting record in its datastore and stalls marking the
+  # node Ready.  Delete it NOW while /etc/kubernetes still exists (kubeconfig
+  # is needed to reach the API server on the master).
   if [[ "$RNT" == "worker" ]]; then
     local _WN; _WN=$(hostname)
     local _KCFG=""
-    for _kc in /etc/kubernetes/admin.conf /root/.kube/config /home/*/.kube/config; do
+    # Search live paths — /etc/kubernetes not yet deleted at this point
+    for _kc in /root/.kube/config /home/*/.kube/config /etc/kubernetes/kubelet.conf; do
       [[ -f "$_kc" ]] && { _KCFG="$_kc"; break; }
     done
 
@@ -3044,30 +3087,60 @@ run_reset() {
         log "WARNING: could not delete stale worker node ${_WN} — master unreachable?"
       fi
     else
-      echo -e "${YELLOW}    ⚠️  No kubeconfig found on this worker.${NC}"
-      echo -e "${YELLOW}    → Run on MASTER before running --init on this worker:${NC}"
+      echo -e "${YELLOW}    ⚠️  No kubeconfig found — cannot contact master automatically.${NC}"
+      echo -e "${YELLOW}    → Run this on the MASTER before running --init on this worker:${NC}"
       echo -e "${WHITE}       kubectl delete node ${_WN}${NC}"
       log "WARNING: no kubeconfig on worker — operator must manually delete node ${_WN}"
     fi
   fi
 
-  # ── Rocky/RHEL specific ────────────────────────────────────────────────
-  # After kubeadm join the worker's /var/lib/kubelet/config.yaml may contain:
-  #   resolvConf: /run/systemd/resolve/resolv.conf   ← wrong path on Rocky
-  # This file is inside /var/lib/kubelet/ (already removed above), so no
-  # separate action needed — just note it here for clarity.
+  # ── Common (master + worker): remove cluster dirs AFTER stale-node cleanup ─
+  # /etc/kubernetes: certs, manifests, kubelet.conf, bootstrap-kubelet.conf,
+  #                  admin.conf (master), k8s-version.txt, cni-*.txt
+  rm -rf /etc/kubernetes
 
-  echo -e "${GREEN}  ✓${NC}"
+  # kubelet working dir: pod logs, volumes, device plugins, checkpoint state
+  rm -rf /var/lib/kubelet
+
+  rm -rf /var/run/kubernetes
+  umount -l /run/calico/cgroup 2>/dev/null || true
+
+  # Unmount active pod sandbox mounts so rm -rf /var/lib/kubelet completes cleanly.
+  # IMPORTANT: do NOT touch /var/lib/containers/storage or /var/lib/containerd —
+  # those hold the image cache and must survive reset.
+  for _mnt in $(mount 2>/dev/null \
+      | awk '{print $3}' \
+      | grep -E '^/run/containerd/io\.containerd\.runtime|^/run/crio/[a-f0-9]|^/var/lib/kubelet/pods' \
+      | sort -r); do
+    umount -l "$_mnt" 2>/dev/null || true
+  done
+
+  rm -f /etc/crictl.yaml
+  rm -f /etc/default/kubelet /etc/sysconfig/kubelet
+  rm -f "$K8S_VERSION_FILE" "$CNI_CONFIG_FILE" "$CNI_IFACE_FILE"
+  rm -f /etc/fstab.backup-*
+  rm -f /tmp/calico*.yaml /tmp/kube-flannel.yaml
+
+  # ── Master-only ────────────────────────────────────────────────────────
+  if [[ "$RNT" == "master" ]]; then
+    rm -rf /var/lib/etcd
+    rm -rf /root/.kube
+    for _d in /home/*; do [[ -d "${_d}/.kube" ]] && rm -rf "${_d}/.kube"; done
+    rm -f /root/kubeadm-config.yaml
+    echo -e "${CYAN}    ✓ Master: etcd, /root/.kube, ~/username/.kube, kubeadm-config.yaml${NC}"
+  fi
+
+  echo -e "${GREEN}  ✓ Cluster state, certs and configs removed${NC}"
 
   # ════════════════════════════════════════════════════════════════════════
   # [4/6] CNI network state
   # Binaries in /opt/cni/bin are preserved — only runtime state is cleared.
   # Order: netns → interfaces → iptables → dirs
   # ════════════════════════════════════════════════════════════════════════
+  _reset_progress
   echo -e "${YELLOW}  [4/6] Cleaning CNI network state...${NC}"
 
   # Release pod network namespaces FIRST so veth peer references are dropped
-  # before we try to delete the cali* interfaces
   _cleanup_namespaces
 
   # Remove virtual interfaces left by Calico / Flannel
@@ -3076,16 +3149,7 @@ run_reset() {
   # Flush KUBE-* and cali*/CALICO* iptables chains
   _cleanup_iptables_kube
 
-  # CNI runtime state dirs
-  # /etc/cni/net.d  — per-interface CNI configs written by calico-node/flannel
-  # /var/lib/cni    — IPAM allocation state (e.g. flannel subnet leases)
-  # /var/lib/calico — Calico persistent node identity/state (MUST clear on reset
-  #                   or Calico re-init stalls: old node record conflicts with new
-  #                   kubeadm-generated node and prevents node-ready status)
-  # /run/flannel    — flannel subnet env files
-  # /run/calico     — Calico per-node data (BGP state, felix etc.)
-  # /run/nodeagent  — Istio/Calico node agent
-  # /run/netns      — anonymous bind-mount netns registrations
+  # CNI runtime state dirs (binaries in /opt/cni/bin are preserved)
   rm -rf /etc/cni/net.d \
          /var/lib/cni   \
          /var/lib/calico \
@@ -3094,61 +3158,60 @@ run_reset() {
          /run/nodeagent \
          /run/netns
 
-  # CRI-O runtime socket and per-container state live under /run/crio/.
-  # This dir contains ONLY runtime sockets and ephemeral container state —
-  # NO images (images live in /var/lib/containers/storage which is preserved).
-  # /run/crio/ is automatically recreated when crio.service starts.
+  # /run/crio/ contains only sockets and ephemeral state — recreated on start
   rm -rf /run/crio 2>/dev/null || true
 
-  echo -e "${GREEN}  ✓${NC}"
+  echo -e "${GREEN}  ✓ CNI network state cleaned${NC}"
 
   # ════════════════════════════════════════════════════════════════════════
   # [5/6] Restore runtime config integrity
-  # Runtime package stays; just ensure its config is sane before restart.
+  # Runtime package stays; ensure config is healthy before restart.
   # ════════════════════════════════════════════════════════════════════════
+  _reset_progress
   echo -e "${YELLOW}  [5/6] Restoring runtime config...${NC}"
 
   if [[ "$RRT" == "containerd" ]]; then
-    # If /etc/containerd/config.toml was wiped by a partial previous operation,
-    # regenerate it — but never overwrite a working config.
+    local _CFG_GOOD=true
+    # Check file exists, is non-empty, and has SystemdCgroup = true
     if [[ ! -s /etc/containerd/config.toml ]]; then
+      _CFG_GOOD=false
+    elif ! grep -q "SystemdCgroup = true" /etc/containerd/config.toml 2>/dev/null; then
+      _CFG_GOOD=false
+    fi
+    if [[ "$_CFG_GOOD" == false ]]; then
       mkdir -p /etc/containerd
-      containerd config default > /etc/containerd/config.toml 2>/dev/null && \
-        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      containerd config default > /etc/containerd/config.toml 2>/dev/null
+      sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
       echo -e "${CYAN}    ✓ containerd config.toml regenerated (SystemdCgroup=true)${NC}"
     else
-      echo -e "${CYAN}    ✓ containerd config.toml intact — no change${NC}"
+      echo -e "${CYAN}    ✓ containerd config.toml intact and correct${NC}"
     fi
   elif [[ "$RRT" == "crio" ]]; then
     echo -e "${CYAN}    ✓ CRI-O config intact — no change${NC}"
   else
     echo -e "${CYAN}    ℹ️  No runtime detected — skipping config check${NC}"
   fi
-  echo -e "${GREEN}  ✓${NC}"
+  echo -e "${GREEN}  ✓ Runtime config verified${NC}"
 
   # ════════════════════════════════════════════════════════════════════════
   # [6/6] Restart runtime and re-enable kubelet unit
   # kubelet itself is NOT started here — it has nothing to connect to yet.
   # It will be started by kubeadm init/join during the next --init run.
   # ════════════════════════════════════════════════════════════════════════
+  _reset_progress
   echo -e "${YELLOW}  [6/6] Restarting runtime and preparing kubelet unit...${NC}"
 
-  # ── Write crictl.yaml + drop-in BEFORE restarting runtime ───────────────
-  # CRITICAL ORDER: the drop-in ExecStartPost fires during the restart below.
-  # If we write it after, this restart's ExecStartPost runs without the drop-in
-  # and the socket stays root:root — crictl fails with permission denied.
-  # Writing it first ensures the very next restart bakes in the correct perms.
+  # Write crictl.yaml + drop-in BEFORE restarting runtime so that
+  # ExecStartPost runs with the drop-in in place and sets socket permissions.
   echo -e "${CYAN}    Writing crictl config and socket drop-in before runtime restart...${NC}"
   _restore_crictl_config "$RRT"
   echo -e "${GREEN}    ✓ /etc/crictl.yaml written, drop-in installed, systemd reloaded${NC}"
 
   if [[ -n "$RRT" ]]; then
     systemctl restart "$RRT" 2>/dev/null && \
-      echo -e "${CYAN}    ✓ ${RRT} restarted (ExecStartPost will set socket permissions)${NC}" || \
+      echo -e "${CYAN}    ✓ ${RRT} restarted (socket permissions applied via ExecStartPost)${NC}" || \
       echo -e "${YELLOW}    ⚠️  ${RRT} restart failed — check: journalctl -u ${RRT} -n 20${NC}"
-    # Give ExecStartPost a moment to finish chgrp/chmod
     sleep 1
-    # Verify the socket has correct permissions now
     local _SOCK=""
     [[ "$RRT" == "containerd" ]] && _SOCK="/run/containerd/containerd.sock"
     [[ "$RRT" == "crio"       ]] && _SOCK="/var/run/crio/crio.sock"
@@ -3158,9 +3221,8 @@ run_reset() {
       if [[ "$_SOCK_GRP" == "k8sadmins" && "$_SOCK_MOD" == "660" ]]; then
         echo -e "${GREEN}    ✓ Socket permissions confirmed: ${_SOCK} → group=k8sadmins mode=660${NC}"
       else
-        # ExecStartPost may still be running — apply directly
         chgrp k8sadmins "$_SOCK" && chmod 660 "$_SOCK" 2>/dev/null || true
-        echo -e "${CYAN}    ✓ Socket permissions applied directly: group=${_SOCK_GRP}→k8sadmins mode=${_SOCK_MOD}→660${NC}"
+        echo -e "${CYAN}    ✓ Socket permissions applied directly (group=k8sadmins mode=660)${NC}"
       fi
     fi
   else
@@ -3168,94 +3230,119 @@ run_reset() {
     echo -e "${CYAN}    ℹ️  No runtime service detected — skipping restart${NC}"
   fi
 
-  # Re-enable kubelet so it auto-starts when kubeadm init/join writes its config.
-  # Guard: unit file may not exist on a first-run after a full --destroy.
   if systemctl list-unit-files kubelet.service &>/dev/null 2>&1; then
     systemctl enable kubelet 2>/dev/null || true
     echo -e "${CYAN}    ✓ kubelet unit enabled (will start on next --init)${NC}"
   else
     echo -e "${CYAN}    ℹ️  kubelet.service unit not found — will be installed by --init${NC}"
   fi
-  echo -e "${GREEN}  ✓${NC}"
+  echo -e "${GREEN}  ✓ Runtime ready, kubelet unit enabled${NC}"
 
   # ════════════════════════════════════════════════════════════════════════
   # RESET COMPLETE BANNER
   # ════════════════════════════════════════════════════════════════════════
+  local _RESET_ET=$(( $(date +%s) - START_TIME ))
+  _reset_progress_complete
   print_header "RESET COMPLETE  (${RNT^^})"
 
   echo -e "${GREEN}  ✔ Cleared (cluster state):${NC}"
-  echo -e "     /etc/kubernetes  /var/lib/kubelet  /var/run/kubernetes"
+  echo -e "     /etc/kubernetes   /var/lib/kubelet   /var/run/kubernetes"
   if [[ "$RNT" == "master" ]]; then
-    echo -e "     /var/lib/etcd  /root/.kube  ~/user/.kube  kubeadm-config.yaml"
+    echo -e "     /var/lib/etcd   /root/.kube   ~/username/.kube   kubeadm-config.yaml"
   fi
-  echo -e "     kubelet extra-args  crictl.yaml (deleted then restored with correct socket)  CNI net.d  CNI IPAM state"
+  echo -e "     kubelet extra-args   crictl.yaml (deleted then restored)   CNI net.d   CNI IPAM state"
   echo -e "     /var/lib/calico (Calico node identity — prevents stale-node conflicts)"
-  echo -e "     CNI virtual interfaces (cali* vxlan.calico flannel.1 cni0)"
+  echo -e "     CNI virtual interfaces (cali*   vxlan.calico   flannel.1   cni0)"
   echo -e "     iptables KUBE-* and CALICO* chains"
-  echo -e "     temp manifests (/tmp/calico*.yaml /tmp/kube-flannel.yaml)"
+  echo -e "     temp manifests (/tmp/calico*.yaml   /tmp/kube-flannel.yaml)"
   echo ""
   echo -e "${GREEN}  ✔ Preserved (packages + config):${NC}"
-  echo -e "     kubelet  kubeadm  kubectl  ${RRT:-runtime}  cri-tools  /opt/cni/bin"
-  echo -e "     K8s repos  runtime repos  GPG keys"
-  echo -e "     /etc/containerd/config.toml  /etc/crio/  (runtime config)"
-  echo -e "     /var/lib/containerd          (containerd image + content store)"
-  echo -e "     /var/lib/containers/storage  (CRI-O image layers)"
-  echo -e "     /etc/modules-load.d/k8s.conf  /etc/sysctl.d/k8s.conf"
+  echo -e "     kubelet   kubeadm   kubectl   ${RRT:-runtime}   cri-tools   /opt/cni/bin"
+  echo -e "     K8s repos   runtime repos   GPG keys"
+  echo -e "     /etc/containerd/config.toml   /etc/crio/   (runtime config)"
+  echo -e "     /var/lib/containerd   (containerd image + content store)"
+  echo -e "     /var/lib/containers/storage   (CRI-O image layers)"
+  echo -e "     /etc/modules-load.d/k8s.conf   /etc/sysctl.d/k8s.conf"
   echo -e "     Firewall rules (ports still open for re-init)"
   echo -e "     k8sadmins group (runtime socket permissions)"
   if [[ "$PKG_MANAGER" == "dnf" ]]; then
-    echo -e "     chrony  container-selinux  dnf-plugin-versionlock  (Rocky/RHEL extras)"
+    echo -e "     chrony   container-selinux   dnf-plugin-versionlock   (Rocky/RHEL extras)"
   fi
   echo ""
 
   # ── Show installed K8s component versions ────────────────────────────────
   local _KA_VER; _KA_VER=$(kubeadm version -o short 2>/dev/null | sed 's/^v//')
   local _KL_VER;  _KL_VER=$(kubelet --version 2>/dev/null | awk '{print $2}' | sed 's/^v//')
-  local _KT_VER;  _KT_VER=$(kubectl version --client -o json 2>/dev/null | grep '"gitVersion"' | head -1 | awk -F'"' '{print $4}' | sed 's/^v//')
-  local _RT_VER
-  [[ -n "$RRT" ]] && _RT_VER=$($RRT --version 2>/dev/null | head -1 || echo "")
+  local _KT_VER;  _KT_VER=$(kubectl version --client -o json 2>/dev/null \
+                             | grep '"gitVersion"' | head -1 | awk -F'"' '{print $4}' | sed 's/^v//')
+  local _RT_VER=""
+  [[ -n "$RRT" ]] && _RT_VER=$($RRT --version 2>/dev/null | head -1 || true)
 
   if [[ -n "$_KA_VER" || -n "$_KL_VER" ]]; then
     echo -e "${CYAN}  Installed K8s components (ready for --init):${NC}"
-    [[ -n "$_KA_VER" ]] && echo -e "   ${GREEN}✓${NC} kubeadm  : ${WHITE}v${_KA_VER}${NC}"
-    [[ -n "$_KL_VER" ]] && echo -e "   ${GREEN}✓${NC} kubelet  : ${WHITE}v${_KL_VER}${NC}"
-    [[ -n "$_KT_VER" ]] && echo -e "   ${GREEN}✓${NC} kubectl  : ${WHITE}v${_KT_VER}${NC}"
-    [[ -n "$_RT_VER" ]] && echo -e "   ${GREEN}✓${NC} ${RRT}  : ${WHITE}${_RT_VER}${NC}"
+    [[ -n "$_KA_VER" ]] && echo -e "   ${GREEN}✓${NC} kubeadm   : ${WHITE}v${_KA_VER}${NC}"
+    [[ -n "$_KL_VER" ]] && echo -e "   ${GREEN}✓${NC} kubelet   : ${WHITE}v${_KL_VER}${NC}"
+    [[ -n "$_KT_VER" ]] && echo -e "   ${GREEN}✓${NC} kubectl   : ${WHITE}v${_KT_VER}${NC}"
+    [[ -n "$_RT_VER" ]] && echo -e "   ${GREEN}✓${NC} ${RRT}   : ${WHITE}${_RT_VER}${NC}"
     echo ""
     echo -e "${DIM}  Run: ${WHITE}sudo ./k8s-cluster-bootstrap.sh --init${NC}${DIM} to bootstrap again.${NC}"
-    echo -e "${DIM}  Run: ${WHITE}sudo ./k8s-cluster-bootstrap.sh --upgrade${NC}${DIM} to change K8s version first.${NC}"
+    echo -e "${DIM}  Run: ${WHITE}sudo ./k8s-cluster-bootstrap.sh --upgrade${NC}${DIM} to change version first.${NC}"
   else
     echo -e "${YELLOW}  ⚠️  kubeadm/kubelet not detected — packages may need re-install (run --init).${NC}"
   fi
   echo ""
+  echo -e "${CYAN}⏱️  Total time : ${WHITE}$(( _RESET_ET/60 ))m $(( _RESET_ET%60 ))s${NC}"
+  echo -e "${CYAN}📄 Log file   : ${WHITE}${LOG_FILE}${NC}"
+  echo ""
 
   # ── crictl session notice ─────────────────────────────────────────────────
-  # Socket permissions (group=k8sadmins) are set — but Linux group membership
-  # only takes effect in NEW login sessions.  The current shell still has the
-  # OLD group token from before this script ran.
   local _INVOKE_USER="${SUDO_USER:-${LOGNAME:-${USER:-}}}"
   local _IN_GRP=false
   [[ -n "$_INVOKE_USER" ]] && id -nG "$_INVOKE_USER" 2>/dev/null | grep -qw "k8sadmins" && _IN_GRP=true
 
   if [[ "$_IN_GRP" == "true" ]]; then
-    echo -e "${CYAN}╔═════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  crictl — use without sudo                              ║${NC}"
-    echo -e "${CYAN}╚═════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║  crictl — use without sudo                                       ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo -e "${YELLOW}  Your current shell session needs a group refresh.${NC}"
     echo -e "${YELLOW}  Choose one of:${NC}"
     echo -e "   ${GREEN}A)${NC} Fastest  — run in this terminal: ${WHITE}newgrp k8sadmins${NC}"
     echo -e "   ${GREEN}B)${NC} Clean    — log out and log back in"
-    echo -e "   ${GREEN}C)${NC} Use sudo — ${WHITE}sudo crictl ps${NC}  (works immediately, no refresh needed)"
+    echo -e "   ${GREEN}C)${NC} Use sudo — ${WHITE}sudo crictl ps${NC}  (works immediately)"
     echo ""
     echo -e "  After refresh, ${WHITE}crictl ps${NC} will work without sudo."
   fi
   echo ""
+  print_credits
 }
 
 # ════════════════════════════════════════════════════════════════════════════
 # --destroy
 # ════════════════════════════════════════════════════════════════════════════
 run_destroy() {
+  # Destroy has its own step counter — isolated from --init's CURRENT_STEP
+  local DESTROY_STEP=0
+  local DESTROY_TOTAL=8
+  _destroy_progress() {
+    DESTROY_STEP=$(( DESTROY_STEP + 1 ))
+    local PCT=$(( DESTROY_STEP * 100 / DESTROY_TOTAL ))
+    local BAR_WIDTH=50
+    local FILLED=$(( PCT * BAR_WIDTH / 100 ))
+    local EMPTY=$(( BAR_WIDTH - FILLED ))
+    [[ $EMPTY -lt 0 ]] && EMPTY=0
+    local BAR; BAR=$(printf "%${FILLED}s" | tr ' ' '█')
+    local SPC; SPC=$(printf "%${EMPTY}s")
+    printf "\n${RED}╔══════════════════════════════════════════════════════════════════╗${NC}\n"
+    printf "${RED}║${NC}  ${YELLOW}Destroy: [%3d%%]${NC} ${RED}%s${DIM}%s${NC}  ${RED}║${NC}\n" "$PCT" "$BAR" "$SPC"
+    printf "${RED}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
+  }
+  _destroy_progress_complete() {
+    local BAR; BAR=$(printf "%50s" | tr ' ' '█')
+    printf "\n${RED}╔══════════════════════════════════════════════════════════════════╗${NC}\n"
+    printf "${RED}║${NC}  ${YELLOW}Destroy: [100%%]${NC} ${RED}%s${NC}  ${RED}║${NC}\n" "$BAR"
+    printf "${RED}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
+  }
+
   print_header "FULL UNINSTALL  --destroy"
 
   # ── Detect OS early (needed for runtime detection below) ─────────────────
@@ -3267,7 +3354,10 @@ run_destroy() {
   fi
 
   # ── Detect node type BEFORE showing the confirmation banner ──────────────
-  # Priority: --node-type flag > hostname > kubectl binary > admin.conf > k8s-version.txt
+  # Priority: --node-type flag > hostname pattern > admin.conf > k8s-version.txt
+  # NOTE: kubectl binary presence alone is NOT used to detect master — a worker
+  # may have kubectl installed manually.  We use admin.conf (master-only file)
+  # and k8s-version.txt (written by --init on master) as reliable indicators.
   local HN_D; HN_D=$(hostname | tr '[:upper:]' '[:lower:]')
   local NT_D="worker"
   if [[ -n "${ARG_NODE_TYPE:-}" ]]; then
@@ -3276,9 +3366,6 @@ run_destroy() {
   elif [[ "$HN_D" =~ master|control ]]; then
     NT_D="master"
     echo -e "${CYAN}  Node type : ${WHITE}MASTER${NC} ${DIM}(detected from hostname)${NC}"
-  elif command -v kubectl &>/dev/null; then
-    NT_D="master"
-    echo -e "${CYAN}  Node type : ${WHITE}MASTER${NC} ${DIM}(detected: kubectl installed)${NC}"
   elif [[ -f /etc/kubernetes/admin.conf ]]; then
     NT_D="master"
     echo -e "${CYAN}  Node type : ${WHITE}MASTER${NC} ${DIM}(detected: admin.conf present)${NC}"
@@ -3287,14 +3374,11 @@ run_destroy() {
     echo -e "${CYAN}  Node type : ${WHITE}MASTER${NC} ${DIM}(detected: k8s-version.txt present)${NC}"
   else
     NT_D="worker"
-    echo -e "${CYAN}  Node type : ${WHITE}WORKER${NC} ${DIM}(detected from hostname / no master indicators found)${NC}"
+    echo -e "${CYAN}  Node type : ${WHITE}WORKER${NC} ${DIM}(no master indicators found)${NC}"
   fi
   echo ""
 
   # ── Detect installed runtime for the confirmation banner ─────────────────
-  # Pure package-manager check — independent of whether the service is running,
-  # stopped, or disabled.  grep "ok installed" catches normal + held states.
-  # Binary + socket + unit fallbacks handle non-standard installs (Rocky).
   local RRT=""
   if [[ "$PKG_MANAGER" == "apt" ]]; then
     dpkg-query -W -f='${Status}' containerd   2>/dev/null | grep -qE "ok installed" && RRT="containerd"
@@ -3314,7 +3398,7 @@ run_destroy() {
   [[ -z "$RRT" ]] && systemctl list-unit-files 2>/dev/null | grep -q "^crio"       && RRT="crio"
 
   # ── Show what WILL be removed (node-type aware) ───────────────────────────
-  echo -e "${RED}  ⚠️  This will remove:${NC}"
+  echo -e "${RED}  ⚠️  This will PERMANENTLY remove:${NC}"
   if [[ "$NT_D" == "master" ]]; then
     echo -e "${RED}      • kubelet  kubeadm  kubectl  cri-tools${NC}"
   else
@@ -3325,7 +3409,7 @@ run_destroy() {
   echo -e "${RED}      • All data dirs, certs, configs, CNI state${NC}"
   echo -e "${YELLOW}      ℹ️  curl  wget  ca-certificates  gnupg — preserved (system tools)${NC}"
   echo ""
-  printf "${YELLOW}  Type 'yes' to confirm: ${NC}"
+  printf "${RED}  Type 'yes' to confirm full destroy: ${NC}"
   local CONF; read -r CONF
   [[ "$CONF" != "yes" ]] && { echo -e "${YELLOW}  Cancelled.${NC}"; exit 0; }
   echo ""
@@ -3341,35 +3425,36 @@ run_destroy() {
   iptables -C INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT 2>/dev/null || \
     iptables -I INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT
 
-  # ── [1] Stop & disable all services ─────────────────────────────────────
+  # ── [1/8] Stop & disable all services ───────────────────────────────────
+  _destroy_progress
   echo -e "${YELLOW}  [1/8] Stopping and disabling services...${NC}"
   systemctl stop    kubelet    2>/dev/null || true
   systemctl disable kubelet    2>/dev/null || true
-  # Stop both runtimes unconditionally — safe no-op if not installed
   systemctl stop    containerd 2>/dev/null || true
   systemctl disable containerd 2>/dev/null || true
   systemctl stop    crio       2>/dev/null || true
   systemctl disable crio       2>/dev/null || true
-  echo -e "${GREEN}  ✓${NC}"
+  echo -e "${GREEN}  ✓ Services stopped and disabled${NC}"
 
   # ── Release pod netns and CNI interfaces NOW ─────────────────────────────
   # Must happen BEFORE runtime is removed — the anonymous bind-mounts under
   # /var/run/netns/ that hold cali*@ifN veth peer references must be released
-  # while the filesystem is still intact.  After containerd is purged those
-  # mount points become unreachable and the cali* interfaces get stuck.
+  # while the filesystem is still intact.
   echo -e "${CYAN}  Releasing pod network namespaces and CNI interfaces...${NC}"
   _cleanup_namespaces
   _cleanup_cni_interfaces
   _cleanup_iptables_kube
   echo -e "${GREEN}  ✓ CNI interfaces and namespaces cleared${NC}"
 
-  # ── [2] kubeadm reset ────────────────────────────────────────────────────
-  echo -e "${YELLOW}  [2/8] kubeadm reset...${NC}"
+  # ── [2/8] kubeadm reset ─────────────────────────────────────────────────
+  _destroy_progress
+  echo -e "${YELLOW}  [2/8] Running kubeadm reset...${NC}"
   command -v kubeadm &>/dev/null && \
     kubeadm reset -f --ignore-preflight-errors=all >> "$LOG_FILE" 2>&1 || true
-  echo -e "${GREEN}  ✓${NC}"
+  echo -e "${GREEN}  ✓ kubeadm reset complete${NC}"
 
-  # ── [3] Drain crictl containers/pods before removing runtime ────────────
+  # ── [3/8] Drain crictl containers/pods before removing runtime ──────────
+  _destroy_progress
   echo -e "${YELLOW}  [3/8] Stopping crictl pods and containers...${NC}"
   if command -v crictl &>/dev/null; then
     local SOCK=""
@@ -3383,51 +3468,36 @@ run_destroy() {
       crictl stop "$ctr" 2>/dev/null || true; crictl rm -f "$ctr" 2>/dev/null || true
     done
   fi
-  echo -e "${GREEN}  ✓${NC}"
+  echo -e "${GREEN}  ✓ Containers and pods stopped${NC}"
 
-  # ── [4] Remove Kubernetes packages + crictl ──────────────────────────────
-  # Master: removes kubelet kubeadm kubectl  |  Worker: removes kubelet kubeadm (no kubectl)
-  # NT_D is already resolved above (before the confirmation prompt).
+  # ── [4/8] Remove Kubernetes packages + crictl ───────────────────────────
+  _destroy_progress
   local K8S_PKGS=("kubelet" "kubeadm" "kubernetes-cni" "cri-tools")
   [[ "$NT_D" == "master" ]] && K8S_PKGS+=("kubectl")
-  # On Rocky/RHEL --init installs the dnf versionlock plugin; remove it here too.
-  # Both package name variants are tried — only the one actually installed will be removed.
   if [[ "$PKG_MANAGER" == "dnf" ]]; then
     K8S_PKGS+=("dnf-plugin-versionlock" "python3-dnf-plugin-versionlock")
   fi
-  echo -e "${YELLOW}  [4/8] Removing K8s packages (node=${NT_D^^}): ${K8S_PKGS[*]}...${NC}"
+  echo -e "${YELLOW}  [4/8] Removing K8s packages (${NT_D^^}): ${K8S_PKGS[*]}...${NC}"
 
   if [[ "$PKG_MANAGER" == "apt" ]]; then
-    # ── CRITICAL: unhold BEFORE checking install status ──────────────────────
-    # apt-mark hold changes dpkg status from "install ok installed" to
-    # "hold ok installed".  If we check status first, held packages are
-    # invisible to grep "^install ok installed" and never purged.
-    # Solution: unhold unconditionally first, then detect installed packages.
     echo -e "${CYAN}    Releasing any version holds...${NC}"
     for _hp in kubelet kubeadm kubectl cri-tools kubernetes-cni; do
       apt-mark unhold "$_hp" >> "$LOG_FILE" 2>&1 || true
     done
-
-    # Now detect installed packages — status is back to "install ok installed"
     local _K8S_INSTALLED_APT=()
     for _p in "${K8S_PKGS[@]}"; do
-      # Match both "install ok installed" and any residual "hold ok installed"
       dpkg-query -W -f='${Status}' "$_p" 2>/dev/null \
         | grep -qE "ok installed" && _K8S_INSTALLED_APT+=("$_p")
     done
-
     if [[ ${#_K8S_INSTALLED_APT[@]} -gt 0 ]]; then
       echo -e "${CYAN}    Purging: ${_K8S_INSTALLED_APT[*]}${NC}"
       DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "${_K8S_INSTALLED_APT[@]}" >> "$LOG_FILE" 2>&1 || true
       echo -e "${GREEN}    ✓ Removed: ${_K8S_INSTALLED_APT[*]}${NC}"
       _REMOVED_K8S_PKGS=("${_K8S_INSTALLED_APT[@]}")
     else
-      echo -e "${CYAN}  ℹ️  No K8s packages installed — skipping${NC}"
+      echo -e "${CYAN}    ℹ️  No K8s packages installed — skipping${NC}"
     fi
-    # Do NOT apt-get autoremove here — it can cascade-remove system packages
-    # (runc, libseccomp2, libssl, etc.) that other software still depends on.
   else
-    # Ensure versionlock list file exists before deleting entries (Rocky/RHEL).
     mkdir -p /etc/dnf/plugins && touch /etc/dnf/plugins/versionlock.list 2>/dev/null || true
     for _vlpkg in kubelet kubeadm kubectl cri-tools kubernetes-cni; do
       dnf versionlock delete "$_vlpkg" --disablerepo="*" >> "$LOG_FILE" 2>&1 || true
@@ -3442,21 +3512,18 @@ run_destroy() {
       echo -e "${GREEN}    ✓ Removed: ${_K8S_INSTALLED[*]}${NC}"
       _REMOVED_K8S_PKGS=("${_K8S_INSTALLED[@]}")
     else
-      echo -e "${CYAN}  ℹ️  No K8s packages installed — skipping${NC}"
+      echo -e "${CYAN}    ℹ️  No K8s packages installed — skipping${NC}"
     fi
   fi
   rm -f /usr/local/bin/crictl /usr/bin/crictl
   rm -f /usr/local/bin/calicoctl
-  echo -e "${GREEN}  ✓${NC}"
+  echo -e "${GREEN}  ✓ K8s packages removed${NC}"
 
-  # ── [5] Remove container runtime (containerd / crio) ────────────────────
-  # Detection is purely package-manager-based — service state (running/stopped/
-  # disabled) is irrelevant.  grep "ok installed" catches both normal and held
-  # package states.
+  # ── [5/8] Remove container runtime ──────────────────────────────────────
+  _destroy_progress
   echo -e "${YELLOW}  [5/8] Removing container runtime...${NC}"
   if [[ "$PKG_MANAGER" == "apt" ]]; then
     local _RT_INSTALLED_APT=()
-    # runc: installed as CRI-O dependency by --init (apt-get install -y runc)
     for _pkg in containerd containerd.io cri-o runc docker-ce docker-ce-cli \
                 docker-buildx-plugin docker-compose-plugin; do
       dpkg-query -W -f='${Status}' "$_pkg" 2>/dev/null \
@@ -3468,12 +3535,10 @@ run_destroy() {
       echo -e "${GREEN}    ✓ Removed: ${_RT_INSTALLED_APT[*]}${NC}"
       _REMOVED_RT_PKGS=("${_RT_INSTALLED_APT[@]}")
     else
-      echo -e "${CYAN}  ℹ️  No container runtime packages installed — skipping${NC}"
+      echo -e "${CYAN}    ℹ️  No container runtime packages installed — skipping${NC}"
     fi
   else
     local _RT_INSTALLED=()
-    # container-selinux: installed by --init as CRI-O dependency on Rocky/RHEL
-    # epel-release: installed by --init as fallback for containerd on Rocky/RHEL
     for _p in containerd containerd.io cri-o container-selinux epel-release docker-ce docker-ce-cli; do
       rpm -q "$_p" &>/dev/null && _RT_INSTALLED+=("$_p")
     done
@@ -3483,36 +3548,32 @@ run_destroy() {
       echo -e "${GREEN}    ✓ Removed: ${_RT_INSTALLED[*]}${NC}"
       _REMOVED_RT_PKGS=("${_RT_INSTALLED[@]}")
     else
-      echo -e "${CYAN}  ℹ️  No container runtime packages installed — skipping${NC}"
+      echo -e "${CYAN}    ℹ️  No container runtime packages installed — skipping${NC}"
     fi
   fi
-  echo -e "${GREEN}  ✓${NC}"
+  echo -e "${GREEN}  ✓ Container runtime removed${NC}"
 
-  # ── [6] Remove prerequisite packages installed by --init ─────────────────
+  # ── [6/8] Remove prerequisite packages installed by --init ───────────────
+  _destroy_progress
   echo -e "${YELLOW}  [6/8] Removing prerequisite packages...${NC}"
   if [[ "$PKG_MANAGER" == "apt" ]]; then
-    echo -e "${CYAN}  ℹ️  Skipping curl/wget/ca-certificates/gnupg on Ubuntu/Debian — system packages${NC}"
+    echo -e "${CYAN}    ℹ️  Skipping curl/wget/ca-certificates/gnupg — system packages${NC}"
   else
-    echo -e "${CYAN}  ℹ️  Skipping wget/gnupg2 on Rocky/RHEL — core system dependencies${NC}"
-    # chrony: installed by --init configure_timezone() on Rocky/RHEL ONLY if it
-    # was not already present. Safe to remove — not a protected package on RHEL 9.
+    echo -e "${CYAN}    ℹ️  Skipping wget/gnupg2 — core system dependencies${NC}"
     if rpm -q chrony &>/dev/null; then
       echo -e "${CYAN}    Removing chrony (installed by --init for time sync)...${NC}"
       dnf remove -y -q --disablerepo="*" chrony >> "$LOG_FILE" 2>&1 || true
       echo -e "${GREEN}    ✓ chrony removed${NC}"
     fi
-    # Clean EPEL cache (created if EPEL fallback for containerd was used)
     rm -rf /var/cache/dnf/epel* 2>/dev/null || true
     find /var/cache/dnf -maxdepth 1 -type d -name 'epel*' -exec rm -rf {} + 2>/dev/null || true
   fi
-  echo -e "${GREEN}  ✓${NC}"
+  echo -e "${GREEN}  ✓ Prerequisite packages handled${NC}"
 
-  # ── [7] Remove firewall rules opened for K8s ────────────────────────────
+  # ── [7/8] Remove firewall rules opened for K8s ──────────────────────────
+  _destroy_progress
   echo -e "${YELLOW}  [7/8] Removing K8s firewall rules (${NT_D^^})...${NC}"
   if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
-    # Master ports: API(6443) etcd(2379-2380) kubelet(10250) scheduler(10259)
-    #               controller(10257) VXLAN(4789) Flannel(8472) NodePort(30000-32767)
-    # Worker ports: kubelet(10250) kube-proxy(10256) VXLAN(4789) Flannel(8472)
     local _FW_PORTS=()
     if [[ "$NT_D" == "master" ]]; then
       _FW_PORTS=(6443/tcp 2379-2380/tcp 10250/tcp 10259/tcp 10257/tcp
@@ -3524,7 +3585,7 @@ run_destroy() {
       firewall-cmd --permanent --remove-port="$p" 2>/dev/null || true
     done
     firewall-cmd --reload 2>/dev/null || true
-    echo -e "${GREEN}  ✓ firewalld K8s ports removed (${NT_D^^})${NC}"
+    echo -e "${GREEN}    ✓ firewalld K8s ports removed (${NT_D^^})${NC}"
   elif command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
     local _UFW_PORTS=()
     if [[ "$NT_D" == "master" ]]; then
@@ -3536,56 +3597,34 @@ run_destroy() {
     for p in "${_UFW_PORTS[@]}"; do
       ufw delete allow "$p" 2>/dev/null || true
     done
-    echo -e "${GREEN}  ✓ ufw K8s rules removed (${NT_D^^})${NC}"
+    echo -e "${GREEN}    ✓ ufw K8s rules removed (${NT_D^^})${NC}"
   else
-    echo -e "${CYAN}  ℹ️  No active firewall detected — skipping${NC}"
+    echo -e "${CYAN}    ℹ️  No active firewall detected — skipping${NC}"
   fi
-  echo -e "${GREEN}  ✓${NC}"
+  echo -e "${GREEN}  ✓ Firewall rules handled${NC}"
 
-  # ── [8] Remove repos, GPG keys, data dirs, configs, CNI, iptables ───────
+  # ── [8/8] Remove repos, GPG keys, data dirs, configs, CNI, iptables ─────
+  _destroy_progress
   echo -e "${YELLOW}  [8/8] Removing repos, data directories and configs...${NC}"
 
-  # Repos and GPG keys — only K8s, CRI-O and Docker (containerd.io source), system repos untouched
   if [[ "$PKG_MANAGER" == "apt" ]]; then
-    # ── Remove K8s, CRI-O and Docker apt source files and keyrings ───────────
-    # K8s and CRI-O — added by --init
     rm -f /etc/apt/sources.list.d/kubernetes.list
     rm -f /etc/apt/sources.list.d/cri-o.list
     rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg
     rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg
-
-    # Docker — may have been present before --init or added by another tool.
-    # --destroy must remove it so 'apt update' doesn't fail with cert/TLS errors
-    # after ca-certificates state changes.  System repos (noble, security, etc.)
-    # are completely untouched.
     rm -f /etc/apt/sources.list.d/docker.list
     rm -f /etc/apt/sources.list.d/docker-ce.list
     rm -f /etc/apt/keyrings/docker.gpg
     rm -f /etc/apt/keyrings/docker-archive-keyring.gpg
     rm -f /etc/apt/trusted.gpg.d/docker*.gpg
-    # Glob-catch any other docker source variant (e.g. docker-ce-stable.list)
     rm -f /etc/apt/sources.list.d/docker* 2>/dev/null || true
     rm -f /etc/apt/keyrings/docker* 2>/dev/null || true
-
-    # ── Remove only K8s/CRI-O/Docker apt list cache files ────────────────────
-    # Both K8s core and CRI-O addons are served from pkgs.k8s.io.
-    # Do NOT run apt-get update — that would hit all system repos needlessly.
     rm -f /var/lib/apt/lists/pkgs.k8s.io_* 2>/dev/null || true
     rm -f /var/lib/apt/lists/download.docker.com_* 2>/dev/null || true
-    # Release any stale apt locks left by the purge steps above
     rm -f /var/lib/apt/lists/lock 2>/dev/null || true
     rm -f /var/cache/apt/archives/lock 2>/dev/null || true
-
-    # ── Fix needrestart ghost service restarts ────────────────────────────────
-    # After containerd/crio are purged, needrestart still tries to restart them
-    # on every subsequent apt operation, producing:
-    #   "Failed to restart containerd.service: Unit containerd.service not found"
-    # Fix: remove containerd/crio from needrestart's pending-restart state cache
-    # and suppress runtime-specific restart hooks so apt runs stay clean.
     rm -f /var/lib/needrestart/restart-required.d/containerd* 2>/dev/null || true
     rm -f /var/lib/needrestart/restart-required.d/crio*       2>/dev/null || true
-    # If needrestart.conf exists, suppress auto-restart of removed services.
-    # Use perl to avoid bash/sed $ quoting complexity.
     if [[ -f /etc/needrestart/needrestart.conf ]]; then
       perl -i -pe 's{^\s*\$nrconf\{restart\}.*}{\$nrconf{restart} = q(l);}g' \
         /etc/needrestart/needrestart.conf 2>/dev/null || true
@@ -3594,24 +3633,19 @@ run_destroy() {
     rm -f /etc/yum.repos.d/kubernetes.repo
     rm -f /etc/yum.repos.d/cri-o.repo
     rm -f /etc/yum.repos.d/docker-ce.repo
-    # Note: RPM keyring GPG key removal is handled in the data-dir cleanup
-    # section above to avoid duplicate rpm -e calls.
-    # Remove only K8s/Docker/CRI-O/EPEL repo metadata caches from /var/cache/dnf.
     for _repo_cache in kubernetes docker-ce-stable cri-o epel; do
       rm -rf /var/cache/dnf/${_repo_cache}* 2>/dev/null || true
     done
     find /var/cache/dnf -maxdepth 1 -type d \
       \( -name 'kubernetes*' -o -name 'docker*' -o -name 'cri-o*' -o -name 'epel*' \) \
       -exec rm -rf {} + 2>/dev/null || true
-    # Clear orphaned K8s versionlock entries (packages removed in step [4]).
-    # Never delete versionlock.list itself — the plugin requires it to always exist.
     mkdir -p /etc/dnf/plugins && touch /etc/dnf/plugins/versionlock.list 2>/dev/null || true
     for _pkg in kubelet kubeadm kubectl cri-tools kubernetes-cni; do
       dnf versionlock delete "$_pkg" --disablerepo="*" 2>/dev/null || true
     done
   fi
 
-  echo -e "${CYAN}  Unmounting runtime mounts (shm/rootfs/cgroup)...${NC}"
+  echo -e "${CYAN}    Unmounting runtime mounts (shm/rootfs/cgroup)...${NC}"
   umount -l /run/calico/cgroup 2>/dev/null || true
   for _mnt in $(mount 2>/dev/null \
       | awk '{print $3}' \
@@ -3620,7 +3654,6 @@ run_destroy() {
     umount -l "$_mnt" 2>/dev/null || true
   done
 
-  # Data directories — common to both master and worker
   rm -rf \
     /etc/kubernetes    /var/lib/kubelet    /var/run/kubernetes \
     /etc/containerd    /var/lib/containerd /run/containerd     \
@@ -3629,9 +3662,7 @@ run_destroy() {
     /etc/cni           /opt/cni            /var/lib/cni        /run/flannel \
     /run/calico        /run/nodeagent      /run/netns
 
-  # ── Rocky/RHEL: remove GPG keys imported to RPM keyring by --init ────────
-  # docker-ce.repo: rpm --import https://download.docker.com/linux/centos/gpg
-  # cri-o.repo:    rpm --import https://pkgs.k8s.io/addons:/cri-o/.../repomd.xml.key
+  # Rocky/RHEL: remove GPG keys imported to RPM keyring by --init
   if [[ "$PKG_MANAGER" == "dnf" ]]; then
     local _DOCKER_GPGKEY
     _DOCKER_GPGKEY=$(rpm -q gpg-pubkey --qf "%{VERSION}-%{RELEASE}\n" 2>/dev/null \
@@ -3654,7 +3685,6 @@ run_destroy() {
     rm -f /etc/pki/rpm-gpg/RPM-GPG-KEY-kubernetes* 2>/dev/null || true
   fi
 
-  # Master-only cleanup — etcd, kubeconfigs, kubeadm init config
   if [[ "$NT_D" == "master" ]]; then
     rm -rf /var/lib/etcd /root/.kube
     for d in /home/*; do [[ -d "${d}/.kube" ]] && rm -rf "${d}/.kube"; done
@@ -3663,56 +3693,58 @@ run_destroy() {
 
   rm -f /tmp/calico*.yaml /tmp/kube-flannel.yaml /etc/crictl.yaml
   rm -f /etc/fstab.backup-*
-
-  # /etc/hosts is intentionally NOT modified by --destroy.
-  # It contains network config (hostname → IP mappings) that belongs to the
-  # OS, not to Kubernetes.  A fresh --init will set what it needs.
-
-  # Kubelet config, kernel module and sysctl configs
   rm -f /etc/default/kubelet /etc/sysconfig/kubelet
   rm -f /etc/modules-load.d/k8s.conf /etc/sysctl.d/k8s.conf
 
   groupdel k8sadmins 2>/dev/null || true
-  # Remove systemd drop-ins that set socket group permissions
   rm -f /etc/systemd/system/containerd.service.d/k8sadmins-socket.conf
   rm -f /etc/systemd/system/crio.service.d/k8sadmins-socket.conf
-  # Remove empty drop-in dirs if nothing else is in them
   rmdir /etc/systemd/system/containerd.service.d 2>/dev/null || true
   rmdir /etc/systemd/system/crio.service.d       2>/dev/null || true
 
   systemctl daemon-reload
-  echo -e "${GREEN}  ✓${NC}"
+  echo -e "${GREEN}  ✓ Repos, data directories and configs removed${NC}"
 
+  # ════════════════════════════════════════════════════════════════════════
+  # DESTROY COMPLETE BANNER
+  # ════════════════════════════════════════════════════════════════════════
+  local _DESTROY_ET=$(( $(date +%s) - START_TIME ))
+  _destroy_progress_complete
   print_header "DESTROY COMPLETE  (${NT_D^^})"
+
   if [[ ${#_REMOVED_K8S_PKGS[@]} -gt 0 ]]; then
-    echo -e "${GREEN}  ✔ K8s packages removed   : ${_REMOVED_K8S_PKGS[*]}${NC}"
+    echo -e "${GREEN}  ✔ K8s packages removed      : ${_REMOVED_K8S_PKGS[*]}${NC}"
   else
-    echo -e "${YELLOW}  ℹ️  No K8s packages found installed${NC}"
+    echo -e "${YELLOW}  ℹ️  No K8s packages were found installed${NC}"
   fi
   if [[ ${#_REMOVED_RT_PKGS[@]} -gt 0 ]]; then
-    echo -e "${GREEN}  ✔ Runtime removed        : ${_REMOVED_RT_PKGS[*]}${NC}"
+    echo -e "${GREEN}  ✔ Runtime removed           : ${_REMOVED_RT_PKGS[*]}${NC}"
   else
-    echo -e "${YELLOW}  ℹ️  No container runtime packages found installed${NC}"
+    echo -e "${YELLOW}  ℹ️  No container runtime packages were found installed${NC}"
   fi
   if [[ "$NT_D" == "master" ]]; then
-    echo -e "${GREEN}  ✔ etcd data              : removed${NC}"
-    echo -e "${GREEN}  ✔ kubeconfig (.kube)     : removed${NC}"
-    echo -e "${GREEN}  ✔ Firewall ports removed : 6443 2379-2380 10250 10259 10257 4789 8472 30000-32767${NC}"
+    echo -e "${GREEN}  ✔ etcd data                 : removed${NC}"
+    echo -e "${GREEN}  ✔ kubeconfig (.kube)         : removed${NC}"
+    echo -e "${GREEN}  ✔ Firewall ports removed     : 6443  2379-2380  10250  10259  10257  4789  8472  30000-32767${NC}"
   else
-    echo -e "${GREEN}  ✔ Firewall ports removed : 10250 10256 4789 8472${NC}"
+    echo -e "${GREEN}  ✔ Firewall ports removed     : 10250  10256  4789  8472${NC}"
   fi
-  echo -e "${GREEN}  ✔ K8s repos / GPG keys   : removed${NC}"
-  echo -e "${GREEN}  ✔ Data dirs / configs    : removed${NC}"
-  echo -e "${GREEN}  ✔ CNI interfaces / iptables : cleaned${NC}"
-  echo -e "${GREEN}  ✔ Kernel module / sysctl : removed${NC}"
+  echo -e "${GREEN}  ✔ K8s repos / GPG keys       : removed${NC}"
+  echo -e "${GREEN}  ✔ Data dirs / configs         : removed${NC}"
+  echo -e "${GREEN}  ✔ CNI interfaces / iptables   : cleaned${NC}"
+  echo -e "${GREEN}  ✔ Kernel module / sysctl cfg  : removed${NC}"
   if [[ "$PKG_MANAGER" == "dnf" ]]; then
-    echo -e "${GREEN}  ✔ Rocky/RHEL extras      : chrony, container-selinux, epel-release, versionlock plugin${NC}"
-    echo -e "${GREEN}  ✔ RPM GPG keys           : Docker + CRI-O keys removed from keyring${NC}"
+    echo -e "${GREEN}  ✔ Rocky/RHEL extras          : chrony  container-selinux  epel-release  versionlock plugin${NC}"
+    echo -e "${GREEN}  ✔ RPM GPG keys               : Docker + CRI-O keys removed from keyring${NC}"
   fi
-  echo -e "${GREEN}  ✔ Node is fully clean — ready for fresh install${NC}"
+  echo -e "${GREEN}  ✔ Node is fully clean — ready for a fresh install${NC}"
+  echo ""
+  echo -e "${CYAN}⏱️  Total time : ${WHITE}$(( _DESTROY_ET/60 ))m $(( _DESTROY_ET%60 ))s${NC}"
+  echo -e "${CYAN}📄 Log file   : ${WHITE}${LOG_FILE}${NC}"
   echo ""
   echo -e "${CYAN}  To re-install: ${WHITE}sudo ./k8s-cluster-bootstrap.sh --init${NC}"
   echo ""
+  print_credits
 }
 
 # ════════════════════════════════════════════════════════════════════════════
