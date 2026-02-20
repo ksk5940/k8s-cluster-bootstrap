@@ -26,9 +26,7 @@
 
 set -o pipefail
 
-# ════════════════════════════════════════════════════════════════════════════
 # GLOBAL VARIABLES
-# ════════════════════════════════════════════════════════════════════════════
 # LOG_FILE is set dynamically in setup_logging() based on the active mode:
 #   --init    -> k8s-init.log
 #   --reset   -> k8s-reset.log
@@ -71,9 +69,7 @@ ARG_POD_CIDR=""         # --pod-cidr   x.x.x.x/xx  override default pod network 
 ARG_NODE_TYPE=""        # --node-type  master|worker  override hostname detection
 ARG_TIMEZONE=""         # --timezone   Region/City|skip  default: empty = skip (keep existing)
 
-# ════════════════════════════════════════════════════════════════════════════
 # COLORS
-# ════════════════════════════════════════════════════════════════════════════
 GREEN=$'\033[1;32m'
 RED=$'\033[1;31m'
 YELLOW=$'\033[1;33m'
@@ -112,7 +108,6 @@ show_usage() {
   echo
   border
 
-  # Header
   line_color "      KUBERNETES CLUSTER BOOTSTRAP" "${BOLD}${YELLOW}"
   line "Author : Sreekanth K"
   line "Email  : ksk5940@gmail.com"
@@ -152,7 +147,6 @@ parse_arguments() {
     show_usage
   fi
 
-  # First argument must be a mode
   case "$1" in
     --init)    INIT_MODE=true    ;;
     --upgrade) UPGRADE_MODE=true ;;
@@ -166,7 +160,6 @@ parse_arguments() {
   esac
   shift
 
-  # Parse optional flags
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --host-cidr)
@@ -196,7 +189,6 @@ parse_arguments() {
     esac
   done
 
-  # Validate flag/mode combinations — these flags are only valid with --init
   local _init_only_flags=""
   [[ -n "$ARG_HOST_CIDR" ]] && _init_only_flags+=" --host-cidr"
   [[ -n "$ARG_POD_CIDR"  ]] && _init_only_flags+=" --pod-cidr"
@@ -206,13 +198,10 @@ parse_arguments() {
     exit 1
   fi
 
-  # Apply overrides
   [[ -n "$ARG_POD_CIDR" ]] && POD_CIDR="$ARG_POD_CIDR"
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # ROOT CHECK
-# ════════════════════════════════════════════════════════════════════════════
 check_root() {
   if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}╔══════════════════════════════════════════════════════════════════╗${NC}"
@@ -225,9 +214,7 @@ check_root() {
   touch "$LOG_FILE"
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # UTILITIES
-# ════════════════════════════════════════════════════════════════════════════
 
 # log() — write a plain timestamped entry directly to the log file.
 # Used for internal script events that are NOT echoed to the console.
@@ -239,13 +226,7 @@ log() { echo "$(date '+%F %T') | $1" >> "$LOG_FILE"; }
 #   1. Shown on the console WITH color (original stream untouched)
 #   2. Stripped of ANSI escape codes and written to LOG_FILE with a timestamp
 #      per line so every event has an exact time.
-#
-# Pattern:
-#   exec > >(tee >(strip_ansi | timestamp >> LOG_FILE)) 2>&1
-#
-# The _strip_color helper removes ANSI SGR codes so the log file is clean text.
 _strip_color() {
-  # Use printf to build sed script with real ESC (\033) so sed anchors correctly
   sed "$(printf 's/\033\[[0-9;]*[mKHfABCDJsu]//g; s/\033(B//g')"
 }
 
@@ -260,9 +241,6 @@ setup_logging() {
   mkdir -p /var/log
 
   # ── Choose log file based on active mode ─────────────────────────────────
-  # Each operation gets its own dedicated log file so init/reset/upgrade/destroy
-  # output never mixes.  Previous runs are rotated (last 3 kept) so history
-  # is preserved without the file growing unbounded.
   local _TS; _TS=$(date '+%Y%m%d-%H%M%S')
   if   [[ "$INIT_MODE"    == true ]]; then LOG_FILE="/var/log/k8s-init.log"
   elif [[ "$RESET_MODE"   == true ]]; then LOG_FILE="/var/log/k8s-reset.log"
@@ -271,19 +249,15 @@ setup_logging() {
   else                                     LOG_FILE="/var/log/k8s-bootstrap.log"
   fi
 
-  # ── Rotate previous log ───────────────────────────────────────────────────
-  # Archive any existing log with a timestamp suffix before opening a fresh one.
   if [[ -s "$LOG_FILE" ]]; then
     local _BASE="${LOG_FILE%.log}"
     mv "$LOG_FILE" "${_BASE}-${_TS}.log" 2>/dev/null || true
-    # Keep only the 3 most recent rotated copies; prune older ones
     ls -1t "${_BASE}"-????????-??????.log 2>/dev/null \
       | tail -n +4 | xargs rm -f 2>/dev/null || true
   fi
 
   touch "$LOG_FILE"
 
-  # Write a session header so each run is clearly delimited in the log
   {
     echo ""
     echo "════════════════════════════════════════════════════════════════"
@@ -292,7 +266,6 @@ setup_logging() {
     echo "════════════════════════════════════════════════════════════════"
   } >> "$LOG_FILE"
 
-  # On exit (success or error), write a session footer with exit code
   trap '_EC=$?; {
     echo "════════════════════════════════════════════════════════════════"
     echo "$(date '"'"'+%F %T'"'"') | SESSION END    exit_code=${_EC}"
@@ -300,8 +273,6 @@ setup_logging() {
     echo ""
   } >> "$LOG_FILE"' EXIT
 
-  # Redirect: stdout → tee → (console AND timestamped log)
-  #           stderr → same pipe (2>&1 after the exec)
   exec > >(tee >(_strip_color | _timestamp_lines >> "$LOG_FILE")) 2>&1
 
   echo -e "${DIM}  Log: ${WHITE}${LOG_FILE}${NC}"
@@ -361,9 +332,7 @@ prompt_input() {
   fi
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 1: OS DETECTION
-# ════════════════════════════════════════════════════════════════════════════
 detect_os() {
   progress
   echo -e "${YELLOW}🔍 Detecting Operating System...${NC}"
@@ -380,19 +349,15 @@ detect_os() {
   log "OS=$OS PKG_MANAGER=$PKG_MANAGER"
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 2: TIMEZONE
-# ════════════════════════════════════════════════════════════════════════════
 configure_timezone() {
   echo ""
   echo -e "${YELLOW}🕐 Configuring Timezone...${NC}"
   local CTZ; CTZ=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "Unknown")
 
   if [[ "${ARG_TIMEZONE,,}" == "skip" || -z "$ARG_TIMEZONE" ]]; then
-    # Default: leave timezone untouched
     echo -e "${GREEN}✓ Timezone: ${WHITE}${CTZ}${GREEN} (unchanged — use --timezone to set)${NC}"
   else
-    # Validate the requested timezone exists
     if ! timedatectl list-timezones 2>/dev/null | grep -qx "$ARG_TIMEZONE"; then
       echo -e "${RED}❌ Unknown timezone: '${ARG_TIMEZONE}'${NC}"
       echo -e "${YELLOW}   Run: timedatectl list-timezones | grep <Region>${NC}"
@@ -406,7 +371,6 @@ configure_timezone() {
     fi
   fi
 
-  # Sync time regardless of timezone change
   if [[ "$OS" =~ (ubuntu|debian) ]]; then
     systemctl enable --now systemd-timesyncd
     systemctl restart systemd-timesyncd
@@ -417,14 +381,11 @@ configure_timezone() {
   fi
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 3: NETWORK VALIDATION
-# ════════════════════════════════════════════════════════════════════════════
 
 _detect_ip_method() {
   local iface="$1" f method
 
-  # NetworkManager
   local nm_dir="/etc/NetworkManager/system-connections"
   if [[ -d "$nm_dir" ]]; then
     for f in "$nm_dir"/*.nmconnection "$nm_dir"/*; do
@@ -438,7 +399,6 @@ _detect_ip_method() {
     done
   fi
 
-  # Netplan
   for f in /etc/netplan/*.yaml /etc/netplan/*.yml; do
     [[ -f "$f" ]] || continue
     grep -q "$iface" "$f" 2>/dev/null || continue
@@ -453,7 +413,6 @@ _detect_ip_method() {
     done < "$f"
   done
 
-  # /etc/network/interfaces
   if [[ -f /etc/network/interfaces ]]; then
     local in_iface=false
     while IFS= read -r line; do
@@ -476,10 +435,7 @@ validate_network_config() {
   local failed=false
 
   # ── Resolve Host-Only adapter ─────────────────────────────────────────────
-  # If --host-cidr supplied: match that specific subnet.
-  # Otherwise: fall back to auto-detect 192.168.x.x (VMware Host-Only default).
   if [[ -n "$ARG_HOST_CIDR" ]]; then
-    # Extract the network prefix (e.g. "10.10.0" from "10.10.0.0/24")
     local HO_PREFIX; HO_PREFIX=$(echo "$ARG_HOST_CIDR" | cut -d/ -f1 | awk -F. '{print $1"."$2"."$3}')
     HOST_ONLY_IP=$(ip -4 addr | awk "/inet ${HO_PREFIX//./\.}\./ {print \$2}" | cut -d/ -f1 | head -1)
     HOST_ONLY_IFACE=$(ip -4 addr | awk "/inet ${HO_PREFIX//./\.}\./ {print \$NF}" | head -1)
@@ -507,8 +463,6 @@ validate_network_config() {
   fi
 
   # ── Resolve NAT adapter ───────────────────────────────────────────────────
-  # Exclude the Host-Only IP and loopback, then pick first remaining private IP.
-  # Covers 10.x, 172.16-31.x, and any other private range used for NAT/internet.
   NAT_IP=$(ip -4 addr \
     | awk '/inet (10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ && !/127\./' \
     | awk '{print $2}' | cut -d/ -f1 \
@@ -520,7 +474,6 @@ validate_network_config() {
 
   if [[ -z "$NAT_IP" ]]; then
     echo -e "${YELLOW}⚠️  NAT       : not found — internet access may be limited${NC}"
-    # NAT missing is a warning not a hard failure; cluster can still work on Host-Only only
   else
     local nat_method
     nat_method=$(_detect_ip_method "$NAT_IFACE")
@@ -541,15 +494,12 @@ validate_network_config() {
   return 0
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 4: HOSTNAME VALIDATION
-# ════════════════════════════════════════════════════════════════════════════
 validate_hostname() {
   progress
   echo -e "${YELLOW}🏷️  Validating Hostname...${NC}"
 
   if [[ -n "$ARG_NODE_TYPE" ]]; then
-    # --node-type flag overrides hostname detection
     NODE_TYPE="$ARG_NODE_TYPE"
     echo -e "${CYAN}  Node type override: ${WHITE}--node-type ${NODE_TYPE}${NC}"
   else
@@ -580,19 +530,15 @@ validate_hostname() {
   local FHN; FHN=$(hostname)
 
   # ── /etc/hosts: ensure HOST_ONLY_IP → hostname is present ─────────────────
-  # Required on ALL OS for both master and worker so kubeadm init/join resolves
-  # the node's hostname to its real cluster IP (not loopback, not NAT).
   if [[ -z "$HOST_ONLY_IP" ]]; then
     echo -e "${RED}   ❌ HOST_ONLY_IP is not set — cannot add /etc/hosts entry${NC}"
     log "ERROR: HOST_ONLY_IP empty in validate_hostname for ${NODE_TYPE} (${FHN})"
     exit 1
   fi
 
-  # Check 1: correct entry already present → skip
   if grep -qE "^${HOST_ONLY_IP}[[:space:]]+${FHN}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
     echo -e "${CYAN}   ℹ️  /etc/hosts: ${HOST_ONLY_IP} → ${FHN} already present${NC}"
 
-  # Check 2: hostname present but mapped to a DIFFERENT IP → fix it
   elif grep -qE "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+[[:space:]]+${FHN}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
     local _OLD_IP
     _OLD_IP=$(grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+[[:space:]]+${FHN}([[:space:]]|$)" /etc/hosts \
@@ -603,7 +549,6 @@ validate_hostname() {
     log "/etc/hosts: replaced stale ${_OLD_IP} → ${FHN} with ${HOST_ONLY_IP} → ${FHN}"
     echo -e "${GREEN}   ✓ /etc/hosts: updated ${HOST_ONLY_IP} → ${FHN}${NC}"
 
-  # Check 3: no entry at all → add it
   else
     printf "%s\t%s\n" "${HOST_ONLY_IP}" "${FHN}" >> /etc/hosts
     log "/etc/hosts: added ${HOST_ONLY_IP} → ${FHN} (${NODE_TYPE}, ${OS})"
@@ -611,9 +556,7 @@ validate_hostname() {
   fi
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 5: SWAP
-# ════════════════════════════════════════════════════════════════════════════
 disable_swap() {
   echo ""
   local ST; ST=$(free | grep Swap | awk '{print $2}')
@@ -630,9 +573,7 @@ disable_swap() {
   fi
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 6: FIREWALL
-# ════════════════════════════════════════════════════════════════════════════
 configure_firewall() {
   progress
   echo -e "${YELLOW}🛡️  Configuring Firewall...${NC}"
@@ -678,9 +619,7 @@ configure_firewall() {
   fi
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 7: INSTALL PREREQUISITES
-# ════════════════════════════════════════════════════════════════════════════
 install_prerequisites() {
   progress
   echo -e "${YELLOW}📦 Installing prerequisites...${NC}"
@@ -702,9 +641,7 @@ install_prerequisites() {
   echo ""
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 8: KERNEL MODULES & SYSCTL
-# ════════════════════════════════════════════════════════════════════════════
 configure_kernel() {
   progress
   echo -e "${YELLOW}⚙️  Configuring kernel modules and sysctl...${NC}"
@@ -723,9 +660,7 @@ SEOF
   echo -e "${GREEN}✓ Kernel configuration applied${NC}"
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 9: DNS
-# ════════════════════════════════════════════════════════════════════════════
 configure_dns() {
   echo ""
   echo -e "${YELLOW}🌐 Configuring DNS Resolver...${NC}"
@@ -740,12 +675,10 @@ configure_dns() {
   echo -e "${GREEN}✓ DNS configured${NC}"
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 10: K8s REPO SETUP
 # Prerequisites (curl, gnupg, ca-certificates) already installed in step 7.
 # This step just ensures the APT keyring directory exists for Ubuntu,
 # then configure_k8s_repo_for_version() handles the actual repo file.
-# ════════════════════════════════════════════════════════════════════════════
 setup_k8s_repositories() {
   progress
   echo -e "${YELLOW}📦 Setting up Kubernetes repository...${NC}"
@@ -758,9 +691,7 @@ setup_k8s_repositories() {
   echo ""
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # CONFIGURE K8s REPO FOR MINOR VERSION
-# ════════════════════════════════════════════════════════════════════════════
 configure_k8s_repo_for_version() {
   local minor="$1"
   log "Configuring K8s repo for v${minor}"
@@ -789,9 +720,7 @@ REOF
   fi
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STATIC VERSION TABLE (no live probing)
-# ════════════════════════════════════════════════════════════════════════════
 show_static_version_table() {
   echo ""
   echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════╗${NC}"
@@ -805,15 +734,16 @@ show_static_version_table() {
     "Minor" "Status" "Stable Patch Versions"
   printf "  ${BLUE}╠══════════╬════════════════╬════════════════════════════════════╣${NC}\n"
 
-  local -a MINORS=( "1.33"      "1.32"     "1.31"     "1.30"      "1.29"   )
-  local -a LABELS=( "🚀 Latest" "✓ Stable" "✓ Stable" "🛡  LTS"   "⚠ EOL"  )
-  local -a COLOURS=( "$BLUE"    "$GREEN"   "$GREEN"   "$MAGENTA"  "$DIM"   )
+  local -a MINORS=( "1.35"        "1.34"     "1.33"      "1.32"     "1.31"     "1.30"     )
+  local -a LABELS=( "🚀 Latest"  "✓ Stable" "✓ Stable" "✓ Stable" "🛡  LTS"  "⚠ EOL"  )
+  local -a COLOURS=( "$BLUE"      "$GREEN"   "$GREEN"    "$GREEN"   "$MAGENTA" "$DIM"     )
   local -a PATCHES=(
-    "1.33.0  1.33.1  1.33.2"
+    "1.35.0  1.35.1"
+    "1.34.0  1.34.1  1.34.2  1.34.3"
+    "1.33.0  1.33.1  1.33.2  1.33.3"
     "1.32.0  1.32.1  1.32.2  1.32.3  1.32.4  1.32.5"
     "1.31.0  1.31.1  1.31.2  1.31.3  1.31.4  1.31.5  1.31.6  1.31.7  1.31.8  1.31.9"
     "1.30.0  1.30.1  1.30.2  1.30.3  1.30.4  1.30.5  1.30.6  1.30.7  1.30.8  1.30.9  1.30.10  1.30.11  1.30.12  1.30.13"
-    "1.29.0  1.29.1  1.29.2  1.29.3  1.29.4  1.29.5  1.29.6  1.29.7  1.29.8  1.29.9  1.29.10  1.29.11  1.29.12  1.29.13  1.29.14  1.29.15"
   )
 
   for i in "${!MINORS[@]}"; do
@@ -850,19 +780,13 @@ show_static_version_table() {
   echo ""
 }
 
-# ════════════════════════════════════════════════════════════════════════════
-# VERSION GUARD
-# ════════════════════════════════════════════════════════════════════════════
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 11: VERSION SELECTION
-#
 # Idempotency matrix:
 #   All K8s tools present    → show installed versions, ask yes/upgrade, skip
 #   Only some tools present  → detect the installed version, proceed to
 #                              install_k8s_components to fill the gap
 #   No tools present         → show version table and ask user
 #   Worker w/ K8S_VERSION_FILE → use master's version silently
-# ════════════════════════════════════════════════════════════════════════════
 select_k8s_version() {
   progress
 
@@ -874,7 +798,6 @@ select_k8s_version() {
     KUBECTL_VER=$(kubectl version --client -o json 2>/dev/null \
       | grep '"gitVersion"' | head -1 | awk -F'"' '{print $4}' | sed 's/^v//')
 
-  # ── WORKER: K8S_VERSION_FILE written by master ───────────────────────────
   if [[ "$NODE_TYPE" == "worker" ]] && [[ -f "$K8S_VERSION_FILE" ]]; then
     K8S_VERSION=$(cat "$K8S_VERSION_FILE")
     echo -e "${GREEN}✓ Worker: using master version ${WHITE}v${K8S_VERSION}${NC}"
@@ -883,9 +806,6 @@ select_k8s_version() {
     return
   fi
 
-  # ── ALL TOOLS INSTALLED: full idempotent path ─────────────────────────────
-  # Master needs kubeadm + kubelet + kubectl.
-  # Worker needs kubeadm + kubelet (kubectl is master-only).
   local _ALL_PRESENT=false
   if [[ "$NODE_TYPE" == "master" ]]; then
     [[ -n "$KUBEADM_VER" && -n "$KUBELET_VER" && -n "$KUBECTL_VER" ]] && _ALL_PRESENT=true
@@ -915,7 +835,6 @@ select_k8s_version() {
       K8S_VERSION="$KUBELET_VER"
       log "Reusing installed K8s: kubeadm v${KUBEADM_VER} kubelet v${KUBELET_VER}"
       echo -e "${GREEN}✓ Using installed Kubernetes v${K8S_VERSION} — skipping version selection${NC}"
-      # Ensure repo is configured for this version (needed for cri-tools install etc.)
       local minor; minor=$(echo "$K8S_VERSION" | cut -d'.' -f1-2)
       configure_k8s_repo_for_version "$minor"
       [[ "$NODE_TYPE" == "master" ]] && { mkdir -p /etc/kubernetes; echo "$K8S_VERSION" > "$K8S_VERSION_FILE"; }
@@ -927,7 +846,6 @@ select_k8s_version() {
     fi
   fi
 
-  # ── PARTIAL INSTALL: one or more tools missing ────────────────────────────
   # install_k8s_components() will fill the gap — we just need to set K8S_VERSION
   # from whatever is already installed so it can install the missing piece
   # at the matching version without asking the user again.
@@ -947,16 +865,14 @@ select_k8s_version() {
     return
   fi
 
-  # ── NO TOOLS INSTALLED: fresh install — ask user ─────────────────────────
   show_static_version_table
 
-  local _DEFAULT_VER="1.30.2"
-  echo -e "  ${DIM}⏱  Auto-selecting ${WHITE}${_DEFAULT_VER}${DIM} (LTS default) in ${WHITE}30s${DIM} if no input...${NC}"
+  local _DEFAULT_VER="1.32.3"
+  echo -e "  ${DIM}⏱  Auto-selecting ${WHITE}${_DEFAULT_VER}${DIM} (Stable default) in ${WHITE}30s${DIM} if no input...${NC}"
   echo ""
 
   while true; do
     local _INPUT=""
-    # Read with 30-second timeout; on timeout use default
     if read -r -t 30 -p "$(printf "${CYAN}Enter Kubernetes version (e.g. 1.32.3): ${NC}")" _INPUT; then
       K8S_VERSION="${_INPUT:-${_DEFAULT_VER}}"
     else
@@ -989,29 +905,13 @@ select_k8s_version() {
   print_header "Selected: Kubernetes v${K8S_VERSION}"
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 12: CONTAINER RUNTIME
-# ════════════════════════════════════════════════════════════════════════════
 setup_container_runtime() {
   progress
   echo -e "${YELLOW}🐳 Setting up Container Runtime...${NC}"
 
-  # ── Detect already-installed runtime via package manager (most reliable) ─
-  # Do NOT rely solely on `command -v` — the binary exists after install but
-  # the package manager is the authoritative source.
   local _RT_FOUND=""
-  if [[ "$PKG_MANAGER" == "apt" ]]; then
-    dpkg-query -W -f='${Status}' containerd    2>/dev/null | grep -q "ok installed" && _RT_FOUND="containerd"
-    dpkg-query -W -f='${Status}' containerd.io 2>/dev/null | grep -q "ok installed" && _RT_FOUND="containerd"
-    dpkg-query -W -f='${Status}' cri-o         2>/dev/null | grep -q "ok installed" && _RT_FOUND="crio"
-  else
-    rpm -q containerd    &>/dev/null && _RT_FOUND="containerd"
-    rpm -q containerd.io &>/dev/null && _RT_FOUND="containerd"
-    rpm -q cri-o         &>/dev/null && _RT_FOUND="crio"
-  fi
-  # Also accept binary-only detection (e.g. manually installed)
-  [[ -z "$_RT_FOUND" ]] && command -v containerd &>/dev/null && _RT_FOUND="containerd"
-  [[ -z "$_RT_FOUND" ]] && command -v crio       &>/dev/null && _RT_FOUND="crio"
+  _detect_runtime _RT_FOUND
 
   if [[ -n "$_RT_FOUND" ]]; then
     RUNTIME="$_RT_FOUND"
@@ -1020,14 +920,20 @@ setup_container_runtime() {
     echo -e "${GREEN}  ✓ Runtime already installed: ${WHITE}${RUNTIME}${NC}  ${DIM}(${_RTV})${NC}"
     echo -e "${GREEN}  ✓ Skipping runtime installation${NC}"
 
-    # Ensure config is correct and service is running — idempotent
     if [[ "$RUNTIME" == "containerd" ]]; then
       if [[ ! -s /etc/containerd/config.toml ]] || \
          ! grep -q "SystemdCgroup = true" /etc/containerd/config.toml 2>/dev/null; then
         mkdir -p /etc/containerd
         containerd config default > /etc/containerd/config.toml 2>/dev/null
         sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-        echo -e "${CYAN}  ⚙️  containerd config updated (SystemdCgroup=true)${NC}"
+        sed -i 's|sandbox_image = ".*"|sandbox_image = "registry.k8s.io/pause:3.10"|'           /etc/containerd/config.toml
+        echo -e "${CYAN}  ⚙️  containerd config updated (SystemdCgroup=true, pause=3.10)${NC}"
+      else
+        # Config exists and correct — just ensure pause pin
+        if ! grep -q 'pause:3.10' /etc/containerd/config.toml 2>/dev/null; then
+          sed -i 's|sandbox_image = ".*"|sandbox_image = "registry.k8s.io/pause:3.10"|'             /etc/containerd/config.toml
+          echo -e "${CYAN}  ⚙️  containerd: pause image pinned → 3.10${NC}"
+        fi
       fi
     fi
     systemctl daemon-reload
@@ -1040,7 +946,6 @@ setup_container_runtime() {
     return 0
   fi
 
-  # ── No runtime installed — ask user ──────────────────────────────────────
   echo ""
   echo -e "${CYAN}  No container runtime detected. Select one to install:${NC}"
   echo ""
@@ -1113,16 +1018,23 @@ CREOF
     _install_containerd
   fi
 
-  # ── Post-install config ───────────────────────────────────────────────────
   if [[ "$RUNTIME" == "containerd" ]]; then
     mkdir -p /etc/containerd
     if ! grep -q "SystemdCgroup = true" /etc/containerd/config.toml 2>/dev/null; then
-      echo -e "${CYAN}  Applying containerd config (SystemdCgroup=true)...${NC}"
+      echo -e "${CYAN}  Applying containerd config (SystemdCgroup=true, pause=3.10)...${NC}"
       containerd config default > /etc/containerd/config.toml
       sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-      echo -e "${GREEN}  ✓ containerd: SystemdCgroup=true${NC}"
+      # Pin pause container to 3.10 — matches kubeadm default for k8s ≥1.28
+      sed -i 's|sandbox_image = ".*"|sandbox_image = "registry.k8s.io/pause:3.10"|'         /etc/containerd/config.toml
+      echo -e "${GREEN}  ✓ containerd: SystemdCgroup=true   pause=3.10${NC}"
     else
-      echo -e "${GREEN}  ✓ containerd config already correct (SystemdCgroup=true)${NC}"
+      # File exists and has SystemdCgroup=true — just ensure pause pin is correct
+      if ! grep -q 'pause:3.10' /etc/containerd/config.toml 2>/dev/null; then
+        sed -i 's|sandbox_image = ".*"|sandbox_image = "registry.k8s.io/pause:3.10"|'           /etc/containerd/config.toml
+        echo -e "${CYAN}  ✓ containerd: pause image pinned → 3.10${NC}"
+      else
+        echo -e "${GREEN}  ✓ containerd config already correct (SystemdCgroup=true, pause=3.10)${NC}"
+      fi
     fi
   elif [[ "$RUNTIME" == "crio" ]]; then
     echo -e "${GREEN}  ✓ CRI-O: SystemdCgroup enabled by default${NC}"
@@ -1145,12 +1057,10 @@ CREOF
   fi
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # CONTAINERD INSTALL HELPER
 # Ubuntu/Debian : containerd package from apt (includes runc)
 # Rocky/RHEL    : containerd.io from Docker's official repo (ships runc too)
 #                 The distro containerd package is often outdated on RHEL9.
-# ════════════════════════════════════════════════════════════════════════════
 _install_containerd() {
   echo -e "${CYAN}  Installing Containerd on ${OS}...${NC}"
 
@@ -1183,7 +1093,6 @@ _install_containerd() {
     fi
     log "Docker repo: using centos/${_DOCKER_RELVER} for OS version ${_OS_VER}"
 
-    # Write repo file with pinned releasever — avoids $releasever expanding to 9
     echo -e "${CYAN}    ⬇  Writing Docker CE repo (centos/${_DOCKER_RELVER})...${NC}"
     cat > /etc/yum.repos.d/docker-ce.repo << DCEOF
 [docker-ce-stable]
@@ -1195,15 +1104,12 @@ gpgkey=https://download.docker.com/linux/centos/gpg
 DCEOF
     log "docker-ce.repo written: centos/${_DOCKER_RELVER}"
 
-    # Import GPG key into RPM keyring so gpgcheck=1 passes without prompting
     echo -e "${CYAN}    ⬇  Importing Docker GPG key...${NC}"
     rpm --import https://download.docker.com/linux/centos/gpg >> "$LOG_FILE" 2>&1 || true
 
-    # Refresh metadata for the docker repo only
     echo -e "${CYAN}    ⬇  Refreshing Docker repo metadata...${NC}"
     dnf makecache --enablerepo="docker-ce-stable" >> "$LOG_FILE" 2>&1 || true
 
-    # Install containerd.io — the Docker-packaged build with runc bundled
     echo -e "${CYAN}    ⬇  Installing containerd.io from Docker repo (this may take a minute)...${NC}"
     dnf install -y -q --enablerepo="docker-ce-stable" containerd.io >> "$LOG_FILE" 2>&1
 
@@ -1240,11 +1146,8 @@ DCEOF
   echo -e "${GREEN}  ✓ Containerd installed${NC}"
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # VERSION LOCK HELPERS
-# ════════════════════════════════════════════════════════════════════════════
 ensure_versionlock_plugin() {
-  # Install plugin if not present
   if ! dnf versionlock --help &>/dev/null 2>&1; then
     dnf install -y -q "dnf-plugin-versionlock" >> "$LOG_FILE" 2>&1 || \
       dnf install -y -q "python3-dnf-plugin-versionlock" >> "$LOG_FILE" 2>&1 || true
@@ -1292,19 +1195,15 @@ unpin_k8s_packages() {
   fi
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 13: INSTALL K8s COMPONENTS
-#
 # select_k8s_version() already handled the user prompt and set K8S_VERSION.
 # This function's only job is to install whatever is missing:
 #   CASE 1 — all tools present : nothing to install, just ensure kubelet enabled
 #   CASE 2 — partial install   : install only the missing piece at K8S_VERSION
 #   CASE 3 — fresh node        : install all tools at K8S_VERSION
-#
 # DNF uses --disableexcludes=kubernetes so the repo's exclude= directive
 # (which protects against accidental upgrades via 'dnf update') does NOT
 # block this intentional install.
-# ════════════════════════════════════════════════════════════════════════════
 
 # Helper: get installed version of a binary (kubeadm or kubelet), empty if absent
 _get_installed_k8s_version() {
@@ -1342,11 +1241,7 @@ install_k8s_components() {
   local PKGS=("kubelet" "kubeadm")
   [[ "$NODE_TYPE" == "master" ]] && PKGS+=("kubectl")
 
-  # ── CASE 1: All required tools already installed ─────────────────────────
-  # select_k8s_version() confirmed with the user and set K8S_VERSION.
-  # Nothing to install — just ensure kubelet unit is enabled.
   if [[ -n "$KUBEADM_VER" && -n "$KUBELET_VER" ]]; then
-    # Master: also install kubectl if it is somehow missing
     if [[ "$NODE_TYPE" == "master" ]] && ! command -v kubectl &>/dev/null; then
       echo -e "${CYAN}  kubectl missing on master — installing v${K8S_VERSION}...${NC}"
       _install_k8s_pkg "kubectl" "$K8S_VERSION"
@@ -1359,21 +1254,18 @@ install_k8s_components() {
     return 0
   fi
 
-  # ── CASE 2a: kubeadm present, kubelet missing ────────────────────────────
   if [[ -n "$KUBEADM_VER" && -z "$KUBELET_VER" ]]; then
     echo -e "${CYAN}  ℹ️  kubeadm v${KUBEADM_VER} found — installing missing kubelet v${K8S_VERSION}...${NC}"
     _install_k8s_pkg "kubelet" "$K8S_VERSION"
     [[ "$NODE_TYPE" == "master" ]] && ! command -v kubectl &>/dev/null && \
       _install_k8s_pkg "kubectl" "$K8S_VERSION"
 
-  # ── CASE 2b: kubelet present, kubeadm missing ────────────────────────────
   elif [[ -z "$KUBEADM_VER" && -n "$KUBELET_VER" ]]; then
     echo -e "${CYAN}  ℹ️  kubelet v${KUBELET_VER} found — installing missing kubeadm v${K8S_VERSION}...${NC}"
     _install_k8s_pkg "kubeadm" "$K8S_VERSION"
     [[ "$NODE_TYPE" == "master" ]] && ! command -v kubectl &>/dev/null && \
       _install_k8s_pkg "kubectl" "$K8S_VERSION"
 
-  # ── CASE 3: Fresh node — install all components ──────────────────────────
   else
     log "Fresh install: ${PKGS[*]} v${K8S_VERSION}"
     if [[ "$OS" =~ (ubuntu|debian) ]]; then
@@ -1411,40 +1303,30 @@ install_k8s_components() {
   fi
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 14: CRICTL
-#
 # DNF also uses --disableexcludes=kubernetes here because cri-tools is
 # listed in the repo's exclude= directive alongside kubelet/kubeadm.
-# ════════════════════════════════════════════════════════════════════════════
-# ════════════════════════════════════════════════════════════════════════════
-# _restore_crictl_config
 # ────────────────────────────────────────────────────────────────────────────
 # Shared helper called by both configure_crictl() (--init) and run_reset()
 # (--reset).  After --reset deletes /etc/crictl.yaml, crictl falls back to
 # trying all default socket paths as root — non-root users get PERMISSION
 # DENIED until the file is restored.
-#
 # This function:
 #   1. Auto-detects the active runtime socket (containerd / crio)
 #   2. Writes /etc/crictl.yaml pointing at that socket
 #   3. Applies chgrp/chmod to the live socket immediately
 #   4. Writes/refreshes the systemd drop-in so permissions survive reboots
 #   5. Adds the invoking non-root user to k8sadmins if not already there
-#
 # It is safe to call multiple times (idempotent).
 # Sets the SOCK variable in the caller's scope for use in log messages.
-# ════════════════════════════════════════════════════════════════════════════
 _restore_crictl_config() {
   local _rt="${1:-$RUNTIME}"   # accept explicit runtime arg or use global
   local SOCK=""
 
-  # ── Resolve socket path ────────────────────────────────────────────────
   case "$_rt" in
     containerd) SOCK="/run/containerd/containerd.sock" ;;
     crio)       SOCK="/var/run/crio/crio.sock"         ;;
     *)
-      # Auto-detect from live sockets (fallback when RUNTIME not yet set)
       if [[ -S /run/containerd/containerd.sock ]]; then
         SOCK="/run/containerd/containerd.sock"; _rt="containerd"
       elif [[ -S /var/run/crio/crio.sock ]]; then
@@ -1457,7 +1339,6 @@ _restore_crictl_config() {
       ;;
   esac
 
-  # ── Write /etc/crictl.yaml ─────────────────────────────────────────────
   cat > /etc/crictl.yaml << CEOF
 runtime-endpoint: unix://${SOCK}
 image-endpoint: unix://${SOCK}
@@ -1466,7 +1347,6 @@ debug: false
 CEOF
   log "_restore_crictl_config: wrote /etc/crictl.yaml → ${SOCK}"
 
-  # ── k8sadmins group setup ──────────────────────────────────────────────
   local GRP="k8sadmins"
   getent group "$GRP" >/dev/null || groupadd "$GRP"
 
@@ -1481,7 +1361,6 @@ CEOF
     fi
   fi
 
-  # ── systemd drop-in: persist socket permissions across reboots ─────────
   # ── Persist socket permissions via systemd socket unit override ────────────
   #
   # WHY NOT ExecStartPost chgrp/chmod:
@@ -1510,7 +1389,6 @@ CEOF
     _DROPIN_DIR="/etc/systemd/system/containerd.service.d"
     _DROPIN_FILE="${_DROPIN_DIR}/k8sadmins-socket.conf"
     mkdir -p "$_DROPIN_DIR"
-    # Part A: service drop-in — robust wait+retry loop
     cat > "$_DROPIN_FILE" << 'DROPIN'
 # Written by k8s-cluster-bootstrap.sh
 # Persists k8sadmins group ownership on the containerd socket after every start.
@@ -1525,7 +1403,6 @@ ExecStartPost=/bin/bash -c '\
   done; \
   chgrp k8sadmins /run/containerd/containerd.sock && chmod 660 /run/containerd/containerd.sock'
 DROPIN
-    # Part B: tmpfiles — pre-boot ownership (d = create dir / adjust existing path)
     cat > "$_TMPFILES_FILE" << 'TMPEOF'
 # Written by k8s-cluster-bootstrap.sh
 # Adjusts containerd socket permissions at boot before containerd starts.
@@ -1536,7 +1413,6 @@ TMPEOF
     _DROPIN_DIR="/etc/systemd/system/crio.service.d"
     _DROPIN_FILE="${_DROPIN_DIR}/k8sadmins-socket.conf"
     mkdir -p "$_DROPIN_DIR"
-    # Part A: service drop-in — robust wait+retry loop
     cat > "$_DROPIN_FILE" << 'DROPIN'
 # Written by k8s-cluster-bootstrap.sh
 # Persists k8sadmins group ownership on the CRI-O socket after every start.
@@ -1551,7 +1427,6 @@ ExecStartPost=/bin/bash -c '\
   done; \
   chgrp k8sadmins /var/run/crio/crio.sock && chmod 660 /var/run/crio/crio.sock'
 DROPIN
-    # Part B: tmpfiles
     cat > "$_TMPFILES_FILE" << 'TMPEOF'
 # Written by k8s-cluster-bootstrap.sh
 # Adjusts CRI-O socket permissions at boot before crio starts.
@@ -1559,8 +1434,6 @@ z /var/run/crio/crio.sock 0660 root k8sadmins - -
 TMPEOF
   fi
 
-  # ── Apply to live socket immediately for this session ───────────────────────
-  # Retry up to 5s in case the runtime just restarted and socket isn't ready yet
   local _try=0
   while [[ $_try -lt 10 ]]; do
     if [[ -S "$SOCK" ]]; then
@@ -1574,7 +1447,6 @@ TMPEOF
   fi
 
   systemctl daemon-reload
-  # Apply tmpfiles rules now (for the live socket, same as boot-time)
   systemd-tmpfiles --create "$_TMPFILES_FILE" 2>/dev/null || true
 }
 
@@ -1582,10 +1454,8 @@ configure_crictl() {
   progress
   echo -e "${YELLOW}🔧 Configuring crictl...${NC}"
 
-  # Check if crictl exists AND is executable/functional
   local _CRICTL_OK=false
   if command -v crictl &>/dev/null; then
-    # Verify it's a real binary, not a broken symlink
     local _CRICTL_PATH; _CRICTL_PATH=$(command -v crictl 2>/dev/null)
     if [[ -x "$_CRICTL_PATH" ]]; then
       _CRICTL_OK=true
@@ -1606,7 +1476,6 @@ configure_crictl() {
     echo -e "${GREEN}  ✓ cri-tools installed${NC}"
   fi
 
-  # ── Ensure crictl is visible in $PATH (kubeadm preflight checks $PATH) ──────
   # cri-tools installs crictl to /usr/bin on Debian/Ubuntu but kubeadm may
   # search only /usr/local/bin.  Symlink into /usr/local/bin if needed and
   # export PATH so every subprocess (including kubeadm) can find it.
@@ -1622,10 +1491,8 @@ configure_crictl() {
   export PATH="/usr/local/bin:/usr/bin:${PATH}"
   log "PATH exported: ${PATH}"
 
-  # Delegate all config/permission work to the shared helper
   _restore_crictl_config "$RUNTIME"
 
-  # Expose the resolved socket path for the success banner
   local SOCK=""
   case "$RUNTIME" in
     containerd) SOCK="/run/containerd/containerd.sock" ;;
@@ -1638,19 +1505,15 @@ configure_crictl() {
   echo -e "${GREEN}✓ Socket permissions: group=k8sadmins mode=660 (persists across reboots)${NC}"
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 15: HOST-ONLY INTERFACE DETECTION
-#
 # Confirms the Host-Only interface and IP (already validated in step 3).
 # For MASTER: writes kubelet --node-ip extra-args config here.
 # For WORKER: kubelet extra-args are written in bootstrap_worker() BEFORE
 #             the kubeadm join call, so they take effect during the join.
 #             This step still sets the iface file used by CNI.
-# ════════════════════════════════════════════════════════════════════════════
 detect_network_interfaces() {
   progress
-  # HOST_ONLY_IFACE and HOST_ONLY_IP already set by validate_network_config()
-  # Re-detect only if somehow unset (edge case)
+  echo -e "${YELLOW}🌐 Configuring node network interface...${NC}"
   if [[ -z "$HOST_ONLY_IFACE" || -z "$HOST_ONLY_IP" ]]; then
     HOST_ONLY_IFACE=$(ip -4 addr show | grep -B2 "192\.168\." | grep -m1 "^[0-9]" | awk '{print $2}' | cut -d: -f1)
     HOST_ONLY_IP=$(ip -4 addr show | grep -oP '192\.168\.\d+\.\d+' | head -1)
@@ -1668,8 +1531,6 @@ detect_network_interfaces() {
   mkdir -p /etc/kubernetes
   echo "$HOST_ONLY_IFACE" > "$CNI_IFACE_FILE"
 
-  # Write kubelet extra-args for MASTER here.
-  # WORKER kubelet extra-args are written in bootstrap_worker() before join.
   if [[ "$NODE_TYPE" == "master" ]]; then
     if [[ "$OS" =~ (ubuntu|debian) ]]; then
       echo "KUBELET_EXTRA_ARGS=--node-ip=${HOST_ONLY_IP}" > /etc/default/kubelet
@@ -1679,12 +1540,12 @@ detect_network_interfaces() {
     fi
     systemctl daemon-reload
   fi
+  echo -e "${GREEN}✓ Node network  : ${WHITE}${HOST_ONLY_IFACE}${NC} ${DIM}→ ${HOST_ONLY_IP}${NC}"
+  echo -e "${GREEN}✓ kubelet --node-ip : ${WHITE}${HOST_ONLY_IP}${NC} ${DIM}(Host-Only, not NAT)${NC}"
   log "detect_network_interfaces: HOST_ONLY_IFACE=${HOST_ONLY_IFACE} HOST_ONLY_IP=${HOST_ONLY_IP}"
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # CNI HEALTH CHECK
-# ════════════════════════════════════════════════════════════════════════════
 check_cni_interface() {
   local cni_type="$1" expected_iface="$2"
   if [[ "$cni_type" == "flannel" ]]; then
@@ -1710,9 +1571,7 @@ check_cni_interface() {
   return 2
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # CNI AUTO-FIX
-# ════════════════════════════════════════════════════════════════════════════
 fix_cni_interface() {
   local cni_type="$1" iface="$2"
   print_header "CNI AUTO-FIX"
@@ -1736,9 +1595,7 @@ fix_cni_interface() {
   sleep 15
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # POD READINESS
-# ════════════════════════════════════════════════════════════════════════════
 pod_ready_count() {
   local ns="$1" selector="$2"
   local -n _r="$3" _t="$4"
@@ -1825,7 +1682,6 @@ wait_for_worker_pods_ready() {
   local MAX_WAIT=420   # calico-node image pull can take 3-5 min on first join
   local WAITED=0
 
-  # Wait for kubelet to be active first
   echo -e "${YELLOW}⏳ Waiting for kubelet...${NC}"
   while [[ $WAITED -lt $MAX_WAIT ]]; do
     systemctl is-active --quiet kubelet && break
@@ -1861,10 +1717,8 @@ wait_for_worker_pods_ready() {
     fi
   fi
 
-  # Reset counter for the CNI agent wait — independent of kubelet wait above
   WAITED=0
 
-  # Wait for calico-node (or flannel) container to be Running on this worker.
   #
   # ROOT CAUSE FIX: crictl ps output has a variable-width CREATED column:
   #   "38 seconds ago"     → 3 words → STATE lands on awk $6
@@ -1912,9 +1766,7 @@ wait_for_worker_pods_ready() {
   return 0
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # CNI SELECTION
-# ════════════════════════════════════════════════════════════════════════════
 select_and_deploy_cni() {
   # ── Idempotency check ────────────────────────────────────────────────────
   # If CNI was already deployed in a previous --init run, $CNI_CONFIG_FILE
@@ -1983,9 +1835,7 @@ select_and_deploy_cni() {
   echo -e "${GREEN}✓ CNI deployed${NC}"
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # FLANNEL DEPLOYMENT
-# ════════════════════════════════════════════════════════════════════════════
 deploy_flannel() {
   local IFACE="${HOST_ONLY_IFACE:-eth0}"
   echo -e "${YELLOW}  Deploying Flannel VXLAN (CIDR=${POD_CIDR}, Port=8472, iface=${IFACE})...${NC}"
@@ -2185,13 +2035,10 @@ FLANNEL_YAML
   echo -e "${GREEN}  ✓ Flannel deployed (VXLAN · CIDR=${POD_CIDR} · Port=8472 · iface=${IFACE})${NC}"
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # CALICO DEPLOYMENT
-# ════════════════════════════════════════════════════════════════════════════
 # CALICO DEPLOYMENT  —  pure VXLAN, no BGP, no IPIP
 # Uses calicoctl for Calico-native resources (IPPool, FelixConfiguration)
 # to bypass kubectl's REST mapper — eliminates "no matches for kind" errors
-# ════════════════════════════════════════════════════════════════════════════
 deploy_calico() {
   local CALICO_VERSION="v3.29.3"
   local CALICO_MANIFEST="/tmp/calico.yaml"
@@ -2428,9 +2275,7 @@ FELIX_EOF
   echo -e "   ${CYAN}calicoctl      :${NC} ${WHITE}${CALICO_VERSION}${NC} ${DIM}(→ ${CALICOCTL})${NC}"
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # MASTER BOOTSTRAP
-# ════════════════════════════════════════════════════════════════════════════
 bootstrap_master() {
   progress
   print_header "INITIALIZING CONTROL PLANE"
@@ -2450,6 +2295,12 @@ bootstrap_master() {
       [[ -f /run/systemd/resolve/resolv.conf ]] && RESOLV_CONF="/run/systemd/resolve/resolv.conf"
     }
 
+    # Pause image: k8s >= 1.29 uses 3.10, older uses 3.9
+    local _PAUSE_VER="3.10"
+    local _K8S_MINOR; _K8S_MINOR=$(echo "$K8S_VERSION" | cut -d. -f2)
+    [[ "$_K8S_MINOR" -lt 29 ]] 2>/dev/null && _PAUSE_VER="3.9"
+    local _PAUSE_IMG="registry.k8s.io/pause:${_PAUSE_VER}"
+    log "kubeadm-config: pause pinned to ${_PAUSE_IMG}"
     cat > /root/kubeadm-config.yaml << KCFG_EOF
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
@@ -2478,10 +2329,6 @@ kind: KubeletConfiguration
 resolvConf: ${RESOLV_CONF}
 KCFG_EOF
 
-    # ── Pre-flight: verify hostname resolves to HOST_ONLY_IP, not loopback ───
-    # getent hosts on Rocky/RHEL may return IPv6 link-local (fe80::) first.
-    # Use getent ahostsv4 to force IPv4-only resolution, then fall back to
-    # /etc/hosts direct grep if ahostsv4 is unavailable.
     local _RESOLVED_IP
     if getent ahostsv4 "$(hostname)" &>/dev/null 2>&1; then
       _RESOLVED_IP=$(getent ahostsv4 "$(hostname)" 2>/dev/null \
@@ -2534,6 +2381,30 @@ KCFG_EOF
       echo -e "${GREEN}  ✓ Port 6443 freed${NC}"
     fi
     # Run kubeadm init — log everything, show only meaningful phase lines on terminal
+    # Pre-pull control-plane images so kubeadm init uses local cache and shows progress
+    echo -e "${YELLOW}  ⬇️  Pre-pulling Kubernetes control-plane images...${NC}"
+    echo -e "${CYAN}     kube-apiserver · controller-manager · scheduler · etcd · coredns · pause:${_PAUSE_VER}${NC}"
+    echo ""
+    local _PREV_IMG="" _PULL_RC=0
+    kubeadm config images pull --config=/root/kubeadm-config.yaml >> "$LOG_FILE" 2>&1 &
+    local _PULL_PID=$!
+    while kill -0 "$_PULL_PID" 2>/dev/null; do
+      local _LAST_IMG
+      _LAST_IMG=$(grep -oP "Pulling image: \K.*" "$LOG_FILE" 2>/dev/null | tail -1)
+      if [[ -n "$_LAST_IMG" && "$_LAST_IMG" != "$_PREV_IMG" ]]; then
+        echo -e "   ${CYAN}  ⬇  ${_LAST_IMG}${NC}"
+        _PREV_IMG="$_LAST_IMG"
+      fi
+      sleep 1
+    done
+    wait "$_PULL_PID"; _PULL_RC=$?
+    if [[ $_PULL_RC -eq 0 ]]; then
+      echo -e "${GREEN}  ✓ All control-plane images pre-pulled — kubeadm init will use local cache${NC}"
+    else
+      echo -e "${YELLOW}  ⚠️  Some images may not have pre-pulled — kubeadm init will retry${NC}"
+      log "WARNING: kubeadm config images pull exited ${_PULL_RC}"
+    fi
+    echo ""
     local KINIT_RC=0
     kubeadm init --config=/root/kubeadm-config.yaml 2>&1       | tee -a "$LOG_FILE"       | grep --line-buffered -iE "error|fail|warning|control-plane has initialized"       | while IFS= read -r line; do
           if echo "$line" | grep -qiE "error|fail"; then
@@ -2567,7 +2438,6 @@ KCFG_EOF
 
   local NN; NN=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 
-  # Deploy CNI FIRST — while the control-plane taint still blocks scheduling.
   # This ensures calico-node is fully Running and has written the CNI conflist
   # to /etc/cni/net.d/ BEFORE any other pod (coredns, calico-kube-controllers)
   # is allowed to schedule.  If we remove the taint first, coredns races with
@@ -2620,7 +2490,6 @@ KCFG_EOF
     sleep 5; W=$((W+5))
   done
 
-  # ── Patch CoreDNS + calico-kube-controllers tolerations instead of removing taint ─
   progress
   # The control-plane taint (node-role.kubernetes.io/control-plane:NoSchedule)
   # is intentionally KEPT on the master node — removing it is unsafe and
@@ -2640,7 +2509,6 @@ KCFG_EOF
     >> "$LOG_FILE" 2>&1 || true
   echo -e "${GREEN}  ✓ calico-kube-controllers toleration added${NC}"
 
-  # Restart pods so they re-schedule with the new tolerations
   kubectl rollout restart deployment/coredns -n kube-system >> "$LOG_FILE" 2>&1 || true
   kubectl rollout restart deployment/calico-kube-controllers -n kube-system >> "$LOG_FILE" 2>&1 || true
   echo -e "${GREEN}  ✓ control-plane taint preserved — pods patched to tolerate it${NC}"
@@ -2654,9 +2522,7 @@ KCFG_EOF
   fi
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # WORKER JOIN
-# ════════════════════════════════════════════════════════════════════════════
 bootstrap_worker() {
   progress
   print_header "WORKER NODE JOIN"
@@ -2666,11 +2532,12 @@ bootstrap_worker() {
   if [[ ! -f /etc/kubernetes/kubelet.conf ]]; then
     local JOIN_CMD
     prompt_input "  Paste kubeadm join command from master: " JOIN_CMD
+    # Log that join was initiated but never log the token itself
+    log "Worker join initiated — token redacted from log for security"
 
     [[ "$JOIN_CMD" != kubeadm\ join* ]] && \
       { echo -e "${RED}  ❌ Must start with 'kubeadm join ...'${NC}"; exit 1; }
 
-    # Append CRI socket if missing
     if [[ ! "$JOIN_CMD" =~ "cri-socket" ]]; then
       if [[ "$RUNTIME" == "crio" ]]; then
         JOIN_CMD="$JOIN_CMD --cri-socket unix:///var/run/crio/crio.sock"
@@ -2693,16 +2560,55 @@ bootstrap_worker() {
     systemctl daemon-reload
     echo -e "${GREEN}  ✓ kubelet extra-args written (node-ip=${HOST_ONLY_IP})${NC}"
 
+    # ── Pre-pull worker images before kubeadm join ──────────────────────────────────────────
+    # Worker needs: pause, kube-proxy. CNI agent is pulled by kubelet after join.
+    # Extract K8s version from installed kubelet (most reliable on worker).
+    local _W_PAUSE_VER="3.10"
+    local _W_K8S_VER=""
+    _W_K8S_VER=$(kubelet --version 2>/dev/null | awk '{print $2}' | sed 's/^v//')
+    if [[ -z "$_W_K8S_VER" ]]; then
+      # Fallback: extract from kubeadm version
+      _W_K8S_VER=$(kubeadm version -o short 2>/dev/null | sed 's/^v//')
+    fi
+    local _W_MINOR
+    _W_MINOR=$(echo "$_W_K8S_VER" | cut -d. -f2)
+    [[ "$_W_MINOR" -lt 29 ]] 2>/dev/null && _W_PAUSE_VER="3.9"
+
+    echo -e "${YELLOW}  ⬇️  Pre-pulling worker node images...${NC}"
+    if [[ -n "$_W_K8S_VER" ]]; then
+      echo -e "${CYAN}     pause:${_W_PAUSE_VER} · kube-proxy:v${_W_K8S_VER}${NC}"
+    else
+      echo -e "${CYAN}     pause:${_W_PAUSE_VER} · kube-proxy (version auto-detect)${NC}"
+    fi
+    echo ""
+
+    local _W_IMGS=()
+    _W_IMGS+=("registry.k8s.io/pause:${_W_PAUSE_VER}")
+    [[ -n "$_W_K8S_VER" ]] && _W_IMGS+=("registry.k8s.io/kube-proxy:v${_W_K8S_VER}")
+
+    for _img in "${_W_IMGS[@]}"; do
+      echo -e "   ${CYAN}  ⬇  ${_img}${NC}"
+      if [[ "$RUNTIME" == "crio" ]]; then
+        crictl pull "$_img" >> "$LOG_FILE" 2>&1 ||           echo -e "   ${YELLOW}  ⚠️  ${_img} — will retry during join${NC}"
+      else
+        ctr -n k8s.io images pull "$_img" >> "$LOG_FILE" 2>&1 ||           crictl pull "$_img" >> "$LOG_FILE" 2>&1 ||           echo -e "   ${YELLOW}  ⚠️  ${_img} — will retry during join${NC}"
+      fi
+    done
+    echo -e "${GREEN}  ✓ Worker images pre-pulled — kubeadm join will use local cache${NC}"
+    echo ""
+
     echo -e "${YELLOW}  Joining cluster...${NC}"
     echo -e "${CYAN}  node-ip=${HOST_ONLY_IP} (Host-Only — Calico VXLAN will bind to this)${NC}"
 
-    # Run kubeadm join — output goes to log only
-    # Bridge/sysctl preflight checks pass cleanly because configure_kernel()
-    # already wrote all required sysctl values earlier in --init.
-    # No --ignore-preflight-errors needed.
-    eval "${JOIN_CMD}" >> "$LOG_FILE" 2>&1
+    # Run kubeadm join — token is redacted from the log for security.
+    local _JOIN_LOG; _JOIN_LOG=$(mktemp)
+    eval "${JOIN_CMD}" > "$_JOIN_LOG" 2>&1
+    local _JOIN_RC=$?
+    # Strip the join command token from output before writing to log
+    sed 's/--token [^ ]*/--token <REDACTED>/g;s/--discovery-token-ca-cert-hash [^ ]*/--discovery-token-ca-cert-hash <REDACTED>/g'       "$_JOIN_LOG" >> "$LOG_FILE"
+    rm -f "$_JOIN_LOG"
 
-    if [[ $? -ne 0 ]]; then
+    if [[ $_JOIN_RC -ne 0 ]]; then
       echo -e "${RED}  ❌ Join failed — check $LOG_FILE${NC}"
       tail -30 "$LOG_FILE"
       exit 1
@@ -2712,7 +2618,6 @@ bootstrap_worker() {
     echo -e "${GREEN}✓ Worker already joined${NC}"
   fi
 
-  # Restart kubelet so KUBELET_EXTRA_ARGS (--node-ip) takes full effect
   systemctl daemon-reload
   systemctl restart kubelet
   sleep 5
@@ -2733,10 +2638,8 @@ bootstrap_worker() {
   fi
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # CREDITS
-# ════════════════════════════════════════════════════════════════════════════
-print_credits() {
+print_author_banner() {
   echo -e "${DIM}╔══════════════════════════════════════════════════════════════════╗${NC}"
   echo -e "${DIM}║${NC}                     ${CYAN}Script Information${NC}                         ${DIM}║${NC}"
   echo -e "${DIM}╠══════════════════════════════════════════════════════════════════╣${NC}"
@@ -2750,9 +2653,7 @@ print_credits() {
   echo ""
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # COMPLETION BANNERS
-# ════════════════════════════════════════════════════════════════════════════
 print_bootstrap_complete_master() {
   local ET=$(($(date +%s) - START_TIME))
   print_header "CLUSTER SETUP COMPLETE!"
@@ -2784,7 +2685,7 @@ print_bootstrap_complete_master() {
   echo -e "${CYAN}⏱️  Total time : ${WHITE}$((ET/60))m $((ET%60))s${NC}"
   echo -e "${CYAN}📄 Log file   : ${WHITE}$LOG_FILE${NC}"
   echo ""
-  print_credits
+  print_author_banner
 }
 
 print_bootstrap_complete_worker() {
@@ -2800,28 +2701,204 @@ print_bootstrap_complete_worker() {
   echo -e "${CYAN}⏱️  Total time : ${WHITE}$((ET/60))m $((ET%60))s${NC}"
   echo -e "${CYAN}📄 Log file   : ${WHITE}$LOG_FILE${NC}"
   echo ""
-  print_credits
+  print_author_banner
 }
 
-# ════════════════════════════════════════════════════════════════════════════
-# SHARED CLEANUP HELPERS
-# ════════════════════════════════════════════════════════════════════════════
-# ════════════════════════════════════════════════════════════════════════════
+# SHARED MODE HELPERS  (used by --reset, --destroy, --upgrade)
+
+# ── _detect_os_silent ────────────────────────────────────────────────────────
+# Sets OS, PKG_MANAGER, PKG_UPDATE, PKG_INSTALL from /etc/os-release.
+# Silent version of detect_os() — no progress bar, no echo — used by
+# run_reset / run_destroy / run_upgrade which handle their own output.
+_detect_os_silent() {
+  source /etc/os-release
+  OS="$ID"
+  if [[ "$OS" =~ (ubuntu|debian) ]]; then
+    PKG_MANAGER="apt"
+    PKG_UPDATE="apt-get update -y"
+    PKG_INSTALL="apt-get install -y"
+  elif [[ "$OS" =~ (rhel|rocky|centos|almalinux) ]]; then
+    PKG_MANAGER="dnf"
+    PKG_UPDATE="dnf makecache"
+    PKG_INSTALL="dnf install -y"
+  else
+    echo -e "${RED}❌ Unsupported OS: $OS${NC}"; exit 1
+  fi
+  log "_detect_os_silent: OS=${OS} PKG_MANAGER=${PKG_MANAGER}"
+}
+
+# ── _detect_runtime ──────────────────────────────────────────────────────────
+# Detects the installed container runtime and sets the named variable $1.
+# Detection order (highest → lowest confidence):
+#   1. Package manager (works even when the service is stopped/disabled)
+#   2. Binary in PATH  (manually installed, not tracked by pkg manager)
+#   3. Live socket     (runtime running, not tracked by pkg manager)
+#   4. systemd unit    (last resort)
+# Rocky-specific: containerd from Docker's repo is packaged as "containerd.io".
+# Usage:  _detect_runtime RRT
+#         echo "$RRT"   # → "containerd" | "crio" | ""
+_detect_runtime() {
+  local -n _RT_OUT="$1"     # nameref — writes directly into caller's variable
+  _RT_OUT=""
+  if [[ "$PKG_MANAGER" == "apt" ]]; then
+    dpkg-query -W -f='${Status}' containerd    2>/dev/null | grep -qE "ok installed" && _RT_OUT="containerd"
+    dpkg-query -W -f='${Status}' containerd.io 2>/dev/null | grep -qE "ok installed" && _RT_OUT="containerd"
+    [[ -z "$_RT_OUT" ]] &&       dpkg-query -W -f='${Status}' cri-o 2>/dev/null | grep -qE "ok installed" && _RT_OUT="crio"
+  else
+    rpm -q containerd    &>/dev/null && _RT_OUT="containerd"
+    rpm -q containerd.io &>/dev/null && _RT_OUT="containerd"
+    [[ -z "$_RT_OUT" ]] && rpm -q cri-o &>/dev/null && _RT_OUT="crio"
+  fi
+  [[ -z "$_RT_OUT" ]] && command -v containerd &>/dev/null && _RT_OUT="containerd"
+  [[ -z "$_RT_OUT" ]] && command -v crio       &>/dev/null && _RT_OUT="crio"
+  [[ -z "$_RT_OUT" && -S /run/containerd/containerd.sock ]] && _RT_OUT="containerd"
+  [[ -z "$_RT_OUT" && -S /var/run/crio/crio.sock          ]] && _RT_OUT="crio"
+  [[ -z "$_RT_OUT" ]] && systemctl list-unit-files 2>/dev/null | grep -q "^containerd" && _RT_OUT="containerd"
+  [[ -z "$_RT_OUT" ]] && systemctl list-unit-files 2>/dev/null | grep -q "^crio"       && _RT_OUT="crio"
+}
+
+# ── _protect_ssh ──────────────────────────────────────────────────────────────
+# Inserts an ACCEPT rule for the active SSH port into iptables INPUT before
+# any iptables manipulation.  Prevents losing the session if KUBE-* chain
+# flush accidentally drops all traffic.  Safe to call multiple times (uses -C
+# to check before -I).
+_protect_ssh() {
+  local _SSH_PORT
+  _SSH_PORT=$(ss -tnlp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -1)
+  [[ -z "$_SSH_PORT" ]] && _SSH_PORT=22
+  iptables -C INPUT -p tcp --dport "$_SSH_PORT" -j ACCEPT 2>/dev/null ||     iptables -I INPUT -p tcp --dport "$_SSH_PORT" -j ACCEPT
+}
+
+# ── _resolve_node_type ────────────────────────────────────────────────────────
+# Resolves the node type for --reset / --destroy and sets the named variable $1.
+# Also prints the detection line to stdout.
+# Priority (highest → lowest):
+#   1. node-type.txt  — written by --init; the authoritative initialized type
+#   2. --node-type flag (ARG_NODE_TYPE) — explicit caller override
+#   3. admin.conf / k8s-version.txt — reliable master file indicators
+#   4. hostname pattern — last resort
+# Usage:  _resolve_node_type NT
+#         echo "$NT"   # → "master" | "worker"
+_resolve_node_type() {
+  local -n _NT_OUT="$1"
+  _NT_OUT="worker"
+  local _SRC=""
+
+  # 1. Persisted record from --init
+  if [[ -f "$NODE_TYPE_FILE" ]]; then
+    local _V; _V=$(cat "$NODE_TYPE_FILE" 2>/dev/null | tr -d '[:space:]')
+    if [[ "$_V" == "master" || "$_V" == "worker" ]]; then
+      _NT_OUT="$_V"; _SRC="from --init record (node-type.txt)"
+    fi
+  fi
+
+  [[ -z "$_SRC" && -n "${ARG_NODE_TYPE:-}" ]] && { _NT_OUT="$ARG_NODE_TYPE"; _SRC="--node-type flag"; }
+
+  if [[ -z "$_SRC" ]]; then
+    if [[ -f /etc/kubernetes/admin.conf ]]; then
+      _NT_OUT="master"; _SRC="admin.conf present"
+    elif [[ -f /etc/kubernetes/k8s-version.txt ]]; then
+      _NT_OUT="master"; _SRC="k8s-version.txt present"
+    fi
+  fi
+
+  if [[ -z "$_SRC" ]]; then
+    local _HN; _HN=$(hostname | tr '[:upper:]' '[:lower:]')
+    if [[ "$_HN" =~ master|control ]]; then
+      _NT_OUT="master"; _SRC="hostname pattern"
+    else
+      _SRC="hostname pattern (no master indicators found)"
+    fi
+  fi
+
+  echo -e "${CYAN}  Node type : ${WHITE}${_NT_OUT^^}${NC} ${DIM}(${_SRC})${NC}"
+}
+
+# ── _render_mode_progress ─────────────────────────────────────────────────────
+# Generic step-progress bar for --reset / --destroy.
+_render_mode_progress() {
+  local _LBL="$1" _CUR="$2" _TOT="$3" _COL="$4"
+  local _PCT=$(( _CUR * 100 / _TOT ))
+  local _FILL=$(( _PCT * 50 / 100 ))
+  local _EMPTY=$(( 50 - _FILL ))
+  [[ $_EMPTY -lt 0 ]] && _EMPTY=0
+  local _BAR; _BAR=$(printf "%${_FILL}s"  | tr ' ' '█')
+  local _SPC; _SPC=$(printf "%${_EMPTY}s")
+  printf "
+${_COL}╔══════════════════════════════════════════════════════════════════╗${NC}
+"
+  printf "${_COL}║${NC}  ${YELLOW}%s: [%3d%%]${NC} ${GREEN}%s${DIM}%s${NC}  ${_COL}║${NC}
+" "$_LBL" "$_PCT" "$_BAR" "$_SPC"
+  printf "${_COL}╚══════════════════════════════════════════════════════════════════╝${NC}
+"
+}
+
+_render_mode_progress_complete() {
+  local _LBL="$1" _COL="$2"
+  local _BAR; _BAR=$(printf "%50s" | tr ' ' '█')
+  printf "
+${_COL}╔══════════════════════════════════════════════════════════════════╗${NC}
+"
+  printf "${_COL}║${NC}  ${YELLOW}%s: [100%%]${NC} ${GREEN}%s${NC}  ${_COL}║${NC}
+" "$_LBL" "$_BAR"
+  printf "${_COL}╚══════════════════════════════════════════════════════════════════╝${NC}
+"
+}
+
+# ── _print_installed_k8s_versions ────────────────────────────────────────────
+_print_installed_k8s_versions() {
+  local _RT="${1:-}"
+  local _KA; _KA=$(kubeadm version -o short 2>/dev/null | sed 's/^v//')
+  local _KL;  _KL=$(kubelet --version 2>/dev/null | awk '{print $2}' | sed 's/^v//')
+  local _KT;  _KT=$(kubectl version --client -o json 2>/dev/null                     | grep '"gitVersion"' | head -1 | awk -F'"' '{print $4}' | sed 's/^v//')
+  local _RV=""
+  [[ -n "$_RT" ]] && _RV=$("$_RT" --version 2>/dev/null | head -1 || true)
+
+  if [[ -n "$_KA" || -n "$_KL" ]]; then
+    echo -e "${CYAN}  Installed K8s components (ready for --init):${NC}"
+    [[ -n "$_KA" ]] && echo -e "   ${GREEN}✓${NC} kubeadm  : ${WHITE}v${_KA}${NC}"
+    [[ -n "$_KL" ]] && echo -e "   ${GREEN}✓${NC} kubelet  : ${WHITE}v${_KL}${NC}"
+    [[ -n "$_KT" ]] && echo -e "   ${GREEN}✓${NC} kubectl  : ${WHITE}v${_KT}${NC}"
+    [[ -n "$_RV" ]] && echo -e "   ${GREEN}✓${NC} ${_RT}  : ${WHITE}${_RV}${NC}"
+    echo ""
+    echo -e "${DIM}  Run: ${WHITE}sudo ./k8s-cluster-bootstrap.sh --init${NC}${DIM} to bootstrap again.${NC}"
+    echo -e "${DIM}  Run: ${WHITE}sudo ./k8s-cluster-bootstrap.sh --upgrade${NC}${DIM} to change version first.${NC}"
+  else
+    echo -e "${YELLOW}  ⚠️  kubeadm/kubelet not detected — packages may need re-install (run --init).${NC}"
+  fi
+}
+
+# Shown after --reset when the invoking user is already in k8sadmins but the
+# current shell session was opened before the group was added — group membership
+# takes effect only in new login sessions.
+_print_crictl_session_notice() {
+  local _USR="${SUDO_USER:-${LOGNAME:-${USER:-}}}"
+  local _IN=false
+  [[ -n "$_USR" ]] && id -nG "$_USR" 2>/dev/null | grep -qw "k8sadmins" && _IN=true
+  [[ "$_IN" != "true" ]] && return 0
+
+  echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${CYAN}║  crictl — use without sudo                                       ║${NC}"
+  echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
+  echo -e "${YELLOW}  Your current shell session needs a group refresh.${NC}"
+  echo -e "${YELLOW}  Choose one of:${NC}"
+  echo -e "   ${GREEN}A)${NC} Fastest  — run in this terminal: ${WHITE}newgrp k8sadmins${NC}"
+  echo -e "   ${GREEN}B)${NC} Clean    — log out and log back in"
+  echo -e "   ${GREEN}C)${NC} Use sudo — ${WHITE}sudo crictl ps${NC}  (works immediately)"
+  echo ""
+  echo -e "  After refresh, ${WHITE}crictl ps${NC} will work without sudo."
+}
+
 # CNI CLEANUP HELPERS
-#
 # Root cause of lingering cali* interfaces:
 #   containerd creates pod network namespaces as anonymous bind-mounts under
 #   /var/run/netns/<id> — these do NOT appear in 'ip netns list' because they
 #   are not registered with iproute2.  Each anonymous netns holds the peer end
 #   of a veth pair (cali*@if2).  While that netns reference exists the kernel
 #   refuses to delete the host-side cali* interface ("device or resource busy").
-#
 #   Also: ip -o link show prints "cali1b1727edeb1@if2" — the @if2 suffix must
 #   be stripped before passing to 'ip link delete'.
-# ════════════════════════════════════════════════════════════════════════════
 
-# ── _ifaces_matching: list host-side interface names matching a pattern ──────
-# Strips the @ifN peer suffix so names are usable with ip link delete.
 _ifaces_matching() {
   ip -o link show 2>/dev/null \
     | awk '{print $2}' \
@@ -2829,7 +2906,6 @@ _ifaces_matching() {
     | grep -E "$1" || true
 }
 
-# ── _del_iface: bring down and delete one interface, retry up to 4x ──────────
 _del_iface() {
   local _if="$1" _try _max=4
   ip link show "$_if" &>/dev/null || return 0
@@ -2842,7 +2918,6 @@ _del_iface() {
   log "WARNING: could not delete iface ${_if} after ${_max} attempts"
 }
 
-# ── _del_tunnel: clear IP-in-IP / GRE tunnel and unload its kernel module ───
 # tunl0 is created by the 'ipip' kernel module.  'ip tunnel del' only removes
 # the named instance; the interface reappears as long as the module is loaded.
 # The only clean removal is to unload the module itself.  We bring the
@@ -2859,7 +2934,6 @@ _del_tunnel() {
   log "tunnel ${_tun} cleared and ipip module unloaded"
 }
 
-# ── _cleanup_namespaces ──────────────────────────────────────────────────────
 # Releases ALL pod network namespaces — both named (ip netns list) and
 # anonymous bind-mounts under /var/run/netns/ that containerd creates.
 # Once released the kernel drops its reference to the veth peer, making
@@ -2890,52 +2964,38 @@ _cleanup_namespaces() {
   sleep 2
 }
 
-# ── _cleanup_cni_interfaces ──────────────────────────────────────────────────
 # Remove all virtual interfaces left by Calico / Flannel / CNI.
 # MUST run after _cleanup_namespaces so veth peers are no longer held.
 _cleanup_cni_interfaces() {
   local _if
 
-  # cali* — Calico per-pod host-side veth peers
   while IFS= read -r _if; do
     [[ -n "$_if" ]] && _del_iface "$_if"
   done < <(_ifaces_matching '^cali')
 
-  # veth* — generic CNI bridge plugin veth pairs
   while IFS= read -r _if; do
     [[ -n "$_if" ]] && _del_iface "$_if"
   done < <(_ifaces_matching '^veth')
 
-  # Calico VXLAN overlay
   _del_iface "vxlan.calico"
   _del_iface "vxlan-v6.calico"
 
-  # IP-in-IP tunnel — kernel built-in, use tunnel del
   _del_tunnel "tunl0"
 
-  # Flannel VXLAN / CNI bridge / IPVS dummy / docker bridge
   for _if in flannel.1 cni0 kube-ipvs0 kube-bridge docker0; do
     _del_iface "$_if"
   done
 
-  # Any remaining wireguard / kube-* devices
   while IFS= read -r _if; do
     [[ -n "$_if" ]] && _del_iface "$_if"
   done < <(_ifaces_matching '^(wireguard|kube-)')
 
-  # ── Unload CNI-related kernel modules ─────────────────────────────────────
-  # tunl0  → ipip + tunnel4   (Calico IP-in-IP)
-  # vxlan* → vxlan            (Calico VXLAN / Flannel VXLAN)
-  # bridge → bridge           (CNI bridge plugin / docker0)
-  # ip_vs* → IPVS kube-proxy mode
-  # modprobe -r is a safe no-op when the module is still in use or not loaded.
   for _mod in ipip tunnel4 vxlan bridge wireguard ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh nf_conntrack; do
     modprobe -r "$_mod" 2>/dev/null || true
   done
   log "CNI kernel modules unloaded"
 }
 
-# ── _cleanup_iptables_kube ───────────────────────────────────────────────────
 # Flush and remove all KUBE-* and cali*/CALICO* iptables chains.
 _cleanup_iptables_kube() {
   local _t _c
@@ -2949,101 +3009,21 @@ _cleanup_iptables_kube() {
   command -v ipvsadm &>/dev/null && ipvsadm -C 2>/dev/null || true
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # --reset
-# ════════════════════════════════════════════════════════════════════════════
 run_reset() {
-  # Reset has its own step counter — isolated from --init's CURRENT_STEP
   local RESET_STEP=0
   local RESET_TOTAL=6
-  _reset_progress() {
-    RESET_STEP=$(( RESET_STEP + 1 ))
-    local PCT=$(( RESET_STEP * 100 / RESET_TOTAL ))
-    local BAR_WIDTH=50
-    local FILLED=$(( PCT * BAR_WIDTH / 100 ))
-    local EMPTY=$(( BAR_WIDTH - FILLED ))
-    [[ $EMPTY -lt 0 ]] && EMPTY=0
-    local BAR; BAR=$(printf "%${FILLED}s" | tr ' ' '█')
-    local SPC; SPC=$(printf "%${EMPTY}s")
-    printf "\n${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}\n"
-    printf "${CYAN}║${NC}  ${YELLOW}Reset: [%3d%%]${NC} ${GREEN}%s${DIM}%s${NC}  ${CYAN}║${NC}\n" "$PCT" "$BAR" "$SPC"
-    printf "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
-  }
-  _reset_progress_complete() {
-    local BAR; BAR=$(printf "%50s" | tr ' ' '█')
-    printf "\n${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}\n"
-    printf "${CYAN}║${NC}  ${YELLOW}Reset: [100%%]${NC} ${GREEN}%s${NC}  ${CYAN}║${NC}\n" "$BAR"
-    printf "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
-  }
 
   print_header "CLUSTER RESET (packages preserved)"
 
-  # ── Detect OS early — needed for OS-specific path decisions ──────────────
-  source /etc/os-release; OS="$ID"
-  if [[ "$OS" =~ (ubuntu|debian) ]]; then
-    PKG_MANAGER="apt"
-  else
-    PKG_MANAGER="dnf"
-  fi
-
-  # ── Detect node type ──────────────────────────────────────────────────────
-  # Priority (highest → lowest):
-  #   1. node-type.txt — written by --init; reflects the ACTUAL initialized type
-  #      even when --node-type overrode the hostname during that --init run.
-  #   2. --node-type flag — explicit override for this reset run.
-  #   3. kubectl + admin.conf — reliable master indicator when file absent.
-  #   4. hostname pattern — last resort.
-  local RNT="worker"   # safe default
-  local _NT_SOURCE=""
-  if [[ -f "$NODE_TYPE_FILE" ]]; then
-    local _NT_FROM_FILE; _NT_FROM_FILE=$(cat "$NODE_TYPE_FILE" 2>/dev/null | tr -d '[:space:]')
-    if [[ "$_NT_FROM_FILE" == "master" || "$_NT_FROM_FILE" == "worker" ]]; then
-      RNT="$_NT_FROM_FILE"
-      _NT_SOURCE="from --init record (node-type.txt)"
-    fi
-  fi
-  if [[ -z "$_NT_SOURCE" && -n "${ARG_NODE_TYPE:-}" ]]; then
-    RNT="$ARG_NODE_TYPE"
-    _NT_SOURCE="--node-type flag"
-  fi
-  if [[ -z "$_NT_SOURCE" ]]; then
-    local HN; HN=$(hostname | tr '[:upper:]' '[:lower:]')
-    if command -v kubectl &>/dev/null && [[ -f /etc/kubernetes/admin.conf ]]; then
-      RNT="master"; _NT_SOURCE="kubectl + admin.conf present"
-    elif [[ "$HN" =~ master|control ]]; then
-      RNT="master"; _NT_SOURCE="hostname pattern"
-    else
-      RNT="worker"; _NT_SOURCE="hostname pattern (no master indicators)"
-    fi
-  fi
-  echo -e "${CYAN}  Node type : ${WHITE}${RNT^^}${NC} ${DIM}(${_NT_SOURCE})${NC}"
-
-  # ── Detect installed runtime ──────────────────────────────────────────────
-  # Rocky-specific: containerd installed from Docker's repo is packaged as
-  # "containerd.io" (rpm name), not "containerd".  Both are checked.
-  local RRT=""
-  if [[ "$PKG_MANAGER" == "apt" ]]; then
-    dpkg-query -W -f='${Status}' containerd    2>/dev/null | grep -q "ok installed" && RRT="containerd"
-    dpkg-query -W -f='${Status}' containerd.io 2>/dev/null | grep -q "ok installed" && RRT="containerd"
-    [[ -z "$RRT" ]] && \
-      dpkg-query -W -f='${Status}' cri-o 2>/dev/null | grep -q "ok installed" && RRT="crio"
-  else
-    rpm -q containerd    &>/dev/null && RRT="containerd"
-    rpm -q containerd.io &>/dev/null && RRT="containerd"
-    [[ -z "$RRT" ]] && rpm -q cri-o &>/dev/null && RRT="crio"
-  fi
-  [[ -z "$RRT" ]] && command -v containerd &>/dev/null && RRT="containerd"
-  [[ -z "$RRT" ]] && command -v crio       &>/dev/null && RRT="crio"
-  [[ -z "$RRT" && -S /run/containerd/containerd.sock ]] && RRT="containerd"
-  [[ -z "$RRT" && -S /var/run/crio/crio.sock          ]] && RRT="crio"
-  [[ -z "$RRT" ]] && systemctl list-unit-files 2>/dev/null | grep -q "^containerd" && RRT="containerd"
-  [[ -z "$RRT" ]] && systemctl list-unit-files 2>/dev/null | grep -q "^crio"       && RRT="crio"
+  _detect_os_silent
+  _resolve_node_type RNT
+  _detect_runtime RRT
 
   echo -e "${CYAN}  Runtime   : ${WHITE}${RRT:-not detected}${NC}"
   echo -e "${CYAN}  OS        : ${WHITE}${OS}${NC}"
   echo ""
 
-  # ── Show what WILL be cleared vs. preserved ───────────────────────────────
   echo -e "${YELLOW}  ⚠️  This will clear (no packages removed):${NC}"
   echo -e "${YELLOW}      • Cluster certs, kubeconfigs, kubelet state${NC}"
   if [[ "$RNT" == "master" ]]; then
@@ -3060,30 +3040,23 @@ run_reset() {
   [[ "$CONF" != "yes" ]] && { echo -e "${YELLOW}  Cancelled.${NC}"; exit 0; }
   echo ""
 
-  # ── Protect SSH before touching iptables ─────────────────────────────────
-  local SSH_PORT
-  SSH_PORT=$(ss -tnlp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -1)
-  [[ -z "$SSH_PORT" ]] && SSH_PORT=22
-  iptables -C INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT 2>/dev/null || \
-    iptables -I INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT
+  _protect_ssh
 
-  # ════════════════════════════════════════════════════════════════════════
   # [1/6] Stop services
-  # ════════════════════════════════════════════════════════════════════════
-  _reset_progress
+  RESET_STEP=$(( RESET_STEP + 1 ))
+  _render_mode_progress "Reset" "$RESET_STEP" "$RESET_TOTAL" "$CYAN"
   echo -e "${YELLOW}  [1/6] Stopping kubelet and runtime...${NC}"
   systemctl stop kubelet 2>/dev/null || true
   [[ -n "$RRT" ]] && systemctl stop "$RRT" 2>/dev/null || true
   echo -e "${GREEN}  ✓ Services stopped${NC}"
 
-  # ════════════════════════════════════════════════════════════════════════
   # [2/6] kubeadm reset
   # Clears: etcd member state, bootstrap tokens, static pod manifests,
   #         /etc/kubernetes/pki, kubelet.conf, controller-manager.conf,
   #         scheduler.conf (all under /etc/kubernetes/).
   # Does NOT remove packages or repos.
-  # ════════════════════════════════════════════════════════════════════════
-  _reset_progress
+  RESET_STEP=$(( RESET_STEP + 1 ))
+  _render_mode_progress "Reset" "$RESET_STEP" "$RESET_TOTAL" "$CYAN"
   echo -e "${YELLOW}  [2/6] Running kubeadm reset...${NC}"
   if command -v kubeadm &>/dev/null; then
     kubeadm reset -f --ignore-preflight-errors=all >> "$LOG_FILE" 2>&1 || true
@@ -3092,32 +3065,22 @@ run_reset() {
     echo -e "${CYAN}  ℹ️  kubeadm not found — skipping${NC}"
   fi
 
-  # ════════════════════════════════════════════════════════════════════════
   # [3/6] Cluster state, certs and configs
   # IMPORTANT: Worker stale-node deletion MUST happen BEFORE /etc/kubernetes
   # is removed — the kubeconfig lives there and is needed to talk to the master.
-  # ════════════════════════════════════════════════════════════════════════
-  _reset_progress
+  RESET_STEP=$(( RESET_STEP + 1 ))
+  _render_mode_progress "Reset" "$RESET_STEP" "$RESET_TOTAL" "$CYAN"
   echo -e "${YELLOW}  [3/6] Removing cluster state, certs and configs...${NC}"
 
-  # ── Worker-only: remove stale node object from master FIRST ───────────
-  # When a worker is reset, its node object stays in etcd on the master.
-  # On re-join with the same hostname the new kubelet inherits the stale node —
-  # Calico finds a conflicting record in its datastore and stalls marking the
-  # node Ready.  Delete it NOW while /etc/kubernetes still exists (kubeconfig
-  # is needed to reach the API server on the master).
   if [[ "$RNT" == "worker" ]]; then
     local _WN; _WN=$(hostname)
     local _KCFG=""
-    # Search live paths — /etc/kubernetes not yet deleted at this point
     for _kc in /root/.kube/config /home/*/.kube/config /etc/kubernetes/kubelet.conf; do
       [[ -f "$_kc" ]] && { _KCFG="$_kc"; break; }
     done
-
     if [[ -n "$_KCFG" ]]; then
       echo -e "${CYAN}    Removing stale node '${_WN}' from master (using ${_KCFG})...${NC}"
-      if KUBECONFIG="$_KCFG" kubectl delete node "$_WN" \
-           --ignore-not-found=true >> "$LOG_FILE" 2>&1; then
+      if KUBECONFIG="$_KCFG" kubectl delete node "$_WN" --ignore-not-found=true >> "$LOG_FILE" 2>&1; then
         echo -e "${GREEN}    ✓ Stale node '${_WN}' removed — clean re-join guaranteed${NC}"
         log "Deleted stale worker node ${_WN} from master during reset"
       else
@@ -3133,95 +3096,52 @@ run_reset() {
     fi
   fi
 
-  # ── Common (master + worker): remove cluster dirs AFTER stale-node cleanup ─
-  # /etc/kubernetes: certs, manifests, kubelet.conf, bootstrap-kubelet.conf,
-  #                  admin.conf (master), k8s-version.txt, cni-*.txt
-  rm -rf /etc/kubernetes
-
-  # kubelet working dir: pod logs, volumes, device plugins, checkpoint state
-  rm -rf /var/lib/kubelet
-
-  rm -rf /var/run/kubernetes
+  rm -rf /etc/kubernetes /var/lib/kubelet /var/run/kubernetes
   umount -l /run/calico/cgroup 2>/dev/null || true
-
-  # Unmount active pod sandbox mounts so rm -rf /var/lib/kubelet completes cleanly.
-  # IMPORTANT: do NOT touch /var/lib/containers/storage or /var/lib/containerd —
-  # those hold the image cache and must survive reset.
-  for _mnt in $(mount 2>/dev/null \
-      | awk '{print $3}' \
-      | grep -E '^/run/containerd/io\.containerd\.runtime|^/run/crio/[a-f0-9]|^/var/lib/kubelet/pods' \
-      | sort -r); do
+  for _mnt in $(mount 2>/dev/null       | awk '{print $3}'       | grep -E '^/run/containerd/io\.containerd\.runtime|^/run/crio/[a-f0-9]|^/var/lib/kubelet/pods'       | sort -r); do
     umount -l "$_mnt" 2>/dev/null || true
   done
 
-  rm -f /etc/crictl.yaml
-  rm -f /etc/default/kubelet /etc/sysconfig/kubelet
+  rm -f /etc/crictl.yaml /etc/default/kubelet /etc/sysconfig/kubelet
   rm -f "$K8S_VERSION_FILE" "$CNI_CONFIG_FILE" "$CNI_IFACE_FILE" "$NODE_TYPE_FILE"
-  rm -f /etc/fstab.backup-*
-  rm -f /tmp/calico*.yaml /tmp/kube-flannel.yaml
+  rm -f /etc/fstab.backup-* /tmp/calico*.yaml /tmp/kube-flannel.yaml
 
-  # ── Master-only ────────────────────────────────────────────────────────
   if [[ "$RNT" == "master" ]]; then
-    rm -rf /var/lib/etcd
-    rm -rf /root/.kube
+    rm -rf /var/lib/etcd /root/.kube
     for _d in /home/*; do [[ -d "${_d}/.kube" ]] && rm -rf "${_d}/.kube"; done
     rm -f /root/kubeadm-config.yaml
     echo -e "${CYAN}    ✓ Master: etcd, /root/.kube, ~/username/.kube, kubeadm-config.yaml${NC}"
   fi
-
   echo -e "${GREEN}  ✓ Cluster state, certs and configs removed${NC}"
 
-  # ════════════════════════════════════════════════════════════════════════
   # [4/6] CNI network state
   # Binaries in /opt/cni/bin are preserved — only runtime state is cleared.
   # Order: netns → interfaces → iptables → dirs
-  # ════════════════════════════════════════════════════════════════════════
-  _reset_progress
+  RESET_STEP=$(( RESET_STEP + 1 ))
+  _render_mode_progress "Reset" "$RESET_STEP" "$RESET_TOTAL" "$CYAN"
   echo -e "${YELLOW}  [4/6] Cleaning CNI network state...${NC}"
-
-  # Release pod network namespaces FIRST so veth peer references are dropped
   _cleanup_namespaces
-
-  # Remove virtual interfaces left by Calico / Flannel
   _cleanup_cni_interfaces
-
-  # Flush KUBE-* and cali*/CALICO* iptables chains
   _cleanup_iptables_kube
-
-  # CNI runtime state dirs (binaries in /opt/cni/bin are preserved)
-  rm -rf /etc/cni/net.d \
-         /var/lib/cni   \
-         /var/lib/calico \
-         /run/flannel   \
-         /run/calico    \
-         /run/nodeagent \
-         /run/netns
-
-  # /run/crio/ contains only sockets and ephemeral state — recreated on start
+  rm -rf /etc/cni/net.d /var/lib/cni /var/lib/calico          /run/flannel /run/calico /run/nodeagent /run/netns
   rm -rf /run/crio 2>/dev/null || true
-
   echo -e "${GREEN}  ✓ CNI network state cleaned${NC}"
 
-  # ════════════════════════════════════════════════════════════════════════
   # [5/6] Restore runtime config integrity
   # Runtime package stays; ensure config is healthy before restart.
-  # ════════════════════════════════════════════════════════════════════════
-  _reset_progress
+  RESET_STEP=$(( RESET_STEP + 1 ))
+  _render_mode_progress "Reset" "$RESET_STEP" "$RESET_TOTAL" "$CYAN"
   echo -e "${YELLOW}  [5/6] Restoring runtime config...${NC}"
-
   if [[ "$RRT" == "containerd" ]]; then
     local _CFG_GOOD=true
-    # Check file exists, is non-empty, and has SystemdCgroup = true
-    if [[ ! -s /etc/containerd/config.toml ]]; then
-      _CFG_GOOD=false
-    elif ! grep -q "SystemdCgroup = true" /etc/containerd/config.toml 2>/dev/null; then
-      _CFG_GOOD=false
-    fi
+    [[ ! -s /etc/containerd/config.toml ]] && _CFG_GOOD=false
+    ! grep -q "SystemdCgroup = true" /etc/containerd/config.toml 2>/dev/null && _CFG_GOOD=false
     if [[ "$_CFG_GOOD" == false ]]; then
       mkdir -p /etc/containerd
       containerd config default > /etc/containerd/config.toml 2>/dev/null
       sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-      echo -e "${CYAN}    ✓ containerd config.toml regenerated (SystemdCgroup=true)${NC}"
+      sed -i 's|sandbox_image = ".*"|sandbox_image = "registry.k8s.io/pause:3.10"|'         /etc/containerd/config.toml
+      echo -e "${CYAN}    ✓ containerd config.toml regenerated (SystemdCgroup=true, pause=3.10)${NC}"
     else
       echo -e "${CYAN}    ✓ containerd config.toml intact and correct${NC}"
     fi
@@ -3232,24 +3152,18 @@ run_reset() {
   fi
   echo -e "${GREEN}  ✓ Runtime config verified${NC}"
 
-  # ════════════════════════════════════════════════════════════════════════
   # [6/6] Restart runtime and re-enable kubelet unit
   # kubelet itself is NOT started here — it has nothing to connect to yet.
   # It will be started by kubeadm init/join during the next --init run.
-  # ════════════════════════════════════════════════════════════════════════
-  _reset_progress
+  RESET_STEP=$(( RESET_STEP + 1 ))
+  _render_mode_progress "Reset" "$RESET_STEP" "$RESET_TOTAL" "$CYAN"
   echo -e "${YELLOW}  [6/6] Restarting runtime and preparing kubelet unit...${NC}"
-
-  # Write crictl.yaml + drop-in BEFORE restarting runtime so that
-  # ExecStartPost runs with the drop-in in place and sets socket permissions.
   echo -e "${CYAN}    Writing crictl config and socket drop-in before runtime restart...${NC}"
   _restore_crictl_config "$RRT"
   echo -e "${GREEN}    ✓ /etc/crictl.yaml written, drop-in installed, systemd reloaded${NC}"
 
   if [[ -n "$RRT" ]]; then
-    systemctl restart "$RRT" 2>/dev/null && \
-      echo -e "${CYAN}    ✓ ${RRT} restarted (socket permissions applied via ExecStartPost)${NC}" || \
-      echo -e "${YELLOW}    ⚠️  ${RRT} restart failed — check: journalctl -u ${RRT} -n 20${NC}"
+    systemctl restart "$RRT" 2>/dev/null &&       echo -e "${CYAN}    ✓ ${RRT} restarted (socket permissions applied via ExecStartPost)${NC}" ||       echo -e "${YELLOW}    ⚠️  ${RRT} restart failed — check: journalctl -u ${RRT} -n 20${NC}"
     sleep 1
     local _SOCK=""
     [[ "$RRT" == "containerd" ]] && _SOCK="/run/containerd/containerd.sock"
@@ -3277,11 +3191,7 @@ run_reset() {
   fi
   echo -e "${GREEN}  ✓ Runtime ready, kubelet unit enabled${NC}"
 
-  # ════════════════════════════════════════════════════════════════════════
-  # RESET COMPLETE BANNER
-  # ════════════════════════════════════════════════════════════════════════
   local _RESET_ET=$(( $(date +%s) - START_TIME ))
-  _reset_progress_complete
   print_header "RESET COMPLETE  (${RNT^^})"
 
   echo -e "${GREEN}  ✔ Cleared (cluster state):${NC}"
@@ -3309,146 +3219,30 @@ run_reset() {
   fi
   echo ""
 
-  # ── Show installed K8s component versions ────────────────────────────────
-  local _KA_VER; _KA_VER=$(kubeadm version -o short 2>/dev/null | sed 's/^v//')
-  local _KL_VER;  _KL_VER=$(kubelet --version 2>/dev/null | awk '{print $2}' | sed 's/^v//')
-  local _KT_VER;  _KT_VER=$(kubectl version --client -o json 2>/dev/null \
-                             | grep '"gitVersion"' | head -1 | awk -F'"' '{print $4}' | sed 's/^v//')
-  local _RT_VER=""
-  [[ -n "$RRT" ]] && _RT_VER=$($RRT --version 2>/dev/null | head -1 || true)
-
-  if [[ -n "$_KA_VER" || -n "$_KL_VER" ]]; then
-    echo -e "${CYAN}  Installed K8s components (ready for --init):${NC}"
-    [[ -n "$_KA_VER" ]] && echo -e "   ${GREEN}✓${NC} kubeadm   : ${WHITE}v${_KA_VER}${NC}"
-    [[ -n "$_KL_VER" ]] && echo -e "   ${GREEN}✓${NC} kubelet   : ${WHITE}v${_KL_VER}${NC}"
-    [[ -n "$_KT_VER" ]] && echo -e "   ${GREEN}✓${NC} kubectl   : ${WHITE}v${_KT_VER}${NC}"
-    [[ -n "$_RT_VER" ]] && echo -e "   ${GREEN}✓${NC} ${RRT}   : ${WHITE}${_RT_VER}${NC}"
-    echo ""
-    echo -e "${DIM}  Run: ${WHITE}sudo ./k8s-cluster-bootstrap.sh --init${NC}${DIM} to bootstrap again.${NC}"
-    echo -e "${DIM}  Run: ${WHITE}sudo ./k8s-cluster-bootstrap.sh --upgrade${NC}${DIM} to change version first.${NC}"
-  else
-    echo -e "${YELLOW}  ⚠️  kubeadm/kubelet not detected — packages may need re-install (run --init).${NC}"
-  fi
+  _print_installed_k8s_versions "$RRT"
   echo ""
   echo -e "${CYAN}⏱️  Total time : ${WHITE}$(( _RESET_ET/60 ))m $(( _RESET_ET%60 ))s${NC}"
   echo -e "${CYAN}📄 Log file   : ${WHITE}${LOG_FILE}${NC}"
   echo ""
-
-  # ── crictl session notice ─────────────────────────────────────────────────
-  local _INVOKE_USER="${SUDO_USER:-${LOGNAME:-${USER:-}}}"
-  local _IN_GRP=false
-  [[ -n "$_INVOKE_USER" ]] && id -nG "$_INVOKE_USER" 2>/dev/null | grep -qw "k8sadmins" && _IN_GRP=true
-
-  if [[ "$_IN_GRP" == "true" ]]; then
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  crictl — use without sudo                                       ║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
-    echo -e "${YELLOW}  Your current shell session needs a group refresh.${NC}"
-    echo -e "${YELLOW}  Choose one of:${NC}"
-    echo -e "   ${GREEN}A)${NC} Fastest  — run in this terminal: ${WHITE}newgrp k8sadmins${NC}"
-    echo -e "   ${GREEN}B)${NC} Clean    — log out and log back in"
-    echo -e "   ${GREEN}C)${NC} Use sudo — ${WHITE}sudo crictl ps${NC}  (works immediately)"
-    echo ""
-    echo -e "  After refresh, ${WHITE}crictl ps${NC} will work without sudo."
-  fi
+  _print_crictl_session_notice
   echo ""
-  print_credits
+  print_author_banner
 }
 
-# ════════════════════════════════════════════════════════════════════════════
+
 # --destroy
-# ════════════════════════════════════════════════════════════════════════════
 run_destroy() {
-  # Destroy has its own step counter — isolated from --init's CURRENT_STEP
   local DESTROY_STEP=0
   local DESTROY_TOTAL=8
-  _destroy_progress() {
-    DESTROY_STEP=$(( DESTROY_STEP + 1 ))
-    local PCT=$(( DESTROY_STEP * 100 / DESTROY_TOTAL ))
-    local BAR_WIDTH=50
-    local FILLED=$(( PCT * BAR_WIDTH / 100 ))
-    local EMPTY=$(( BAR_WIDTH - FILLED ))
-    [[ $EMPTY -lt 0 ]] && EMPTY=0
-    local BAR; BAR=$(printf "%${FILLED}s" | tr ' ' '█')
-    local SPC; SPC=$(printf "%${EMPTY}s")
-    printf "\n${RED}╔══════════════════════════════════════════════════════════════════╗${NC}\n"
-    printf "${RED}║${NC}  ${YELLOW}Destroy: [%3d%%]${NC} ${RED}%s${DIM}%s${NC}  ${RED}║${NC}\n" "$PCT" "$BAR" "$SPC"
-    printf "${RED}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
-  }
-  _destroy_progress_complete() {
-    local BAR; BAR=$(printf "%50s" | tr ' ' '█')
-    printf "\n${RED}╔══════════════════════════════════════════════════════════════════╗${NC}\n"
-    printf "${RED}║${NC}  ${YELLOW}Destroy: [100%%]${NC} ${RED}%s${NC}  ${RED}║${NC}\n" "$BAR"
-    printf "${RED}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
-  }
 
   print_header "FULL UNINSTALL  --destroy"
 
-  # ── Detect OS early (needed for runtime detection below) ─────────────────
-  source /etc/os-release; OS="$ID"
-  if [[ "$OS" =~ (ubuntu|debian) ]]; then
-    PKG_MANAGER="apt"; PKG_UPDATE="apt-get update -y"; PKG_INSTALL="apt-get install -y"
-  else
-    PKG_MANAGER="dnf"; PKG_UPDATE="dnf makecache"; PKG_INSTALL="dnf install -y"
-  fi
-
-  # ── Detect node type BEFORE showing the confirmation banner ──────────────
-  # Priority (highest → lowest):
-  #   1. node-type.txt — written by --init; reflects the ACTUAL initialized type
-  #      even when --node-type overrode the hostname during that --init run.
-  #   2. --node-type flag — explicit override for this destroy run.
-  #   3. admin.conf / k8s-version.txt — reliable master indicators.
-  #   4. hostname pattern — last resort.
-  # NOTE: kubectl binary presence alone is NOT used — a worker may have kubectl
-  # installed manually, which would falsely trigger master-mode destroy.
-  local NT_D="worker"
-  local _NT_SRC=""
-  if [[ -f "$NODE_TYPE_FILE" ]]; then
-    local _NT_FILE; _NT_FILE=$(cat "$NODE_TYPE_FILE" 2>/dev/null | tr -d '[:space:]')
-    if [[ "$_NT_FILE" == "master" || "$_NT_FILE" == "worker" ]]; then
-      NT_D="$_NT_FILE"
-      _NT_SRC="from --init record (node-type.txt)"
-    fi
-  fi
-  if [[ -z "$_NT_SRC" && -n "${ARG_NODE_TYPE:-}" ]]; then
-    NT_D="$ARG_NODE_TYPE"
-    _NT_SRC="--node-type flag"
-  fi
-  if [[ -z "$_NT_SRC" ]]; then
-    local HN_D; HN_D=$(hostname | tr '[:upper:]' '[:lower:]')
-    if [[ -f /etc/kubernetes/admin.conf ]]; then
-      NT_D="master"; _NT_SRC="admin.conf present"
-    elif [[ -f /etc/kubernetes/k8s-version.txt ]]; then
-      NT_D="master"; _NT_SRC="k8s-version.txt present"
-    elif [[ "$HN_D" =~ master|control ]]; then
-      NT_D="master"; _NT_SRC="hostname pattern"
-    else
-      NT_D="worker"; _NT_SRC="hostname pattern (no master indicators found)"
-    fi
-  fi
-  echo -e "${CYAN}  Node type : ${WHITE}${NT_D^^}${NC} ${DIM}(${_NT_SRC})${NC}"
+  _detect_os_silent
+  _resolve_node_type NT_D
   echo ""
 
-  # ── Detect installed runtime for the confirmation banner ─────────────────
-  local RRT=""
-  if [[ "$PKG_MANAGER" == "apt" ]]; then
-    dpkg-query -W -f='${Status}' containerd   2>/dev/null | grep -qE "ok installed" && RRT="containerd"
-    dpkg-query -W -f='${Status}' containerd.io 2>/dev/null | grep -qE "ok installed" && RRT="containerd"
-    [[ -z "$RRT" ]] && \
-      dpkg-query -W -f='${Status}' cri-o 2>/dev/null | grep -qE "ok installed" && RRT="crio"
-  else
-    rpm -q containerd    &>/dev/null && RRT="containerd"
-    rpm -q containerd.io &>/dev/null && RRT="containerd"
-    [[ -z "$RRT" ]] && rpm -q cri-o &>/dev/null && RRT="crio"
-  fi
-  [[ -z "$RRT" ]] && command -v containerd &>/dev/null && RRT="containerd"
-  [[ -z "$RRT" ]] && command -v crio       &>/dev/null && RRT="crio"
-  [[ -z "$RRT" && -S /run/containerd/containerd.sock ]] && RRT="containerd"
-  [[ -z "$RRT" && -S /var/run/crio/crio.sock          ]] && RRT="crio"
-  [[ -z "$RRT" ]] && systemctl list-unit-files 2>/dev/null | grep -q "^containerd" && RRT="containerd"
-  [[ -z "$RRT" ]] && systemctl list-unit-files 2>/dev/null | grep -q "^crio"       && RRT="crio"
+  _detect_runtime RRT
 
-  # ── Show what WILL be removed (node-type aware) ───────────────────────────
   echo -e "${RED}  ⚠️  This will PERMANENTLY remove:${NC}"
   if [[ "$NT_D" == "master" ]]; then
     echo -e "${RED}      • kubelet  kubeadm  kubectl  cri-tools${NC}"
@@ -3465,19 +3259,14 @@ run_destroy() {
   [[ "$CONF" != "yes" ]] && { echo -e "${YELLOW}  Cancelled.${NC}"; exit 0; }
   echo ""
 
-  # Function-scope tracking — populated by steps [4] and [5], read by the banner
   local _REMOVED_K8S_PKGS=()
   local _REMOVED_RT_PKGS=()
 
-  # Protect SSH before touching iptables
-  local SSH_PORT
-  SSH_PORT=$(ss -tnlp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -1)
-  [[ -z "$SSH_PORT" ]] && SSH_PORT=22
-  iptables -C INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT 2>/dev/null || \
-    iptables -I INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT
+  _protect_ssh
 
   # ── [1/8] Stop & disable all services ───────────────────────────────────
-  _destroy_progress
+  DESTROY_STEP=$(( DESTROY_STEP + 1 ))
+  _render_mode_progress "Destroy" "$DESTROY_STEP" "$DESTROY_TOTAL" "$RED"
   echo -e "${YELLOW}  [1/8] Stopping and disabling services...${NC}"
   systemctl stop    kubelet    2>/dev/null || true
   systemctl disable kubelet    2>/dev/null || true
@@ -3487,10 +3276,6 @@ run_destroy() {
   systemctl disable crio       2>/dev/null || true
   echo -e "${GREEN}  ✓ Services stopped and disabled${NC}"
 
-  # ── Release pod netns and CNI interfaces NOW ─────────────────────────────
-  # Must happen BEFORE runtime is removed — the anonymous bind-mounts under
-  # /var/run/netns/ that hold cali*@ifN veth peer references must be released
-  # while the filesystem is still intact.
   echo -e "${CYAN}  Releasing pod network namespaces and CNI interfaces...${NC}"
   _cleanup_namespaces
   _cleanup_cni_interfaces
@@ -3498,14 +3283,15 @@ run_destroy() {
   echo -e "${GREEN}  ✓ CNI interfaces and namespaces cleared${NC}"
 
   # ── [2/8] kubeadm reset ─────────────────────────────────────────────────
-  _destroy_progress
+  DESTROY_STEP=$(( DESTROY_STEP + 1 ))
+  _render_mode_progress "Destroy" "$DESTROY_STEP" "$DESTROY_TOTAL" "$RED"
   echo -e "${YELLOW}  [2/8] Running kubeadm reset...${NC}"
-  command -v kubeadm &>/dev/null && \
-    kubeadm reset -f --ignore-preflight-errors=all >> "$LOG_FILE" 2>&1 || true
+  command -v kubeadm &>/dev/null &&     kubeadm reset -f --ignore-preflight-errors=all >> "$LOG_FILE" 2>&1 || true
   echo -e "${GREEN}  ✓ kubeadm reset complete${NC}"
 
   # ── [3/8] Drain crictl containers/pods before removing runtime ──────────
-  _destroy_progress
+  DESTROY_STEP=$(( DESTROY_STEP + 1 ))
+  _render_mode_progress "Destroy" "$DESTROY_STEP" "$DESTROY_TOTAL" "$RED"
   echo -e "${YELLOW}  [3/8] Stopping crictl pods and containers...${NC}"
   if command -v crictl &>/dev/null; then
     local SOCK=""
@@ -3522,12 +3308,11 @@ run_destroy() {
   echo -e "${GREEN}  ✓ Containers and pods stopped${NC}"
 
   # ── [4/8] Remove Kubernetes packages + crictl ───────────────────────────
-  _destroy_progress
+  DESTROY_STEP=$(( DESTROY_STEP + 1 ))
+  _render_mode_progress "Destroy" "$DESTROY_STEP" "$DESTROY_TOTAL" "$RED"
   local K8S_PKGS=("kubelet" "kubeadm" "kubernetes-cni" "cri-tools")
   [[ "$NT_D" == "master" ]] && K8S_PKGS+=("kubectl")
-  if [[ "$PKG_MANAGER" == "dnf" ]]; then
-    K8S_PKGS+=("dnf-plugin-versionlock" "python3-dnf-plugin-versionlock")
-  fi
+  [[ "$PKG_MANAGER" == "dnf" ]] && K8S_PKGS+=("dnf-plugin-versionlock" "python3-dnf-plugin-versionlock")
   echo -e "${YELLOW}  [4/8] Removing K8s packages (${NT_D^^}): ${K8S_PKGS[*]}...${NC}"
 
   if [[ "$PKG_MANAGER" == "apt" ]]; then
@@ -3537,8 +3322,7 @@ run_destroy() {
     done
     local _K8S_INSTALLED_APT=()
     for _p in "${K8S_PKGS[@]}"; do
-      dpkg-query -W -f='${Status}' "$_p" 2>/dev/null \
-        | grep -qE "ok installed" && _K8S_INSTALLED_APT+=("$_p")
+      dpkg-query -W -f='${Status}' "$_p" 2>/dev/null         | grep -qE "ok installed" && _K8S_INSTALLED_APT+=("$_p")
     done
     if [[ ${#_K8S_INSTALLED_APT[@]} -gt 0 ]]; then
       echo -e "${CYAN}    Purging: ${_K8S_INSTALLED_APT[*]}${NC}"
@@ -3566,11 +3350,7 @@ run_destroy() {
       echo -e "${CYAN}    ℹ️  No K8s packages installed — skipping${NC}"
     fi
   fi
-  # ── Remove crictl binary from ALL standard paths ────────────────────────
-  # cri-tools package may install crictl to /usr/bin, /usr/local/bin, or /bin.
-  # configure_crictl may also have created a symlink in /usr/local/bin.
-  # Some manual installs drop it directly in /usr/local/bin as a real binary.
-  # Remove every copy so --init's "crictl already present" check never fires.
+
   echo -e "${CYAN}    Removing crictl binary from all paths...${NC}"
   for _cdir in /usr/local/bin /usr/bin /bin /sbin /usr/sbin; do
     if [[ -f "$_cdir/crictl" || -L "$_cdir/crictl" ]]; then
@@ -3579,20 +3359,18 @@ run_destroy() {
       log "destroy: removed ${_cdir}/crictl"
     fi
   done
-  # Hash cache bust: if running in a live shell, force PATH rehash
   hash -r 2>/dev/null || true
   rm -f /usr/local/bin/calicoctl
   echo -e "${GREEN}  ✓ K8s packages removed${NC}"
 
   # ── [5/8] Remove container runtime ──────────────────────────────────────
-  _destroy_progress
+  DESTROY_STEP=$(( DESTROY_STEP + 1 ))
+  _render_mode_progress "Destroy" "$DESTROY_STEP" "$DESTROY_TOTAL" "$RED"
   echo -e "${YELLOW}  [5/8] Removing container runtime...${NC}"
   if [[ "$PKG_MANAGER" == "apt" ]]; then
     local _RT_INSTALLED_APT=()
-    for _pkg in containerd containerd.io cri-o runc docker-ce docker-ce-cli \
-                docker-buildx-plugin docker-compose-plugin; do
-      dpkg-query -W -f='${Status}' "$_pkg" 2>/dev/null \
-        | grep -qE "ok installed" && _RT_INSTALLED_APT+=("$_pkg")
+    for _pkg in containerd containerd.io cri-o runc docker-ce docker-ce-cli                 docker-buildx-plugin docker-compose-plugin; do
+      dpkg-query -W -f='${Status}' "$_pkg" 2>/dev/null         | grep -qE "ok installed" && _RT_INSTALLED_APT+=("$_pkg")
     done
     if [[ ${#_RT_INSTALLED_APT[@]} -gt 0 ]]; then
       echo -e "${CYAN}    Purging: ${_RT_INSTALLED_APT[*]}${NC}"
@@ -3619,7 +3397,8 @@ run_destroy() {
   echo -e "${GREEN}  ✓ Container runtime removed${NC}"
 
   # ── [6/8] Remove prerequisite packages installed by --init ───────────────
-  _destroy_progress
+  DESTROY_STEP=$(( DESTROY_STEP + 1 ))
+  _render_mode_progress "Destroy" "$DESTROY_STEP" "$DESTROY_TOTAL" "$RED"
   echo -e "${YELLOW}  [6/8] Removing prerequisite packages...${NC}"
   if [[ "$PKG_MANAGER" == "apt" ]]; then
     echo -e "${CYAN}    ℹ️  Skipping curl/wget/ca-certificates/gnupg — system packages${NC}"
@@ -3636,7 +3415,8 @@ run_destroy() {
   echo -e "${GREEN}  ✓ Prerequisite packages handled${NC}"
 
   # ── [7/8] Remove firewall rules opened for K8s ──────────────────────────
-  _destroy_progress
+  DESTROY_STEP=$(( DESTROY_STEP + 1 ))
+  _render_mode_progress "Destroy" "$DESTROY_STEP" "$DESTROY_TOTAL" "$RED"
   echo -e "${YELLOW}  [7/8] Removing K8s firewall rules (${NT_D^^})...${NC}"
   if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
     local _FW_PORTS=()
@@ -3669,41 +3449,30 @@ run_destroy() {
   echo -e "${GREEN}  ✓ Firewall rules handled${NC}"
 
   # ── [8/8] Remove repos, GPG keys, data dirs, configs, CNI, iptables ─────
-  _destroy_progress
+  DESTROY_STEP=$(( DESTROY_STEP + 1 ))
+  _render_mode_progress "Destroy" "$DESTROY_STEP" "$DESTROY_TOTAL" "$RED"
   echo -e "${YELLOW}  [8/8] Removing repos, data directories and configs...${NC}"
 
   if [[ "$PKG_MANAGER" == "apt" ]]; then
-    rm -f /etc/apt/sources.list.d/kubernetes.list
-    rm -f /etc/apt/sources.list.d/cri-o.list
-    rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-    rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg
-    rm -f /etc/apt/sources.list.d/docker.list
-    rm -f /etc/apt/sources.list.d/docker-ce.list
-    rm -f /etc/apt/keyrings/docker.gpg
-    rm -f /etc/apt/keyrings/docker-archive-keyring.gpg
+    rm -f /etc/apt/sources.list.d/kubernetes.list /etc/apt/sources.list.d/cri-o.list
+    rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg /etc/apt/keyrings/cri-o-apt-keyring.gpg
+    rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker-ce.list
+    rm -f /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/docker-archive-keyring.gpg
     rm -f /etc/apt/trusted.gpg.d/docker*.gpg
     rm -f /etc/apt/sources.list.d/docker* 2>/dev/null || true
     rm -f /etc/apt/keyrings/docker* 2>/dev/null || true
-    rm -f /var/lib/apt/lists/pkgs.k8s.io_* 2>/dev/null || true
-    rm -f /var/lib/apt/lists/download.docker.com_* 2>/dev/null || true
-    rm -f /var/lib/apt/lists/lock 2>/dev/null || true
-    rm -f /var/cache/apt/archives/lock 2>/dev/null || true
-    rm -f /var/lib/needrestart/restart-required.d/containerd* 2>/dev/null || true
-    rm -f /var/lib/needrestart/restart-required.d/crio*       2>/dev/null || true
+    rm -f /var/lib/apt/lists/pkgs.k8s.io_* /var/lib/apt/lists/download.docker.com_* 2>/dev/null || true
+    rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
+    rm -f /var/lib/needrestart/restart-required.d/containerd*           /var/lib/needrestart/restart-required.d/crio* 2>/dev/null || true
     if [[ -f /etc/needrestart/needrestart.conf ]]; then
-      perl -i -pe 's{^\s*\$nrconf\{restart\}.*}{\$nrconf{restart} = q(l);}g' \
-        /etc/needrestart/needrestart.conf 2>/dev/null || true
+      perl -i -pe 's{^\s*\$nrconf\{restart\}.*}{\$nrconf{restart} = q(l);}g'         /etc/needrestart/needrestart.conf 2>/dev/null || true
     fi
   else
-    rm -f /etc/yum.repos.d/kubernetes.repo
-    rm -f /etc/yum.repos.d/cri-o.repo
-    rm -f /etc/yum.repos.d/docker-ce.repo
+    rm -f /etc/yum.repos.d/kubernetes.repo /etc/yum.repos.d/cri-o.repo /etc/yum.repos.d/docker-ce.repo
     for _repo_cache in kubernetes docker-ce-stable cri-o epel; do
       rm -rf /var/cache/dnf/${_repo_cache}* 2>/dev/null || true
     done
-    find /var/cache/dnf -maxdepth 1 -type d \
-      \( -name 'kubernetes*' -o -name 'docker*' -o -name 'cri-o*' -o -name 'epel*' \) \
-      -exec rm -rf {} + 2>/dev/null || true
+    find /var/cache/dnf -maxdepth 1 -type d       \( -name 'kubernetes*' -o -name 'docker*' -o -name 'cri-o*' -o -name 'epel*' \)       -exec rm -rf {} + 2>/dev/null || true
     mkdir -p /etc/dnf/plugins && touch /etc/dnf/plugins/versionlock.list 2>/dev/null || true
     for _pkg in kubelet kubeadm kubectl cri-tools kubernetes-cni; do
       dnf versionlock delete "$_pkg" --disablerepo="*" 2>/dev/null || true
@@ -3712,39 +3481,25 @@ run_destroy() {
 
   echo -e "${CYAN}    Unmounting runtime mounts (shm/rootfs/cgroup)...${NC}"
   umount -l /run/calico/cgroup 2>/dev/null || true
-  for _mnt in $(mount 2>/dev/null \
-      | awk '{print $3}' \
-      | grep -E '^/run/containerd|^/run/crio|^/run/calico/cgroup|^/var/lib/kubelet/pods|^/var/lib/containers' \
-      | sort -r); do
+  for _mnt in $(mount 2>/dev/null       | awk '{print $3}'       | grep -E '^/run/containerd|^/run/crio|^/run/calico/cgroup|^/var/lib/kubelet/pods|^/var/lib/containers'       | sort -r); do
     umount -l "$_mnt" 2>/dev/null || true
   done
 
-  rm -rf \
-    /etc/kubernetes    /var/lib/kubelet    /var/run/kubernetes \
-    /etc/containerd    /var/lib/containerd /run/containerd     \
-    /etc/crio          /var/lib/crio       /var/lib/containers /run/crio \
-    /var/cache/containers \
-    /etc/cni           /opt/cni            /var/lib/cni        /run/flannel \
-    /run/calico        /run/nodeagent      /run/netns
+  rm -rf     /etc/kubernetes    /var/lib/kubelet    /var/run/kubernetes     /etc/containerd    /var/lib/containerd /run/containerd         /etc/crio          /var/lib/crio       /var/lib/containers /run/crio     /var/cache/containers     /etc/cni           /opt/cni            /var/lib/cni        /run/flannel     /run/calico        /run/nodeagent      /run/netns
 
-  # Rocky/RHEL: remove GPG keys imported to RPM keyring by --init
   if [[ "$PKG_MANAGER" == "dnf" ]]; then
     local _DOCKER_GPGKEY
-    _DOCKER_GPGKEY=$(rpm -q gpg-pubkey --qf "%{VERSION}-%{RELEASE}\n" 2>/dev/null \
-      | while read -r ver; do
+    _DOCKER_GPGKEY=$(rpm -q gpg-pubkey --qf "%{VERSION}-%{RELEASE}\n" 2>/dev/null       | while read -r ver; do
           fingerprint=$(rpm -qi "gpg-pubkey-${ver}" 2>/dev/null | grep -i "docker\|Docker")
           [[ -n "$fingerprint" ]] && echo "$ver"
         done | head -1)
-    [[ -n "$_DOCKER_GPGKEY" ]] && \
-      rpm -e "gpg-pubkey-${_DOCKER_GPGKEY}" 2>/dev/null || true
+    [[ -n "$_DOCKER_GPGKEY" ]] && rpm -e "gpg-pubkey-${_DOCKER_GPGKEY}" 2>/dev/null || true
     local _CRIO_GPGKEY
-    _CRIO_GPGKEY=$(rpm -q gpg-pubkey --qf "%{VERSION}-%{RELEASE}\n" 2>/dev/null \
-      | while read -r ver; do
+    _CRIO_GPGKEY=$(rpm -q gpg-pubkey --qf "%{VERSION}-%{RELEASE}\n" 2>/dev/null       | while read -r ver; do
           fingerprint=$(rpm -qi "gpg-pubkey-${ver}" 2>/dev/null | grep -i "cri-o\|kubernetes\|pkgs.k8s.io")
           [[ -n "$fingerprint" ]] && echo "$ver"
         done | head -1)
-    [[ -n "$_CRIO_GPGKEY" ]] && \
-      rpm -e "gpg-pubkey-${_CRIO_GPGKEY}" 2>/dev/null || true
+    [[ -n "$_CRIO_GPGKEY" ]] && rpm -e "gpg-pubkey-${_CRIO_GPGKEY}" 2>/dev/null || true
     rm -f /etc/pki/rpm-gpg/RPM-GPG-KEY-Docker
     rm -f /etc/pki/rpm-gpg/RPM-GPG-KEY-CRI-O
     rm -f /etc/pki/rpm-gpg/RPM-GPG-KEY-kubernetes* 2>/dev/null || true
@@ -3771,11 +3526,7 @@ run_destroy() {
   systemctl daemon-reload
   echo -e "${GREEN}  ✓ Repos, data directories and configs removed${NC}"
 
-  # ════════════════════════════════════════════════════════════════════════
-  # DESTROY COMPLETE BANNER
-  # ════════════════════════════════════════════════════════════════════════
   local _DESTROY_ET=$(( $(date +%s) - START_TIME ))
-  _destroy_progress_complete
   print_header "DESTROY COMPLETE  (${NT_D^^})"
 
   if [[ ${#_REMOVED_K8S_PKGS[@]} -gt 0 ]]; then
@@ -3810,39 +3561,20 @@ run_destroy() {
   echo ""
   echo -e "${CYAN}  To re-install: ${WHITE}sudo ./k8s-cluster-bootstrap.sh --init${NC}"
   echo ""
-  print_credits
+  print_author_banner
 }
 
-# ════════════════════════════════════════════════════════════════════════════
+
 # --upgrade
-# ════════════════════════════════════════════════════════════════════════════
 run_upgrade() {
   print_header "KUBERNETES VERSION UPGRADE"
 
-  source /etc/os-release; OS="$ID"
-  if [[ "$OS" =~ (ubuntu|debian) ]]; then
-    PKG_MANAGER="apt"; PKG_UPDATE="apt-get update -y"; PKG_INSTALL="apt-get install -y"
-  elif [[ "$OS" =~ (rhel|rocky|centos|almalinux) ]]; then
-    PKG_MANAGER="dnf"; PKG_UPDATE="dnf makecache"; PKG_INSTALL="dnf install -y"
-  else
-    echo -e "${RED}  ❌ Unsupported OS: $OS${NC}"; exit 1
-  fi
-
-  local HN; HN=$(hostname | tr '[:upper:]' '[:lower:]')
-  local UGTYPE="worker"
-  if [[ -n "$ARG_NODE_TYPE" ]]; then
-    UGTYPE="$ARG_NODE_TYPE"
-    echo -e "${CYAN}  Node type : ${WHITE}${UGTYPE^^}${GREEN} (--node-type override)${NC}"
-  elif [[ "$HN" =~ master|control ]]; then
-    UGTYPE="master"
-  fi
+  _detect_os_silent
+  _resolve_node_type UGTYPE
   echo -e "${CYAN}  OS        : ${WHITE}${OS}${NC}"
-  echo -e "${CYAN}  Node type : ${WHITE}${UGTYPE^^}${NC}"
   echo ""
 
-  # ════════════════════════════════════════════════════════════════════════
   # PRE-FLIGHT: check what is actually installed before doing anything
-  # ════════════════════════════════════════════════════════════════════════
   local CURRENT=""
   CURRENT=$(kubelet --version 2>/dev/null | awk '{print $2}' | sed 's/^v//')
 
@@ -3850,7 +3582,6 @@ run_upgrade() {
   command -v kubeadm &>/dev/null && KA_OK=true
   command -v kubelet &>/dev/null && KB_OK=true
 
-  # ── Case 1: Nothing installed at all ─────────────────────────────────────
   if [[ "$KA_OK" == false && "$KB_OK" == false ]]; then
     echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${RED}║  ❌  NO KUBERNETES INSTALLATION FOUND                         ║${NC}"
@@ -3865,10 +3596,6 @@ run_upgrade() {
     exit 1
   fi
 
-  # ── Case 2: K8s binaries present but NO container runtime ────────────────
-  # --upgrade only upgrades kubeadm/kubelet/kubectl — it does not install or
-  # repair a missing runtime.  --init is idempotent and will detect the existing
-  # K8s version, skip already-done steps, and install the missing runtime + CNI.
   local RRT=""
   systemctl list-unit-files 2>/dev/null | grep -q "^containerd" && \
     systemctl is-active --quiet containerd 2>/dev/null && RRT="containerd"
@@ -3897,7 +3624,6 @@ run_upgrade() {
     exit 1
   fi
 
-  # ── Case 3: Normal upgrade path — K8s + runtime both present ─────────────
   if [[ -z "$CURRENT" ]]; then
     echo -e "${RED}  ❌ Cannot determine installed version — kubelet may be broken.${NC}"
     echo -e "${YELLOW}     Try: sudo ./k8s-cluster-bootstrap.sh --init${NC}"
@@ -3911,16 +3637,15 @@ run_upgrade() {
   show_static_version_table
 
   local -a ALL_VERSIONS=(
-    "1.33.0" "1.33.1" "1.33.2"
+    "1.35.0" "1.35.1"
+    "1.34.0" "1.34.1" "1.34.2" "1.34.3"
+    "1.33.0" "1.33.1" "1.33.2" "1.33.3"
     "1.32.0" "1.32.1" "1.32.2" "1.32.3" "1.32.4" "1.32.5"
     "1.31.0" "1.31.1" "1.31.2" "1.31.3" "1.31.4" "1.31.5"
     "1.31.6" "1.31.7" "1.31.8" "1.31.9"
     "1.30.0" "1.30.1" "1.30.2" "1.30.3" "1.30.4" "1.30.5"
     "1.30.6" "1.30.7" "1.30.8" "1.30.9" "1.30.10" "1.30.11"
     "1.30.12" "1.30.13"
-    "1.29.0" "1.29.1" "1.29.2" "1.29.3" "1.29.4" "1.29.5"
-    "1.29.6" "1.29.7" "1.29.8" "1.29.9" "1.29.10" "1.29.11"
-    "1.29.12" "1.29.13" "1.29.14" "1.29.15"
   )
 
   echo -e "${CYAN}  Versions available above v${CURRENT}:${NC}"
@@ -3950,7 +3675,7 @@ run_upgrade() {
 
   echo ""
   local SEL
-  prompt_input "  Select number or enter version manually (e.g. 1.33.3): " SEL
+  prompt_input "  Select number or enter version manually (e.g. 1.32.3): " SEL
 
   local TARGET=""
   if [[ "$SEL" =~ ^[0-9]+$ ]] && [[ -n "${VER_MAP[$SEL]:-}" ]]; then
@@ -3959,12 +3684,10 @@ run_upgrade() {
     TARGET="${SEL#v}"
   fi
 
-  # ── Version format validation ────────────────────────────────────────────
   if [[ -z "$TARGET" || ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo -e "${RED}  ❌ Invalid version format — use x.y.z (e.g. 1.32.3)${NC}"; exit 1
   fi
 
-  # ── Same version (idempotent / already installed) ────────────────────────
   if [[ "$TARGET" == "$CURRENT" ]]; then
     echo ""
     echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
@@ -3978,7 +3701,6 @@ run_upgrade() {
     exit 0
   fi
 
-  # ── Downgrade blocked ────────────────────────────────────────────────────
   local highest
   highest=$(printf '%s\n%s\n' "$CURRENT" "$TARGET" | sort -V | tail -1)
   if [[ "$highest" != "$TARGET" ]]; then
@@ -3995,7 +3717,6 @@ run_upgrade() {
     exit 1
   fi
 
-  # ── Confirm and proceed ──────────────────────────────────────────────────
   echo ""
   echo -e "  ${CYAN}Installed : ${YELLOW}v${CURRENT}${NC}"
   echo -e "  ${CYAN}Target    : ${GREEN}v${TARGET}${NC}"
@@ -4074,16 +3795,10 @@ run_upgrade() {
   echo ""
 }
 
-# ════════════════════════════════════════════════════════════════════════════
-# MAIN INIT PIPELINE
-# ════════════════════════════════════════════════════════════════════════════
-# ════════════════════════════════════════════════════════════════════════════
 # IDEMPOTENCY GATE
-#
 # Called at the very start of run_init, BEFORE any install steps.
 # Inspects the current state of the node and takes the minimum necessary
 # action, exiting early when the cluster is already healthy.
-#
 # State machine:
 #  STATE 1 — Cluster fully running & API responding
 #              → Print live cluster status banner → EXIT 0 (nothing to do)
@@ -4094,12 +3809,8 @@ run_upgrade() {
 #              → Return 1 (let run_init re-initialize)
 #  STATE 4 — Fresh node (no /etc/kubernetes at all)
 #              → Return 0 (let run_init proceed normally)
-# ════════════════════════════════════════════════════════════════════════════
 _check_cluster_idempotent() {
 
-  # ── Shared helpers ────────────────────────────────────────────────────────
-  # Recover globals that the banner functions depend on.
-  # Safe to call before run_init's full pipeline because we only read files.
   _recover_context() {
     K8S_VERSION=$(_get_installed_k8s_version kubelet 2>/dev/null || echo "unknown")
     [[ -f "$K8S_VERSION_FILE" ]] && K8S_VERSION=$(cat "$K8S_VERSION_FILE")
@@ -4111,14 +3822,12 @@ _check_cluster_idempotent() {
     [[ -f "$CNI_IFACE_FILE"  ]] && HOST_ONLY_IFACE=$(cat "$CNI_IFACE_FILE")
   }
 
-  # ── Determine node type early ─────────────────────────────────────────────
   local _HN; _HN=$(hostname | tr '[:upper:]' '[:lower:]')
   local _NT="worker"
   [[ -n "${ARG_NODE_TYPE:-}" ]]                                    && _NT="$ARG_NODE_TYPE"
   [[ "$_HN" =~ master|control ]]                                   && _NT="master"
   [[ -f /etc/kubernetes/admin.conf ]] && command -v kubectl &>/dev/null && _NT="master"
 
-  # ── Common state probes ───────────────────────────────────────────────────
   local _K8S_VER; _K8S_VER=$(_get_installed_k8s_version kubelet 2>/dev/null || echo "")
   local _KUBELET_ACTIVE=false
   systemctl is-active --quiet kubelet 2>/dev/null && _KUBELET_ACTIVE=true
@@ -4135,8 +3844,6 @@ _check_cluster_idempotent() {
       kubectl get nodes &>/dev/null 2>&1 && _API_UP=true
     fi
 
-    # ── MASTER STATE 1: kubelet active + API responding ─────────────────────
-    # → cluster is fully healthy, nothing to do
     if [[ "$_KUBELET_ACTIVE" == true && "$_API_UP" == true ]]; then
       _recover_context
       print_header "CLUSTER ALREADY RUNNING  (MASTER)"
@@ -4174,8 +3881,6 @@ _check_cluster_idempotent() {
       exit 0
     fi
 
-    # ── MASTER STATE 2: init done, kubelet inactive ─────────────────────────
-    # → restart kubelet, wait for API, monitor pods, print recovery banner
     if [[ "$_INIT_DONE" == true && "$_KUBELET_ACTIVE" == false ]]; then
       print_header "MASTER INITIALIZED — KUBELET STOPPED"
       echo -e "${YELLOW}  ⚠️  kubelet is inactive but cluster was previously initialized.${NC}"
@@ -4223,7 +3928,7 @@ _check_cluster_idempotent() {
         echo ""
         echo -e "${DIM}  Log: ${WHITE}${LOG_FILE}${NC}"
         echo ""
-        print_credits
+        print_author_banner
       } || {
         echo -e "${RED}  ❌ Pods not fully ready after recovery${NC}"
         echo -e "${YELLOW}  Run: ${WHITE}sudo ./k8s-cluster-bootstrap.sh --reset${NC}${YELLOW} then --init${NC}"
@@ -4243,8 +3948,6 @@ _check_cluster_idempotent() {
       exit 1
     fi
 
-    # ── MASTER STATE 4: /etc/kubernetes missing entirely ───────────────────
-    # → fresh master, let run_init proceed normally
     return 0
   fi
 
@@ -4258,18 +3961,12 @@ _check_cluster_idempotent() {
   local _JOINED=false   # kubelet.conf written by kubeadm join
   [[ -f /etc/kubernetes/kubelet.conf ]] && _JOINED=true
 
-  # Helper: check if the CNI agent container is Running on this worker.
-  # Uses crictl --state running (built-in filter) to avoid the variable-width
-  # CREATED column parsing bug — see wait_for_worker_pods_ready for details.
   _worker_cni_running() {
     crictl ps --state running 2>/dev/null | grep -qE "calico-node|flannel"
   }
 
-  # Helper: check if VXLAN interface is up (Calico only)
   _vxlan_up() { ip link show vxlan.calico &>/dev/null; }
 
-  # ── WORKER STATE 1: kubelet active + CNI agent Running ─────────────────
-  # → worker fully healthy, nothing to do
   if [[ "$_JOINED" == true && "$_KUBELET_ACTIVE" == true ]] && _worker_cni_running; then
     _recover_context
     print_header "WORKER ALREADY RUNNING"
@@ -4292,9 +3989,6 @@ _check_cluster_idempotent() {
     exit 0
   fi
 
-  # ── WORKER STATE 2: kubelet active but CNI agent not yet Running ────────
-  # → worker joined, kubelet running, just waiting for calico-node to start
-  # → monitor and print banner — no action needed
   if [[ "$_JOINED" == true && "$_KUBELET_ACTIVE" == true ]] && ! _worker_cni_running; then
     _recover_context
     print_header "WORKER RUNNING — WAITING FOR CNI"
@@ -4304,7 +3998,6 @@ _check_cluster_idempotent() {
     echo ""
     echo -e "${YELLOW}  Monitoring CNI agent startup (this is normal after a node restart)...${NC}"
     echo ""
-    # Reuse wait_for_worker_pods_ready — it handles resolvConf patch + calico wait
     if wait_for_worker_pods_ready; then
       _print_worker_recovered_banner "kubelet already running — CNI agent monitored"
     else
@@ -4315,8 +4008,6 @@ _check_cluster_idempotent() {
     exit 0
   fi
 
-  # ── WORKER STATE 3: joined but kubelet inactive ─────────────────────────
-  # → restart kubelet, apply resolvConf patch (Rocky), monitor CNI, banner
   if [[ "$_JOINED" == true && "$_KUBELET_ACTIVE" == false ]]; then
     _recover_context
     print_header "WORKER INITIALIZED — KUBELET STOPPED"
@@ -4340,7 +4031,6 @@ _check_cluster_idempotent() {
     fi
     echo -e "${GREEN}  ✓ kubelet restarted${NC}"
     echo ""
-    # wait_for_worker_pods_ready handles Rocky resolvConf patch + calico-node monitoring
     if wait_for_worker_pods_ready; then
       _print_worker_recovered_banner "kubelet restarted"
     else
@@ -4351,8 +4041,6 @@ _check_cluster_idempotent() {
     exit 0
   fi
 
-  # ── WORKER STATE 4: kubelet.conf missing ────────────────────────────────
-  # → fresh worker, has never joined — let run_init proceed to bootstrap_worker
   return 0
 }
 
@@ -4374,7 +4062,7 @@ _print_worker_recovered_banner() {
   echo -e "${CYAN}⏱️  Total time : ${WHITE}$((ET/60))m $((ET%60))s${NC}"
   echo -e "${CYAN}📄 Log file   : ${WHITE}${LOG_FILE}${NC}"
   echo ""
-  print_credits
+  print_author_banner
 }
 
 run_init() {
@@ -4426,9 +4114,7 @@ run_init() {
   fi
 }
 
-# ════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
-# ════════════════════════════════════════════════════════════════════════════
 parse_arguments "$@"
 check_root "$@"
 setup_logging "$@"
