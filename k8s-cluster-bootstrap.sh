@@ -49,6 +49,7 @@ CURRENT_STEP=0
 K8S_VERSION_FILE="/etc/kubernetes/k8s-version.txt"
 CNI_CONFIG_FILE="/etc/kubernetes/cni-config.txt"
 CNI_IFACE_FILE="/etc/kubernetes/cni-iface.txt"
+NODE_TYPE_FILE="/etc/kubernetes/node-type.txt"
 
 POD_CIDR="10.244.0.0/16"
 
@@ -567,6 +568,15 @@ validate_hostname() {
   fi
 
   echo -e "${GREEN}✓ Node Type: ${BOLD}${WHITE}${NODE_TYPE^^}${NC}"
+
+  # ── Persist the resolved node type ─────────────────────────────────────────
+  # Written here so --reset / --destroy always know what --init actually
+  # initialized, even when --node-type overrode the hostname convention.
+  # Priority for reset/destroy: node-type.txt > --node-type flag > hostname.
+  mkdir -p /etc/kubernetes
+  echo "$NODE_TYPE" > "$NODE_TYPE_FILE"
+  log "validate_hostname: persisted node type '${NODE_TYPE}' → ${NODE_TYPE_FILE}"
+
   local FHN; FHN=$(hostname)
 
   # ── /etc/hosts: ensure HOST_ONLY_IP → hostname is present ─────────────────
@@ -1571,7 +1581,22 @@ TMPEOF
 configure_crictl() {
   progress
   echo -e "${YELLOW}🔧 Configuring crictl...${NC}"
-  if ! command -v crictl &>/dev/null; then
+
+  # Check if crictl exists AND is executable/functional
+  local _CRICTL_OK=false
+  if command -v crictl &>/dev/null; then
+    # Verify it's a real binary, not a broken symlink
+    local _CRICTL_PATH; _CRICTL_PATH=$(command -v crictl 2>/dev/null)
+    if [[ -x "$_CRICTL_PATH" ]]; then
+      _CRICTL_OK=true
+      echo -e "${GREEN}  ✓ crictl already present${NC} ${DIM}(${_CRICTL_PATH})${NC}"
+    else
+      echo -e "${YELLOW}  ⚠️  crictl found at ${_CRICTL_PATH} but not executable — reinstalling${NC}"
+      rm -f "$_CRICTL_PATH" 2>/dev/null || true
+    fi
+  fi
+
+  if [[ "$_CRICTL_OK" == false ]]; then
     echo -e "${CYAN}  ⬇  Installing cri-tools...${NC}"
     if [[ "$OS" =~ (ubuntu|debian) ]]; then
       apt-get install -y -qq cri-tools >> "$LOG_FILE" 2>&1
@@ -1579,8 +1604,6 @@ configure_crictl() {
       dnf install -y -q --disableexcludes=kubernetes cri-tools >> "$LOG_FILE" 2>&1
     fi
     echo -e "${GREEN}  ✓ cri-tools installed${NC}"
-  else
-    echo -e "${GREEN}  ✓ crictl already present${NC}"
   fi
 
   # ── Ensure crictl is visible in $PATH (kubeadm preflight checks $PATH) ──────
@@ -2964,20 +2987,36 @@ run_reset() {
   fi
 
   # ── Detect node type ──────────────────────────────────────────────────────
-  local HN; HN=$(hostname | tr '[:upper:]' '[:lower:]')
+  # Priority (highest → lowest):
+  #   1. node-type.txt — written by --init; reflects the ACTUAL initialized type
+  #      even when --node-type overrode the hostname during that --init run.
+  #   2. --node-type flag — explicit override for this reset run.
+  #   3. kubectl + admin.conf — reliable master indicator when file absent.
+  #   4. hostname pattern — last resort.
   local RNT="worker"   # safe default
-  if [[ -n "${ARG_NODE_TYPE:-}" ]]; then
-    RNT="$ARG_NODE_TYPE"
-    echo -e "${CYAN}  Node type : ${WHITE}${RNT^^}${GREEN} (--node-type override)${NC}"
-  elif [[ "$HN" =~ master|control ]]; then
-    RNT="master"
-    echo -e "${CYAN}  Node type : ${WHITE}MASTER${NC} ${DIM}(detected from hostname)${NC}"
-  elif command -v kubectl &>/dev/null && [[ -f /etc/kubernetes/admin.conf ]]; then
-    RNT="master"
-    echo -e "${CYAN}  Node type : ${WHITE}MASTER${NC} ${DIM}(detected: kubectl + admin.conf present)${NC}"
-  else
-    echo -e "${CYAN}  Node type : ${WHITE}WORKER${NC} ${DIM}(detected from hostname)${NC}"
+  local _NT_SOURCE=""
+  if [[ -f "$NODE_TYPE_FILE" ]]; then
+    local _NT_FROM_FILE; _NT_FROM_FILE=$(cat "$NODE_TYPE_FILE" 2>/dev/null | tr -d '[:space:]')
+    if [[ "$_NT_FROM_FILE" == "master" || "$_NT_FROM_FILE" == "worker" ]]; then
+      RNT="$_NT_FROM_FILE"
+      _NT_SOURCE="from --init record (node-type.txt)"
+    fi
   fi
+  if [[ -z "$_NT_SOURCE" && -n "${ARG_NODE_TYPE:-}" ]]; then
+    RNT="$ARG_NODE_TYPE"
+    _NT_SOURCE="--node-type flag"
+  fi
+  if [[ -z "$_NT_SOURCE" ]]; then
+    local HN; HN=$(hostname | tr '[:upper:]' '[:lower:]')
+    if command -v kubectl &>/dev/null && [[ -f /etc/kubernetes/admin.conf ]]; then
+      RNT="master"; _NT_SOURCE="kubectl + admin.conf present"
+    elif [[ "$HN" =~ master|control ]]; then
+      RNT="master"; _NT_SOURCE="hostname pattern"
+    else
+      RNT="worker"; _NT_SOURCE="hostname pattern (no master indicators)"
+    fi
+  fi
+  echo -e "${CYAN}  Node type : ${WHITE}${RNT^^}${NC} ${DIM}(${_NT_SOURCE})${NC}"
 
   # ── Detect installed runtime ──────────────────────────────────────────────
   # Rocky-specific: containerd installed from Docker's repo is packaged as
@@ -3117,7 +3156,7 @@ run_reset() {
 
   rm -f /etc/crictl.yaml
   rm -f /etc/default/kubelet /etc/sysconfig/kubelet
-  rm -f "$K8S_VERSION_FILE" "$CNI_CONFIG_FILE" "$CNI_IFACE_FILE"
+  rm -f "$K8S_VERSION_FILE" "$CNI_CONFIG_FILE" "$CNI_IFACE_FILE" "$NODE_TYPE_FILE"
   rm -f /etc/fstab.backup-*
   rm -f /tmp/calico*.yaml /tmp/kube-flannel.yaml
 
@@ -3354,28 +3393,40 @@ run_destroy() {
   fi
 
   # ── Detect node type BEFORE showing the confirmation banner ──────────────
-  # Priority: --node-type flag > hostname pattern > admin.conf > k8s-version.txt
-  # NOTE: kubectl binary presence alone is NOT used to detect master — a worker
-  # may have kubectl installed manually.  We use admin.conf (master-only file)
-  # and k8s-version.txt (written by --init on master) as reliable indicators.
-  local HN_D; HN_D=$(hostname | tr '[:upper:]' '[:lower:]')
+  # Priority (highest → lowest):
+  #   1. node-type.txt — written by --init; reflects the ACTUAL initialized type
+  #      even when --node-type overrode the hostname during that --init run.
+  #   2. --node-type flag — explicit override for this destroy run.
+  #   3. admin.conf / k8s-version.txt — reliable master indicators.
+  #   4. hostname pattern — last resort.
+  # NOTE: kubectl binary presence alone is NOT used — a worker may have kubectl
+  # installed manually, which would falsely trigger master-mode destroy.
   local NT_D="worker"
-  if [[ -n "${ARG_NODE_TYPE:-}" ]]; then
-    NT_D="$ARG_NODE_TYPE"
-    echo -e "${CYAN}  Node type : ${WHITE}${NT_D^^}${GREEN} (--node-type override)${NC}"
-  elif [[ "$HN_D" =~ master|control ]]; then
-    NT_D="master"
-    echo -e "${CYAN}  Node type : ${WHITE}MASTER${NC} ${DIM}(detected from hostname)${NC}"
-  elif [[ -f /etc/kubernetes/admin.conf ]]; then
-    NT_D="master"
-    echo -e "${CYAN}  Node type : ${WHITE}MASTER${NC} ${DIM}(detected: admin.conf present)${NC}"
-  elif [[ -f /etc/kubernetes/k8s-version.txt ]]; then
-    NT_D="master"
-    echo -e "${CYAN}  Node type : ${WHITE}MASTER${NC} ${DIM}(detected: k8s-version.txt present)${NC}"
-  else
-    NT_D="worker"
-    echo -e "${CYAN}  Node type : ${WHITE}WORKER${NC} ${DIM}(no master indicators found)${NC}"
+  local _NT_SRC=""
+  if [[ -f "$NODE_TYPE_FILE" ]]; then
+    local _NT_FILE; _NT_FILE=$(cat "$NODE_TYPE_FILE" 2>/dev/null | tr -d '[:space:]')
+    if [[ "$_NT_FILE" == "master" || "$_NT_FILE" == "worker" ]]; then
+      NT_D="$_NT_FILE"
+      _NT_SRC="from --init record (node-type.txt)"
+    fi
   fi
+  if [[ -z "$_NT_SRC" && -n "${ARG_NODE_TYPE:-}" ]]; then
+    NT_D="$ARG_NODE_TYPE"
+    _NT_SRC="--node-type flag"
+  fi
+  if [[ -z "$_NT_SRC" ]]; then
+    local HN_D; HN_D=$(hostname | tr '[:upper:]' '[:lower:]')
+    if [[ -f /etc/kubernetes/admin.conf ]]; then
+      NT_D="master"; _NT_SRC="admin.conf present"
+    elif [[ -f /etc/kubernetes/k8s-version.txt ]]; then
+      NT_D="master"; _NT_SRC="k8s-version.txt present"
+    elif [[ "$HN_D" =~ master|control ]]; then
+      NT_D="master"; _NT_SRC="hostname pattern"
+    else
+      NT_D="worker"; _NT_SRC="hostname pattern (no master indicators found)"
+    fi
+  fi
+  echo -e "${CYAN}  Node type : ${WHITE}${NT_D^^}${NC} ${DIM}(${_NT_SRC})${NC}"
   echo ""
 
   # ── Detect installed runtime for the confirmation banner ─────────────────
@@ -3515,7 +3566,21 @@ run_destroy() {
       echo -e "${CYAN}    ℹ️  No K8s packages installed — skipping${NC}"
     fi
   fi
-  rm -f /usr/local/bin/crictl /usr/bin/crictl
+  # ── Remove crictl binary from ALL standard paths ────────────────────────
+  # cri-tools package may install crictl to /usr/bin, /usr/local/bin, or /bin.
+  # configure_crictl may also have created a symlink in /usr/local/bin.
+  # Some manual installs drop it directly in /usr/local/bin as a real binary.
+  # Remove every copy so --init's "crictl already present" check never fires.
+  echo -e "${CYAN}    Removing crictl binary from all paths...${NC}"
+  for _cdir in /usr/local/bin /usr/bin /bin /sbin /usr/sbin; do
+    if [[ -f "$_cdir/crictl" || -L "$_cdir/crictl" ]]; then
+      rm -f "$_cdir/crictl"
+      echo -e "${CYAN}      ✓ removed ${_cdir}/crictl${NC}"
+      log "destroy: removed ${_cdir}/crictl"
+    fi
+  done
+  # Hash cache bust: if running in a live shell, force PATH rehash
+  hash -r 2>/dev/null || true
   rm -f /usr/local/bin/calicoctl
   echo -e "${GREEN}  ✓ K8s packages removed${NC}"
 
@@ -3692,6 +3757,7 @@ run_destroy() {
   fi
 
   rm -f /tmp/calico*.yaml /tmp/kube-flannel.yaml /etc/crictl.yaml
+  rm -f "$NODE_TYPE_FILE" 2>/dev/null || true
   rm -f /etc/fstab.backup-*
   rm -f /etc/default/kubelet /etc/sysconfig/kubelet
   rm -f /etc/modules-load.d/k8s.conf /etc/sysctl.d/k8s.conf
