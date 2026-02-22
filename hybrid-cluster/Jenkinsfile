@@ -1,11 +1,13 @@
 // =============================================================================
-// Jenkinsfile — Kubernetes Cluster Bootstrap Pipeline (Jenkins on Windows)
-// Uses: SSH Pipeline Steps Plugin  →  https://plugins.jenkins.io/ssh-steps/
+// Jenkinsfile — Kubernetes Cluster Bootstrap Pipeline
+// Compatible with: Jenkins on Windows OR Linux (auto-detected at runtime)
+// Target nodes  : Ubuntu / Rocky Linux
 //
-// Scripts (01-linux-master-setup.sh, 02-linux-worker-setup.sh) are in the
-// SAME repo as this Jenkinsfile under hybrid-cluster/ folder.
-// Jenkins checks out the repo, then sshPut copies scripts directly to nodes.
-// No curl / GitHub raw URL needed.
+// Uses: SSH Pipeline Steps Plugin → https://plugins.jenkins.io/ssh-steps/
+//
+// Scripts live in the SAME repo as this Jenkinsfile:
+//   hybrid-cluster/01-linux-master-setup.sh
+//   hybrid-cluster/02-linux-worker-setup.sh
 //
 // Jenkins Credential Setup (once):
 //   Manage Jenkins → Credentials → global → Add Credentials
@@ -28,7 +30,7 @@ pipeline {
         string(
             name: 'WORKER_IPS',
             defaultValue: '',
-            description: 'Comma-separated WORKER node IPs.\nExample: 192.168.56.12,192.168.56.13'
+            description: 'Comma-separated WORKER node IPs.\nExample: 192.168.56.12,192.168.56.13\nAdd as many as needed — all provisioned in parallel.'
         )
         string(
             name: 'SSH_CREDENTIALS_ID',
@@ -38,18 +40,33 @@ pipeline {
     }
 
     environment {
-        MASTER_SCRIPT = 'hybrid-cluster/01-linux-master-setup.sh'
-        WORKER_SCRIPT = 'hybrid-cluster/02-linux-worker-setup.sh'
+        REMOTE_MASTER_SCRIPT = '/tmp/01-linux-master-setup.sh'
+        REMOTE_WORKER_SCRIPT = '/tmp/02-linux-worker-setup.sh'
     }
 
     stages {
 
         // =====================================================================
-        // Stage 0 — Validate inputs
+        // Stage 0 — Detect Jenkins OS + Validate Inputs
         // =====================================================================
         stage('Validate Inputs') {
             steps {
                 script {
+                    // ---- Detect Jenkins agent OS ----
+                    // isUnix() returns true on Linux/Mac, false on Windows
+                    env.IS_UNIX = isUnix() ? 'true' : 'false'
+                    echo "Jenkins agent OS: ${isUnix() ? 'Linux/Mac' : 'Windows'}"
+
+                    // ---- Set script paths using correct separator ----
+                    if (isUnix()) {
+                        env.LOCAL_MASTER_SCRIPT = 'hybrid-cluster/01-linux-master-setup.sh'
+                        env.LOCAL_WORKER_SCRIPT = 'hybrid-cluster/02-linux-worker-setup.sh'
+                    } else {
+                        env.LOCAL_MASTER_SCRIPT = 'hybrid-cluster\\01-linux-master-setup.sh'
+                        env.LOCAL_WORKER_SCRIPT = 'hybrid-cluster\\02-linux-worker-setup.sh'
+                    }
+
+                    // ---- Validate params ----
                     if (!params.MASTER_IP?.trim()) {
                         error('MASTER_IP cannot be empty.')
                     }
@@ -65,12 +82,13 @@ pipeline {
                     echo "Master IP    : ${params.MASTER_IP.trim()}"
                     echo "Worker IPs   : ${workers.join(', ')}"
                     echo "Worker count : ${workers.size()}"
+                    echo "Credentials  : ${params.SSH_CREDENTIALS_ID}"
                 }
             }
         }
 
         // =====================================================================
-        // Stage 1 — Verify SSH connectivity to all nodes
+        // Stage 1 — Verify SSH Connectivity (all nodes in parallel)
         // =====================================================================
         stage('Verify SSH Connectivity') {
             steps {
@@ -101,8 +119,10 @@ pipeline {
 
         // =====================================================================
         // Stage 2 — Provision Master Node
-        //   sshPut copies the script from Jenkins workspace to the node,
-        //   then sshCommand executes it.
+        //
+        // sshPut copies script from Jenkins workspace (Windows or Linux path)
+        // sed strips CRLF in case Jenkins ran on Windows (no-op on Linux)
+        // bash runs the cleaned script
         // =====================================================================
         stage('Provision Master Node') {
             steps {
@@ -116,17 +136,19 @@ pipeline {
                         def remote   = buildRemote(masterIp, env.SSH_USER, env.SSH_PASS)
 
                         echo "============================================================"
+                        echo " Jenkins OS  : ${env.IS_UNIX == 'true' ? 'Linux/Mac' : 'Windows'}"
                         echo " Provisioning MASTER: ${masterIp}"
                         echo "============================================================"
 
-                        // Copy script from Jenkins workspace → remote node
+                        // sshPut works with both Windows and Linux local paths
                         sshPut remote: remote,
-                               from: env.MASTER_SCRIPT,
-                               into: '/tmp/01-linux-master-setup.sh'
+                               from: env.LOCAL_MASTER_SCRIPT,
+                               into: env.REMOTE_MASTER_SCRIPT
 
-                        // Make executable and run
+                        // sed 's/\r//' = strip Windows CRLF (safe no-op if already LF)
+                        // Works on Ubuntu and Rocky Linux
                         sshCommand remote: remote,
-                                   command: 'chmod +x /tmp/01-linux-master-setup.sh && bash /tmp/01-linux-master-setup.sh'
+                                   command: "sed -i 's/\\r//' ${env.REMOTE_MASTER_SCRIPT} && chmod +x ${env.REMOTE_MASTER_SCRIPT} && bash ${env.REMOTE_MASTER_SCRIPT}"
 
                         echo "Master provisioning COMPLETE: ${masterIp}"
                     }
@@ -161,7 +183,7 @@ pipeline {
                                                .find { it.startsWith('kubeadm join') }
 
                         if (!joinLine) {
-                            error("Could not find a valid 'kubeadm join' line.\nRaw output:\n${rawOutput}")
+                            error("Could not find 'kubeadm join' line.\nRaw output:\n${rawOutput}")
                         }
 
                         env.JOIN_COMMAND = joinLine
@@ -174,8 +196,6 @@ pipeline {
 
         // =====================================================================
         // Stage 4 — Provision Worker Nodes IN PARALLEL
-        //   sshPut copies the script, sed patches out the interactive read,
-        //   then the script runs and joins the cluster automatically.
         // =====================================================================
         stage('Provision Worker Nodes (Parallel)') {
             steps {
@@ -200,17 +220,21 @@ pipeline {
                                 echo " Provisioning WORKER ${num}: ${workerIp}"
                                 echo "============================================================"
 
-                                // Copy script from Jenkins workspace → remote node
+                                // Copy script (works with Windows or Linux local path)
                                 sshPut remote: remote,
-                                       from: env.WORKER_SCRIPT,
-                                       into: '/tmp/02-linux-worker-setup.sh'
+                                       from: env.LOCAL_WORKER_SCRIPT,
+                                       into: env.REMOTE_WORKER_SCRIPT
 
-                                // Patch interactive read → inject join command, then run
+                                // 1. Strip CRLF (safe no-op if already LF)
+                                // 2. Make executable
+                                // 3. Inject join command (bypasses interactive read)
+                                // 4. Execute
                                 def escapedJoin = joinCmd.replace("'", "'\\''")
                                 sshCommand remote: remote, command: """
-                                    chmod +x /tmp/02-linux-worker-setup.sh && \
-                                    sed -i "s|read -r JOIN_CMD|JOIN_CMD='${escapedJoin}'|g" /tmp/02-linux-worker-setup.sh && \
-                                    bash /tmp/02-linux-worker-setup.sh
+                                    sed -i 's/\\r//' ${env.REMOTE_WORKER_SCRIPT} && \
+                                    chmod +x ${env.REMOTE_WORKER_SCRIPT} && \
+                                    sed -i "s|read -r JOIN_CMD|JOIN_CMD='${escapedJoin}'|g" ${env.REMOTE_WORKER_SCRIPT} && \
+                                    bash ${env.REMOTE_WORKER_SCRIPT}
                                 """
 
                                 echo "Worker ${num} (${workerIp}) joined successfully."
@@ -225,7 +249,7 @@ pipeline {
         }
 
         // =====================================================================
-        // Stage 5 — Verify cluster health
+        // Stage 5 — Verify Cluster Health
         // =====================================================================
         stage('Verify Cluster') {
             steps {
@@ -238,7 +262,7 @@ pipeline {
                         def masterIp = params.MASTER_IP.trim()
                         def remote   = buildRemote(masterIp, env.SSH_USER, env.SSH_PASS)
 
-                        echo "Waiting 20s for nodes to register..."
+                        echo "Waiting 20s for all nodes to register with the API server..."
                         sleep(20)
 
                         def nodeStatus = sshCommand(
@@ -257,6 +281,9 @@ pipeline {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // POST
+    // -------------------------------------------------------------------------
     post {
         success {
             script {
@@ -278,7 +305,12 @@ pipeline {
 ╔══════════════════════════════════════════════════════════════════╗
 ║        Kubernetes Cluster Bootstrap — FAILED                    ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Check stage logs above for details.                            ║
+║  Troubleshooting checklist:                                     ║
+║   1. SSH credentials correct in Jenkins credential store        ║
+║   2. SSH Pipeline Steps plugin installed                        ║
+║   3. All nodes reachable on port 22                             ║
+║   4. Root password set on all nodes (passwd root)               ║
+║   5. Nodes have 2GB+ RAM and 20GB+ disk                         ║
 ╚══════════════════════════════════════════════════════════════════╝"""
         }
         always {
