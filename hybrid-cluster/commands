@@ -1,0 +1,77 @@
+============================================================
+WINDOWS KUBERNETES NODE CHECK COMMANDS (PowerShell)
+============================================================
+
+------------------------------
+CHECK KUBELET SERVICE
+------------------------------
+
+# Check kubelet service status
+Get-Service kubelet
+
+# Detailed kubelet information
+Get-Service kubelet | Format-List *
+
+# Show only status and name
+Get-Service kubelet | Select-Object Status, Name
+
+# Start kubelet
+Start-Service kubelet
+
+# Restart kubelet
+Restart-Service kubelet
+
+# View kubelet log (if available)
+Get-Content C:\var\log\kubelet\kubelet.log -Tail 50 -Wait
+
+# If installed using NSSM (check event logs)
+Get-EventLog -LogName Application -Source kubelet -Newest 20
+
+
+
+------------------------------
+CHECK CONTAINERD SERVICE
+------------------------------
+
+# Check containerd service status
+Get-Service containerd
+
+# Detailed containerd information
+Get-Service containerd | Format-List *
+
+# Start containerd
+Start-Service containerd
+
+# Restart containerd
+Restart-Service containerd
+
+# View containerd logs
+Get-Content C:\ProgramData\containerd\containerd.log -Tail 50 -Wait
+
+
+
+------------------------------
+VERIFY CONTAINERD RUNTIME
+------------------------------
+
+# Check containerd version
+containerd --version
+
+# List running containers
+crictl ps
+
+# If crictl not configured (Windows containerd pipe)
+crictl config runtime-endpoint npipe:////./pipe/containerd-containerd
+
+
+
+------------------------------
+CHECK NODE FROM MASTER
+------------------------------
+
+# Run this on master node (Linux)
+kubectl get nodes -o wide
+
+============================================================
+END
+============================================================
