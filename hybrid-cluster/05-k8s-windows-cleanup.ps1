@@ -20,6 +20,10 @@
     powershell -ExecutionPolicy Bypass -File 05-k8s-windows-cleanup.ps1
 #>
 
+param(
+    [switch]$AutoApprove   # Pass -AutoApprove to skip confirmation (for automation/Jenkins)
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -53,10 +57,14 @@ Write-Host "    - All config under C:\etc\kubernetes, C:\var\lib\kubelet, C:\var
 Write-Host "    - Pod and service routes" -ForegroundColor White
 Write-Host ""
 
-$ans = Read-Host "  Proceed with full cleanup? [y/N]"
-if ($ans -notmatch '^[Yy]') {
-    Write-Host "  Cancelled." -ForegroundColor Yellow
-    exit 0
+if (-not $AutoApprove) {
+    $ans = Read-Host "  Proceed with full cleanup? [y/N]"
+    if ($ans -notmatch '^[Yy]') {
+        Write-Host "  Cancelled." -ForegroundColor Yellow
+        exit 0
+    }
+} else {
+    Write-Host "  Auto-approved (running non-interactively)" -ForegroundColor DarkGray
 }
 Write-Host ""
 
@@ -107,8 +115,21 @@ Write-Host "  $('-'*60)" -ForegroundColor DarkGray
 
 if (Test-Path $NSSM) {
     foreach ($svc in @('CalicoNode','CalicoFelix','kube-proxy')) {
-        & $NSSM remove $svc confirm 2>&1 | Out-Null
-        OK "NSSM service removed: $svc"
+        # Check if service exists before trying to remove — NSSM throws hard error
+        # if the service is not registered, even with 2>&1 redirection.
+        $svcExists = Get-Service $svc -ErrorAction SilentlyContinue
+        if ($svcExists) {
+            $result = & $NSSM remove $svc confirm 2>&1
+            if ($LASTEXITCODE -eq 0 -or $result -notmatch 'ERROR') {
+                OK "NSSM service removed: $svc"
+            } else {
+                # Fallback to sc.exe if NSSM fails
+                & sc.exe delete $svc 2>&1 | Out-Null
+                OK "Service removed via sc.exe: $svc"
+            }
+        } else {
+            Skip "Service not registered: $svc"
+        }
     }
 } else {
     Skip "NSSM not found - skipping NSSM service removal"
