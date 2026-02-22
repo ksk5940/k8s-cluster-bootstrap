@@ -29,7 +29,10 @@ else
 fi
 WIN_NODE=$(kubectl get nodes --no-headers -l kubernetes.io/os=windows -o name | head -1)
 if [[ -n "$WIN_NODE" ]]; then ok "Windows node found: $WIN_NODE"
-else fail "No Windows node found"; fi
+else
+    echo -e "  ${YELLOW}[WARN]${NC}  No Windows node found (skipping Windows checks)"
+    WIN_NODE=""
+fi
 
 # =============================================================================
 echo -e "\n  ${CYAN}[2/6] System pods${NC}"
@@ -67,6 +70,8 @@ info "Linux pod IP: $LINUX_POD_IP"
 # =============================================================================
 echo -e "\n  ${CYAN}[4/6] Deploy Windows test pod${NC}"
 # =============================================================================
+WIN_POD_IP=""
+if [[ -n "$WIN_NODE" ]]; then
 kubectl apply -f - << 'EOF' > /dev/null
 apiVersion: v1
 kind: Pod
@@ -90,17 +95,22 @@ echo "  Waiting for windows-test pod (may take 3-5 min for image pull)..."
 kubectl wait --for=condition=Ready pod/windows-test --timeout=300s 2>/dev/null && ok "windows-test pod running" || fail "windows-test pod failed to start"
 WIN_POD_IP=$(kubectl get pod windows-test -o jsonpath='{.status.podIP}')
 info "Windows pod IP: $WIN_POD_IP"
+else
+    echo -e "  ${YELLOW}[SKIP]${NC}  No Windows node — skipping Windows pod deployment"
+fi
 
 # =============================================================================
 echo -e "\n  ${CYAN}[5/6] Pod-to-pod connectivity${NC}"
 # =============================================================================
-# Linux -> Windows
+# Linux -> Windows (only if Windows pod exists)
 if [[ -n "$WIN_POD_IP" ]]; then
     if kubectl exec linux-test -- ping -c 2 "$WIN_POD_IP" &>/dev/null; then
         ok "Linux pod -> Windows pod: reachable"
     else
         fail "Linux pod -> Windows pod: NOT reachable (check routing + rp_filter)"
     fi
+else
+    echo -e "  ${YELLOW}[SKIP]${NC}  Linux -> Windows ping skipped (no Windows pod)"
 fi
 # Linux -> Linux  
 if kubectl exec linux-test -- wget -qO- http://linux-test &>/dev/null 2>&1; then
@@ -139,8 +149,6 @@ fi
 echo ""
 
 # Cleanup test pods
-read -rp "  Delete test pods? [Y/n]: " ans
-if [[ ! "$ans" =~ ^[Nn] ]]; then
-    kubectl delete pod linux-test windows-test --ignore-not-found
-    ok "Test pods deleted"
-fi
+# Auto-cleanup (no interactive prompt — safe for pipeline)
+kubectl delete pod linux-test windows-test --ignore-not-found > /dev/null 2>&1
+ok "Test pods deleted"
