@@ -26,11 +26,11 @@
 #>
 
 param(
-    [string]$JoinCommand = '',   # Pass full kubeadm join command to skip interactive prompt
-    [switch]$AutoApprove         # Pass -AutoApprove to skip "Proceed?" confirmation
+    [string]$JoinCommand = '',
+    [switch]$AutoApprove
 )
 
-Set-StrictMode -Version Latest
+Set-StrictMode -Version 2
 $ErrorActionPreference = 'Stop'
 
 # ==============================================================================
@@ -191,7 +191,7 @@ if (-not $AutoApprove) {
     $ans = Read-Host "  Proceed? [Y/n]"
     if ($ans -match '^[Nn]') { exit 0 }
 } else {
-    Write-Host "  Auto-approved (running non-interactively)" -ForegroundColor DarkGray
+    Write-Host "  Auto-approved." -ForegroundColor DarkGray
 }
 New-Item -ItemType Directory -Force -Path $LOG_DIR | Out-Null
 Log "===== SESSION START node=$env:COMPUTERNAME ====="
@@ -344,21 +344,20 @@ $fwRules = @(
 $fwNew = 0
 foreach ($r in $fwRules) {
     if (Get-NetFirewallRule -DisplayName $r.Name -ErrorAction SilentlyContinue) { continue }
-    $dir = if ($r.Dir) { $r.Dir } else { 'Inbound' }
+    $dir    = if ($r.ContainsKey('Dir'))    { $r.Dir }    else { 'Inbound' }
+    $remote = if ($r.ContainsKey('Remote')) { $r.Remote } else { $null }
+    $port   = if ($r.ContainsKey('Port'))   { $r.Port }   else { $null }
     $p = @{ DisplayName=$r.Name; Direction=$dir; Action='Allow'; Profile='Any'; Enabled='True' }
     switch ($r.Proto) {
         'ICMPv4' { $p['Protocol']='ICMPv4'; $p['IcmpType']=8 }
         'Any'    {
             $p['Protocol']='Any'
-            if ($r.Remote) {
-                if ($dir -eq 'Outbound') { $p['RemoteAddress']=$r.Remote }
-                else                      { $p['RemoteAddress']=$r.Remote }
-            }
+            if ($remote) { $p['RemoteAddress']=$remote }
         }
         default  {
             $p['Protocol']=$r.Proto
-            if ($r.Port) {
-                if ($dir -eq 'Outbound') { $p['RemotePort']=$r.Port } else { $p['LocalPort']=$r.Port }
+            if ($port) {
+                if ($dir -eq 'Outbound') { $p['RemotePort']=$port } else { $p['LocalPort']=$port }
             }
         }
     }
@@ -386,10 +385,18 @@ if ($calicoAlreadyInstalled) {
     # On WS2022, a failed Calico install leaves a 'vxlan0' HNS network that
     # blocks the next install attempt (HNS returns "network already exists").
     $hnsToRemove = @('Calico','nat','cbr0','vxlan0','External')
+    $allHns = @()
+    try {
+        $raw = Get-HnsNetwork -ErrorAction SilentlyContinue
+        if ($raw) {
+            @($raw) | ForEach-Object {
+                if ($_ -and $_.PSObject.Properties['Name']) { $allHns += $_ }
+            }
+        }
+    } catch {}
     foreach ($netName in $hnsToRemove) {
-        Get-HnsNetwork -ErrorAction SilentlyContinue |
-            Where-Object Name -eq $netName |
-            ForEach-Object { $_ | Remove-HnsNetwork -ErrorAction SilentlyContinue }
+        $allHns | Where-Object { $_.Name -eq $netName } |
+            ForEach-Object { try { $_ | Remove-HnsNetwork -ErrorAction SilentlyContinue } catch {} }
     }
     Start-Sleep 2
 
@@ -404,7 +411,18 @@ if ($calicoAlreadyInstalled) {
 
     $env:CALICO_NETWORKING_BACKEND = 'vxlan'
     $env:CALICO_DATASTORE_TYPE     = 'kubernetes'
-    $env:KUBECONFIG                = "$ETC_K8S\kubelet.conf"
+    # Calico install-calico.ps1 requires KUBECONFIG to point to an existing file.
+    # kubelet.conf doesn't exist yet (written after join). Create a placeholder
+    # bootstrap-kubelet.conf so Calico validation passes. It will be deleted
+    # before kubeadm runs in Step 8 and rewritten with the real token.
+    $bootstrapConf = "$ETC_K8S\bootstrap-kubelet.conf"
+    if (-not (Test-Path $ETC_K8S)) { New-Item -ItemType Directory -Force -Path $ETC_K8S | Out-Null }
+    if (-not (Test-Path $bootstrapConf)) {
+        [System.IO.File]::WriteAllText($bootstrapConf,
+            "# placeholder`n", [System.Text.Encoding]::ASCII)
+        Info "Created placeholder bootstrap-kubelet.conf for Calico validation"
+    }
+    $env:KUBECONFIG                = $bootstrapConf
     $env:K8S_SERVICE_CIDR          = $K8S_SERVICE_CIDR
     $env:DNS_NAME_SERVERS          = $CLUSTER_DNS
     $env:DNS_SEARCH                = 'svc.cluster.local'
@@ -473,11 +491,9 @@ if ($alreadyJoined) {
     Write-Host "  +----------------------------------------------------------------+" -ForegroundColor Yellow
     Write-Host ""
 
-    # Use -JoinCommand parameter if provided (non-interactive/Jenkins mode)
-    # Otherwise prompt interactively
     if ($JoinCommand -and $JoinCommand -match 'kubeadm\s+join') {
         $JOIN_CMD = $JoinCommand.Trim()
-        Write-Host "  Using provided join command." -ForegroundColor DarkGray
+        Write-Host "  Using provided -JoinCommand parameter." -ForegroundColor DarkGray
     } else {
         $JOIN_CMD = ''
         while ($JOIN_CMD -notmatch 'kubeadm\s+join') {
@@ -496,19 +512,45 @@ if ($alreadyJoined) {
 
     if (-not (Test-Path "$ETC_K8S\pki\ca.crt")) {
         Info "Fetching cluster CA via kubeadm (preflight only)..."
+        # Delete placeholder bootstrap-kubelet.conf — kubeadm treats any existing
+        # bootstrap-kubelet.conf as a fatal preflight error. Kubeadm will rewrite
+        # it with the real token after fetching the CA.
+        if (Test-Path "$ETC_K8S\bootstrap-kubelet.conf") {
+            Remove-Item "$ETC_K8S\bootstrap-kubelet.conf" -Force
+            Info "Removed placeholder bootstrap-kubelet.conf"
+        }
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'SilentlyContinue'
         & "$BIN_DIR\kubeadm.exe" join "$MASTER_ENDPOINT" `
             --token $TOKEN `
             --discovery-token-ca-cert-hash $CA_HASH `
             --skip-phases=kubelet-start `
             --node-name $NODE_NAME `
             --cri-socket npipe:////./pipe/containerd-containerd `
-            --ignore-preflight-errors=FileContent--proc-sys-net-bridge-bridge-nf-call-iptables,IsPrivilegedUser `
-            2>&1 | Out-Null
+            --ignore-preflight-errors=FileContent--proc-sys-net-bridge-bridge-nf-call-iptables,IsPrivilegedUser
+        $ErrorActionPreference = $prevEAP
     }
-    if (-not (Test-Path "$ETC_K8S\pki\ca.crt")) { Fail "Could not obtain ca.crt. Check token and connectivity." }
-    OK "ca.crt obtained"
 
-    $caCertB64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes("$ETC_K8S\pki\ca.crt"))
+    # Check multiple paths — kubeadm Windows path handling varies by version
+    $caCrtPath = $null
+    foreach ($p in @("$ETC_K8S\pki\ca.crt","C:\etc\kubernetes\pki\ca.crt")) {
+        if (Test-Path $p) { $caCrtPath = $p; break }
+    }
+    # Fallback: extract embedded CA from bootstrap-kubelet.conf if written by kubeadm
+    if (-not $caCrtPath -and (Test-Path "$ETC_K8S\bootstrap-kubelet.conf")) {
+        $bsContent = Get-Content "$ETC_K8S\bootstrap-kubelet.conf" -Raw
+        if ($bsContent -match 'certificate-authority-data:\s*(\S+)') {
+            $caBytes = [Convert]::FromBase64String($Matches[1])
+            New-Item -ItemType Directory -Force -Path "$ETC_K8S\pki" | Out-Null
+            [System.IO.File]::WriteAllBytes("$ETC_K8S\pki\ca.crt", $caBytes)
+            $caCrtPath = "$ETC_K8S\pki\ca.crt"
+            OK "ca.crt extracted from bootstrap-kubelet.conf"
+        }
+    }
+    if (-not $caCrtPath) { Fail "Could not obtain ca.crt. Check token and master connectivity." }
+    OK "ca.crt obtained: $caCrtPath"
+
+    $caCertB64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($caCrtPath))
 
     Info "Writing bootstrap-kubelet.conf..."
     [System.IO.File]::WriteAllText("$ETC_K8S\bootstrap-kubelet.conf", @"
