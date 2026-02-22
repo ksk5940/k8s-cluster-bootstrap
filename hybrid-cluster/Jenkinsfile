@@ -1,1 +1,286 @@
+// =============================================================================
+// Jenkinsfile — Kubernetes Cluster Bootstrap Pipeline
+// Provisions 1 master + N worker nodes in parallel
+// Scripts sourced from: https://github.com/ksk5940/k8s-cluster-bootstrap/tree/main/hybrid-cluster
+// =============================================================================
 
+pipeline {
+
+    agent any
+
+    // -------------------------------------------------------------------------
+    // PARAMETERS  — shown as input fields in Jenkins UI
+    // -------------------------------------------------------------------------
+    parameters {
+        string(
+            name: 'MASTER_IP',
+            defaultValue: '',
+            description: 'IP address of the Kubernetes master/control-plane node (e.g. 192.168.1.10)'
+        )
+        string(
+            name: 'WORKER_IPS',
+            defaultValue: '',
+            description: 'Comma-separated list of worker node IPs (e.g. 192.168.1.11,192.168.1.12,192.168.1.13)'
+        )
+        string(
+            name: 'SSH_USER',
+            defaultValue: 'root',
+            description: 'SSH username to use for all nodes (must have root/sudo privileges)'
+        )
+        password(
+            name: 'SSH_PASSWORD',
+            defaultValue: '',
+            description: 'SSH password for the above user on ALL nodes'
+        )
+        string(
+            name: 'GITHUB_RAW_BASE',
+            defaultValue: 'https://raw.githubusercontent.com/ksk5940/k8s-cluster-bootstrap/main/hybrid-cluster',
+            description: 'Raw GitHub base URL where the setup scripts are hosted'
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // ENVIRONMENT
+    // -------------------------------------------------------------------------
+    environment {
+        MASTER_SCRIPT  = '01-linux-master-setup.sh'
+        WORKER_SCRIPT  = '02-linux-worker-setup.sh'
+        // sshpass is used for password-based SSH — must be installed on the Jenkins agent
+        SSH_OPTS       = '-o StrictHostKeyChecking=no -o ConnectTimeout=30 -o BatchMode=no'
+    }
+
+    // -------------------------------------------------------------------------
+    // STAGES
+    // -------------------------------------------------------------------------
+    stages {
+
+        // ------------------------------------------------------------------
+        // Stage 0: Validate inputs
+        // ------------------------------------------------------------------
+        stage('Validate Inputs') {
+            steps {
+                script {
+                    if (!params.MASTER_IP?.trim()) {
+                        error "MASTER_IP is required. Please re-run with a valid master IP."
+                    }
+                    if (!params.WORKER_IPS?.trim()) {
+                        error "WORKER_IPS is required. Provide at least one worker IP."
+                    }
+                    if (!params.SSH_PASSWORD?.trim()) {
+                        error "SSH_PASSWORD is required."
+                    }
+
+                    // Parse and store worker list globally for later stages
+                    env.WORKER_LIST = params.WORKER_IPS.trim()
+                    echo "Master  : ${params.MASTER_IP}"
+                    echo "Workers : ${env.WORKER_LIST}"
+                    echo "SSH User: ${params.SSH_USER}"
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Stage 1: Verify SSH connectivity to ALL nodes before touching them
+        // ------------------------------------------------------------------
+        stage('Verify SSH Connectivity') {
+            steps {
+                script {
+                    def allNodes = [params.MASTER_IP.trim()] + params.WORKER_IPS.split(',').collect { it.trim() }
+                    def checks   = [:]
+
+                    allNodes.each { ip ->
+                        checks["check-${ip}"] = {
+                            withEnv(["NODE_IP=${ip}"]) {
+                                sh """
+                                    sshpass -p '${params.SSH_PASSWORD}' \
+                                        ssh ${SSH_OPTS} ${params.SSH_USER}@${ip} \
+                                        'echo "SSH OK: \$(hostname)"'
+                                """
+                            }
+                        }
+                    }
+
+                    parallel checks
+                    echo "All nodes are reachable via SSH."
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Stage 2: Provision Master Node
+        // ------------------------------------------------------------------
+        stage('Provision Master Node') {
+            steps {
+                script {
+                    def masterIp = params.MASTER_IP.trim()
+                    echo "============================================================"
+                    echo " Provisioning MASTER: ${masterIp}"
+                    echo "============================================================"
+
+                    sh """
+                        sshpass -p '${params.SSH_PASSWORD}' \
+                            ssh ${SSH_OPTS} ${params.SSH_USER}@${masterIp} \
+                            'curl -fsSL ${params.GITHUB_RAW_BASE}/${MASTER_SCRIPT} -o /tmp/${MASTER_SCRIPT} && \
+                             chmod +x /tmp/${MASTER_SCRIPT} && \
+                             bash /tmp/${MASTER_SCRIPT} 2>&1'
+                    """
+                    echo "Master node provisioning COMPLETE: ${masterIp}"
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Stage 3: Extract Join Command from Master
+        //          Must run AFTER master is ready — workers depend on it
+        // ------------------------------------------------------------------
+        stage('Extract Join Command') {
+            steps {
+                script {
+                    def masterIp = params.MASTER_IP.trim()
+                    echo "Fetching kubeadm join command from master ${masterIp} ..."
+
+                    // Run kubeadm token create and capture output
+                    def joinCmd = sh(
+                        script: """
+                            sshpass -p '${params.SSH_PASSWORD}' \
+                                ssh ${SSH_OPTS} ${params.SSH_USER}@${masterIp} \
+                                'kubeadm token create --print-join-command 2>/dev/null'
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    if (!joinCmd.startsWith('kubeadm join')) {
+                        error "Could not extract a valid kubeadm join command from master. Got: ${joinCmd}"
+                    }
+
+                    // Store for parallel worker stage
+                    env.JOIN_COMMAND = joinCmd
+                    echo "Join command captured successfully."
+                    // Mask token details in log — print only first 60 chars
+                    echo "Join cmd preview: ${joinCmd.take(60)}..."
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Stage 4: Provision Worker Nodes IN PARALLEL
+        //          Each worker runs 02-linux-worker-setup.sh and then
+        //          executes the join command — fully non-interactive
+        // ------------------------------------------------------------------
+        stage('Provision Worker Nodes (Parallel)') {
+            steps {
+                script {
+                    def workers    = params.WORKER_IPS.split(',').collect { it.trim() }.findAll { it }
+                    def joinCmd    = env.JOIN_COMMAND
+                    def workerJobs = [:]
+
+                    workers.eachWithIndex { workerIp, idx ->
+                        def ip    = workerIp   // local binding for closure
+                        def label = "worker-${idx + 1} [${ip}]"
+
+                        workerJobs[label] = {
+                            echo "============================================================"
+                            echo " Provisioning WORKER ${idx + 1}: ${ip}"
+                            echo "============================================================"
+
+                            // Step A: Run the worker setup script
+                            // The script normally waits for stdin (join command).
+                            // We inject it via a heredoc / echo pipe to bypass the interactive prompt.
+                            sh """
+                                sshpass -p '${params.SSH_PASSWORD}' \
+                                    ssh ${SSH_OPTS} ${params.SSH_USER}@${ip} \
+                                    'curl -fsSL ${params.GITHUB_RAW_BASE}/${WORKER_SCRIPT} -o /tmp/${WORKER_SCRIPT} && \
+                                     chmod +x /tmp/${WORKER_SCRIPT}'
+                            """
+
+                            // Step B: Run worker script — feed join command via stdin
+                            //         The script reads JOIN_CMD with `read -r JOIN_CMD`
+                            //         We patch around this by pre-setting it as an env var
+                            //         and using a wrapper that bypasses the interactive read.
+                            sh """
+                                sshpass -p '${params.SSH_PASSWORD}' \
+                                    ssh ${SSH_OPTS} ${params.SSH_USER}@${ip} \
+                                    bash << 'REMOTE_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# -------------------------------------------------------------------
+# Non-interactive wrapper:
+# The original 02-linux-worker-setup.sh does `read -r JOIN_CMD` at
+# Step 4.  We patch the downloaded copy to inject our join command
+# directly, then execute it — keeping the script 100% intact otherwise.
+# -------------------------------------------------------------------
+SCRIPT=/tmp/02-linux-worker-setup.sh
+JOIN_CMD='${joinCmd}'
+
+# Replace the interactive read block with a direct variable assignment
+sed -i "s|read -r JOIN_CMD|JOIN_CMD='\${JOIN_CMD//\\'/\\'\\'\\'}'|g" "\$SCRIPT"
+
+bash "\$SCRIPT" 2>&1
+REMOTE_EOF
+                            """
+
+                            echo "Worker ${ip} joined the cluster successfully."
+                        }
+                    }
+
+                    // Fail fast = false so all workers attempt and we get a full picture
+                    parallel workerJobs
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Stage 5: Verify Cluster Health
+        // ------------------------------------------------------------------
+        stage('Verify Cluster') {
+            steps {
+                script {
+                    def masterIp = params.MASTER_IP.trim()
+                    echo "Waiting 20s for all nodes to register with the API server..."
+                    sleep(20)
+
+                    sh """
+                        sshpass -p '${params.SSH_PASSWORD}' \
+                            ssh ${SSH_OPTS} ${params.SSH_USER}@${masterIp} \
+                            'kubectl get nodes -o wide'
+                    """
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // POST
+    // -------------------------------------------------------------------------
+    post {
+        success {
+            echo """
+╔══════════════════════════════════════════════════════════════╗
+║  Kubernetes Cluster Bootstrap — COMPLETE                     ║
+║                                                              ║
+║  Master : ${params.MASTER_IP}
+║  Workers: ${params.WORKER_IPS}
+║                                                              ║
+║  Run on master to verify:                                    ║
+║    kubectl get nodes -o wide                                 ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+        }
+        failure {
+            echo """
+╔══════════════════════════════════════════════════════════════╗
+║  Bootstrap FAILED — check stage logs above for details.      ║
+║  Common causes:                                              ║
+║   • SSH password incorrect / sshpass not installed on agent  ║
+║   • Node not reachable on port 22                            ║
+║   • Script download failed (check GITHUB_RAW_BASE param)     ║
+║   • Insufficient disk/memory on target node                  ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+        }
+        always {
+            echo "Pipeline finished. Timestamp: ${new Date()}"
+        }
+    }
+}
