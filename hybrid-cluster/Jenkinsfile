@@ -2,59 +2,46 @@
 // Jenkinsfile — Kubernetes Cluster Bootstrap Pipeline (Jenkins on Windows)
 // Uses: SSH Pipeline Steps Plugin  →  https://plugins.jenkins.io/ssh-steps/
 //
-// Jenkins Credential Setup (do this ONCE in Jenkins UI):
-//   Dashboard → Manage Jenkins → Credentials → (global) → Add Credentials
-//     Kind     : Username with password
-//     Username : root          (or your SSH user)
-//     Password : <your password>
-//     ID       : K8S_SSH_CREDS    ← this ID is referenced below
-//     Description: K8s node SSH credentials
+// Scripts (01-linux-master-setup.sh, 02-linux-worker-setup.sh) are in the
+// SAME repo as this Jenkinsfile under hybrid-cluster/ folder.
+// Jenkins checks out the repo, then sshPut copies scripts directly to nodes.
+// No curl / GitHub raw URL needed.
 //
-// Scripts sourced from:
-//   https://github.com/ksk5940/k8s-cluster-bootstrap/tree/main/hybrid-cluster
+// Jenkins Credential Setup (once):
+//   Manage Jenkins → Credentials → global → Add Credentials
+//     Kind     : Username with password
+//     Username : root
+//     Password : <your root password>
+//     ID       : K8S_SSH_CREDS
 // =============================================================================
 
 pipeline {
 
     agent any
 
-    // -------------------------------------------------------------------------
-    // PARAMETERS — shown as separate input fields in the Jenkins build UI
-    // -------------------------------------------------------------------------
     parameters {
         string(
             name: 'MASTER_IP',
             defaultValue: '',
-            description: 'IP address of the Kubernetes MASTER / control-plane node.\nExample: 192.168.1.10'
+            description: 'IP address of the Kubernetes MASTER node.\nExample: 192.168.56.11'
         )
         string(
             name: 'WORKER_IPS',
             defaultValue: '',
-            description: 'Comma-separated list of WORKER node IPs.\nExample: 192.168.1.11,192.168.1.12,192.168.1.13\nAdd as many as needed — all provisioned in parallel.'
+            description: 'Comma-separated WORKER node IPs.\nExample: 192.168.56.12,192.168.56.13'
         )
         string(
             name: 'SSH_CREDENTIALS_ID',
             defaultValue: 'K8S_SSH_CREDS',
-            description: 'Jenkins Credentials ID (Username + Password) configured for all nodes.\nSet up at: Manage Jenkins → Credentials → Add Credentials.'
-        )
-        string(
-            name: 'GITHUB_RAW_BASE',
-            defaultValue: 'https://raw.githubusercontent.com/ksk5940/k8s-cluster-bootstrap/main/hybrid-cluster',
-            description: 'Raw GitHub base URL where the setup scripts are hosted.'
+            description: 'Jenkins Credentials ID (Username + Password) for all nodes.'
         )
     }
 
-    // -------------------------------------------------------------------------
-    // ENVIRONMENT
-    // -------------------------------------------------------------------------
     environment {
-        MASTER_SCRIPT = '01-linux-master-setup.sh'
-        WORKER_SCRIPT = '02-linux-worker-setup.sh'
+        MASTER_SCRIPT = 'hybrid-cluster/01-linux-master-setup.sh'
+        WORKER_SCRIPT = 'hybrid-cluster/02-linux-worker-setup.sh'
     }
 
-    // -------------------------------------------------------------------------
-    // STAGES
-    // -------------------------------------------------------------------------
     stages {
 
         // =====================================================================
@@ -67,37 +54,31 @@ pipeline {
                         error('MASTER_IP cannot be empty.')
                     }
                     if (!params.WORKER_IPS?.trim()) {
-                        error('WORKER_IPS cannot be empty. Provide at least one worker IP.')
-                    }
-                    if (!params.SSH_CREDENTIALS_ID?.trim()) {
-                        error('SSH_CREDENTIALS_ID cannot be empty.')
+                        error('WORKER_IPS cannot be empty.')
                     }
 
                     def workers = params.WORKER_IPS.split(',').collect { it.trim() }.findAll { it }
                     if (workers.isEmpty()) {
-                        error('WORKER_IPS contained no valid IPs after parsing.')
+                        error('No valid worker IPs found after parsing.')
                     }
 
-                    echo "Master IP      : ${params.MASTER_IP.trim()}"
-                    echo "Worker IPs     : ${workers.join(', ')}"
-                    echo "Worker count   : ${workers.size()}"
-                    echo "Credentials ID : ${params.SSH_CREDENTIALS_ID}"
+                    echo "Master IP    : ${params.MASTER_IP.trim()}"
+                    echo "Worker IPs   : ${workers.join(', ')}"
+                    echo "Worker count : ${workers.size()}"
                 }
             }
         }
 
         // =====================================================================
-        // Stage 1 — Verify SSH connectivity to every node
+        // Stage 1 — Verify SSH connectivity to all nodes
         // =====================================================================
         stage('Verify SSH Connectivity') {
             steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: params.SSH_CREDENTIALS_ID,
-                        usernameVariable: 'SSH_USER',
-                        passwordVariable: 'SSH_PASS'
-                    )
-                ]) {
+                withCredentials([usernamePassword(
+                    credentialsId: params.SSH_CREDENTIALS_ID,
+                    usernameVariable: 'SSH_USER',
+                    passwordVariable: 'SSH_PASS'
+                )]) {
                     script {
                         def workers  = params.WORKER_IPS.split(',').collect { it.trim() }.findAll { it }
                         def allNodes = [params.MASTER_IP.trim()] + workers
@@ -120,16 +101,16 @@ pipeline {
 
         // =====================================================================
         // Stage 2 — Provision Master Node
+        //   sshPut copies the script from Jenkins workspace to the node,
+        //   then sshCommand executes it.
         // =====================================================================
         stage('Provision Master Node') {
             steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: params.SSH_CREDENTIALS_ID,
-                        usernameVariable: 'SSH_USER',
-                        passwordVariable: 'SSH_PASS'
-                    )
-                ]) {
+                withCredentials([usernamePassword(
+                    credentialsId: params.SSH_CREDENTIALS_ID,
+                    usernameVariable: 'SSH_USER',
+                    passwordVariable: 'SSH_PASS'
+                )]) {
                     script {
                         def masterIp = params.MASTER_IP.trim()
                         def remote   = buildRemote(masterIp, env.SSH_USER, env.SSH_PASS)
@@ -138,15 +119,14 @@ pipeline {
                         echo " Provisioning MASTER: ${masterIp}"
                         echo "============================================================"
 
-                        // Download script to the remote node
-                        sshCommand remote: remote, command: """
-                            curl -fsSL '${params.GITHUB_RAW_BASE}/${MASTER_SCRIPT}' \
-                                 -o /tmp/${MASTER_SCRIPT} && \
-                            chmod +x /tmp/${MASTER_SCRIPT}
-                        """
+                        // Copy script from Jenkins workspace → remote node
+                        sshPut remote: remote,
+                               from: env.MASTER_SCRIPT,
+                               into: '/tmp/01-linux-master-setup.sh'
 
-                        // Run it — live output streams to Jenkins console
-                        sshCommand remote: remote, command: "bash /tmp/${MASTER_SCRIPT}"
+                        // Make executable and run
+                        sshCommand remote: remote,
+                                   command: 'chmod +x /tmp/01-linux-master-setup.sh && bash /tmp/01-linux-master-setup.sh'
 
                         echo "Master provisioning COMPLETE: ${masterIp}"
                     }
@@ -156,17 +136,14 @@ pipeline {
 
         // =====================================================================
         // Stage 3 — Extract kubeadm join command from master
-        //           Sequential gate — workers wait for this before starting.
         // =====================================================================
         stage('Extract Join Command') {
             steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: params.SSH_CREDENTIALS_ID,
-                        usernameVariable: 'SSH_USER',
-                        passwordVariable: 'SSH_PASS'
-                    )
-                ]) {
+                withCredentials([usernamePassword(
+                    credentialsId: params.SSH_CREDENTIALS_ID,
+                    usernameVariable: 'SSH_USER',
+                    passwordVariable: 'SSH_PASS'
+                )]) {
                     script {
                         def masterIp = params.MASTER_IP.trim()
                         def remote   = buildRemote(masterIp, env.SSH_USER, env.SSH_PASS)
@@ -179,18 +156,16 @@ pipeline {
                             returnStdout: true
                         ).trim()
 
-                        // Isolate the join line defensively (output may include banner lines)
                         def joinLine = rawOutput.split('\n')
                                                .collect { it.trim() }
                                                .find { it.startsWith('kubeadm join') }
 
                         if (!joinLine) {
-                            error("Could not find a valid 'kubeadm join ...' line.\nRaw output:\n${rawOutput}")
+                            error("Could not find a valid 'kubeadm join' line.\nRaw output:\n${rawOutput}")
                         }
 
-                        // Persist across stages via env
                         env.JOIN_COMMAND = joinLine
-                        echo "Join command captured successfully."
+                        echo "Join command captured."
                         echo "Preview: ${joinLine.take(72)}..."
                     }
                 }
@@ -199,28 +174,23 @@ pipeline {
 
         // =====================================================================
         // Stage 4 — Provision Worker Nodes IN PARALLEL
-        //
-        //   Per worker:
-        //     a) Download 02-linux-worker-setup.sh
-        //     b) Patch out the interactive `read -r JOIN_CMD` with the real command
-        //     c) Execute the patched script — joins cluster automatically
+        //   sshPut copies the script, sed patches out the interactive read,
+        //   then the script runs and joins the cluster automatically.
         // =====================================================================
         stage('Provision Worker Nodes (Parallel)') {
             steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: params.SSH_CREDENTIALS_ID,
-                        usernameVariable: 'SSH_USER',
-                        passwordVariable: 'SSH_PASS'
-                    )
-                ]) {
+                withCredentials([usernamePassword(
+                    credentialsId: params.SSH_CREDENTIALS_ID,
+                    usernameVariable: 'SSH_USER',
+                    passwordVariable: 'SSH_PASS'
+                )]) {
                     script {
                         def workers    = params.WORKER_IPS.split(',').collect { it.trim() }.findAll { it }
                         def joinCmd    = env.JOIN_COMMAND
                         def workerJobs = [:]
 
                         workers.eachWithIndex { ip, idx ->
-                            def workerIp = ip        // local binding for closure
+                            def workerIp = ip
                             def num      = idx + 1
 
                             workerJobs["worker-${num} [${workerIp}]"] = {
@@ -230,29 +200,23 @@ pipeline {
                                 echo " Provisioning WORKER ${num}: ${workerIp}"
                                 echo "============================================================"
 
-                                // Step A: Download script
-                                sshCommand remote: remote, command: """
-                                    curl -fsSL '${params.GITHUB_RAW_BASE}/${WORKER_SCRIPT}' \
-                                         -o /tmp/${WORKER_SCRIPT} && \
-                                    chmod +x /tmp/${WORKER_SCRIPT}
-                                """
+                                // Copy script from Jenkins workspace → remote node
+                                sshPut remote: remote,
+                                       from: env.WORKER_SCRIPT,
+                                       into: '/tmp/02-linux-worker-setup.sh'
 
-                                // Step B: Patch `read -r JOIN_CMD` → direct variable assignment.
-                                //         Escapes single-quotes in joinCmd for safe sed injection.
+                                // Patch interactive read → inject join command, then run
                                 def escapedJoin = joinCmd.replace("'", "'\\''")
                                 sshCommand remote: remote, command: """
-                                    sed -i "s|read -r JOIN_CMD|JOIN_CMD='${escapedJoin}'|g" \
-                                        /tmp/${WORKER_SCRIPT}
+                                    chmod +x /tmp/02-linux-worker-setup.sh && \
+                                    sed -i "s|read -r JOIN_CMD|JOIN_CMD='${escapedJoin}'|g" /tmp/02-linux-worker-setup.sh && \
+                                    bash /tmp/02-linux-worker-setup.sh
                                 """
 
-                                // Step C: Run the patched worker script
-                                sshCommand remote: remote, command: "bash /tmp/${WORKER_SCRIPT}"
-
-                                echo "Worker ${num} (${workerIp}) joined the cluster successfully."
+                                echo "Worker ${num} (${workerIp}) joined successfully."
                             }
                         }
 
-                        // failFast false → all workers attempt even if one fails
                         workerJobs.failFast = false
                         parallel workerJobs
                     }
@@ -261,22 +225,20 @@ pipeline {
         }
 
         // =====================================================================
-        // Stage 5 — Verify cluster health from master
+        // Stage 5 — Verify cluster health
         // =====================================================================
         stage('Verify Cluster') {
             steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: params.SSH_CREDENTIALS_ID,
-                        usernameVariable: 'SSH_USER',
-                        passwordVariable: 'SSH_PASS'
-                    )
-                ]) {
+                withCredentials([usernamePassword(
+                    credentialsId: params.SSH_CREDENTIALS_ID,
+                    usernameVariable: 'SSH_USER',
+                    passwordVariable: 'SSH_PASS'
+                )]) {
                     script {
                         def masterIp = params.MASTER_IP.trim()
                         def remote   = buildRemote(masterIp, env.SSH_USER, env.SSH_PASS)
 
-                        echo "Waiting 20s for all nodes to register with the API server..."
+                        echo "Waiting 20s for nodes to register..."
                         sleep(20)
 
                         def nodeStatus = sshCommand(
@@ -295,9 +257,6 @@ pipeline {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // POST
-    // -------------------------------------------------------------------------
     post {
         success {
             script {
@@ -310,7 +269,7 @@ pipeline {
 ║  Workers : ${params.WORKER_IPS.trim()}
 ║  Total   : 1 master + ${workers.size()} worker(s)
 ╠══════════════════════════════════════════════════════════════════╣
-║  Verify from master:  kubectl get nodes -o wide                 ║
+║  Verify:  kubectl get nodes -o wide                             ║
 ╚══════════════════════════════════════════════════════════════════╝"""
             }
         }
@@ -319,12 +278,7 @@ pipeline {
 ╔══════════════════════════════════════════════════════════════════╗
 ║        Kubernetes Cluster Bootstrap — FAILED                    ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Troubleshooting checklist:                                     ║
-║   1. Credentials ID matches exactly in Jenkins credential store ║
-║   2. SSH Pipeline Steps plugin installed in Jenkins             ║
-║   3. All node IPs reachable on port 22 from Jenkins agent       ║
-║   4. GITHUB_RAW_BASE URL returns scripts (test in browser)      ║
-║   5. Nodes have enough disk (20 GB+) and RAM (2 GB+)            ║
+║  Check stage logs above for details.                            ║
 ╚══════════════════════════════════════════════════════════════════╝"""
         }
         always {
@@ -334,7 +288,7 @@ pipeline {
 }
 
 // =============================================================================
-// HELPER — Build the SSH remote map for SSH Pipeline Steps plugin
+// HELPER — Build SSH remote map for SSH Pipeline Steps plugin
 // =============================================================================
 def buildRemote(String ip, String user, String password) {
     return [
@@ -343,7 +297,7 @@ def buildRemote(String ip, String user, String password) {
         port         : 22,
         user         : user,
         password     : password,
-        allowAnyHosts: true,   // StrictHostKeyChecking=no equivalent
-        timeoutSec   : 3600    // 1 hour max per command (K8s install can be slow)
+        allowAnyHosts: true,
+        timeoutSec   : 3600
     ]
 }
