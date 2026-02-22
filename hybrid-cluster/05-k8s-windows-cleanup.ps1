@@ -197,9 +197,9 @@ if ($allHnsNetworks.Count -eq 0) {
             }
         }
     }
-}
-if (-not $removedAny) {
-    Skip "No matching HNS networks found (Calico/nat/cbr0/vxlan0/External)"
+    if (-not $removedAny) {
+        Skip "No matching HNS networks found (Calico/nat/cbr0/vxlan0/External)"
+    }
 }
 
 # Give HNS time to settle after network removal — vSwitch teardown is async
@@ -247,7 +247,13 @@ if (Test-Path $cniConf) {
 }
 
 if (Test-Path 'C:\k\bin\kubeadm.exe') {
+    # kubeadm reset prints warnings to stderr on a fresh node (no config found).
+    # Under Set-StrictMode, stderr from external commands triggers NativeCommandError.
+    # Temporarily set ErrorActionPreference to SilentlyContinue for this call only.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
     & 'C:\k\bin\kubeadm.exe' reset --force 2>&1 | Out-Null
+    $ErrorActionPreference = $prevEAP
     OK "kubeadm reset complete"
 } else {
     Skip "kubeadm.exe not found - skipping reset"
