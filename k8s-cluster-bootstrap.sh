@@ -21,7 +21,7 @@
 # ║                                                                            ║
 # ║  Author  : Sreekanth K                                                     ║
 # ║  Email   : ksk5940@gmail.com                                               ║
-# ║  Version : 1.0.0                                                           ║
+# ║  Version : 1.1.0                                                           ║
 # ╚════════════════════════════════════════════════════════════════════════════╝
 
 set -o pipefail
@@ -2368,18 +2368,15 @@ KCFG_EOF
     echo -e "${CYAN}  Running kubeadm init (full log → $LOG_FILE)...${NC}"
     echo ""
 
-    # ── Kill any stale process occupying port 6443 ───────────────────────────
-    # A previous failed kubeadm init may leave kube-apiserver still running,
-    # which causes [ERROR Port-6443] on re-run.
-    local _STALE_PID
-    _STALE_PID=$(ss -tlnp 'sport = :6443' 2>/dev/null | awk 'NR>1{match($0,/pid=([0-9]+)/,a); if(a[1]) print a[1]}' | head -1)
-    if [[ -n "$_STALE_PID" ]]; then
-      echo -e "${YELLOW}  ⚠️  Port 6443 in use by PID ${_STALE_PID} — killing stale process...${NC}"
-      kill -9 "$_STALE_PID" 2>/dev/null || true
-      sleep 2
-      log "Killed stale process on port 6443: PID ${_STALE_PID}"
-      echo -e "${GREEN}  ✓ Port 6443 freed${NC}"
-    fi
+    # ── Kill any stale processes occupying K8s control-plane ports ──────────────
+    # A previous failed or partial --destroy / --reset may leave kube-apiserver,
+    # etcd, or kube-controller-manager still running inside the container runtime
+    # (containerd/crio keep them alive even after kubelet.service is stopped).
+    # kubeadm reset removes manifest files but does NOT stop those containers.
+    # _kill_stale_k8s_processes() covers: 6443, 2379, 2380, 10250, 10257, 10259.
+    echo -e "${YELLOW}  Checking for stale processes on control-plane ports...${NC}"
+    _kill_stale_k8s_processes "master"
+    echo ""
     # Run kubeadm init — log everything, show only meaningful phase lines on terminal
     # Pre-pull control-plane images so kubeadm init uses local cache and shows progress
     echo -e "${YELLOW}  ⬇️  Pre-pulling Kubernetes control-plane images...${NC}"
@@ -2646,7 +2643,7 @@ print_author_banner() {
   echo -e "${DIM}║${NC}  ${WHITE}Author  :${NC} ${CYAN}Sreekanth K${NC}                                           ${DIM}║${NC}"
   echo -e "${DIM}║${NC}  ${WHITE}Email   :${NC} ${CYAN}ksk5940@gmail.com${NC}                                     ${DIM}║${NC}"
   echo -e "${DIM}║${NC}  ${WHITE}Script  :${NC} k8s-cluster-bootstrap.sh                             ${DIM}║${NC}"
-  echo -e "${DIM}║${NC}  ${WHITE}Version :${NC} 1.0.0                                                ${DIM}║${NC}"
+  echo -e "${DIM}║${NC}  ${WHITE}Version :${NC} 1.1.0                                                ${DIM}║${NC}"
   echo -e "${DIM}║${NC}  ${WHITE}Supports:${NC} Ubuntu · Debian · Rocky · RHEL · AlmaLinux           ${DIM}║${NC}"
   echo -e "${DIM}║${NC}  ${WHITE}CNI     :${NC} Calico (VXLAN) · Flannel                             ${DIM}║${NC}"
   echo -e "${DIM}╚══════════════════════════════════════════════════════════════════╝${NC}"
@@ -2767,6 +2764,149 @@ _protect_ssh() {
   _SSH_PORT=$(ss -tnlp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -1)
   [[ -z "$_SSH_PORT" ]] && _SSH_PORT=22
   iptables -C INPUT -p tcp --dport "$_SSH_PORT" -j ACCEPT 2>/dev/null ||     iptables -I INPUT -p tcp --dport "$_SSH_PORT" -j ACCEPT
+}
+
+# ── _kill_stale_k8s_processes ────────────────────────────────────────────────
+# Kills any processes still occupying Kubernetes control-plane or worker ports.
+# This is the root cause of [ERROR Port-6443] after --destroy / --reset:
+#   kubeadm reset removes config files but does NOT kill static-pod containers
+#   (kube-apiserver, etcd) that containerd/crio continues to run autonomously.
+#
+# Port groups (by node type):
+#   MASTER : 6443 (API server)  2379 2380 (etcd)  10259 (scheduler)
+#             10257 (controller-manager)  10250 (kubelet)
+#   WORKER : 10250 (kubelet)  10256 (kube-proxy)
+#   BOTH   : 10250 (kubelet)
+#
+# Uses 'ss' (preferred, always present on modern Linux).
+# Falls back to 'fuser' if ss is missing (some minimal RHEL images).
+#
+# Usage:  _kill_stale_k8s_processes "master"   # or "worker"
+_kill_stale_k8s_processes() {
+  local _nt="${1:-master}"
+  local _PORTS=()
+
+  if [[ "$_nt" == "master" ]]; then
+    _PORTS=(6443 2379 2380 10250 10257 10259)
+  else
+    _PORTS=(10250 10256)
+  fi
+
+  local _KILLED=false
+  for _port in "${_PORTS[@]}"; do
+    local _pid=""
+
+    # Try ss first (iproute2 — always present on Ubuntu/Debian/Rocky/RHEL)
+    if command -v ss &>/dev/null; then
+      _pid=$(ss -tlnp "sport = :${_port}" 2>/dev/null \
+        | awk 'NR>1 { match($0,/pid=([0-9]+)/,a); if(a[1]) print a[1] }' \
+        | head -1)
+    fi
+
+    # Fallback: fuser (procps — present on most distros)
+    if [[ -z "$_pid" ]] && command -v fuser &>/dev/null; then
+      _pid=$(fuser "${_port}/tcp" 2>/dev/null | awk '{print $1}')
+    fi
+
+    if [[ -n "$_pid" ]]; then
+      local _cmd; _cmd=$(ps -p "$_pid" -o comm= 2>/dev/null || echo "unknown")
+      echo -e "${YELLOW}    ⚠️  Port ${_port} held by PID ${_pid} (${_cmd}) — killing...${NC}"
+      kill -9 "$_pid" 2>/dev/null || true
+      sleep 1
+      # Verify port is now free
+      local _still=""
+      command -v ss &>/dev/null && \
+        _still=$(ss -tlnp "sport = :${_port}" 2>/dev/null | awk 'NR>1{print $1}' | head -1)
+      if [[ -z "$_still" ]]; then
+        echo -e "${GREEN}    ✓ Port ${_port} freed${NC}"
+        log "_kill_stale_k8s_processes: port ${_port} freed (killed PID ${_pid} ${_cmd})"
+      else
+        echo -e "${YELLOW}    ⚠️  Port ${_port} still in use after kill — will retry on next run${NC}"
+        log "WARNING: port ${_port} still in use after kill (PID ${_pid})"
+      fi
+      _KILLED=true
+    fi
+  done
+
+  [[ "$_KILLED" == false ]] && \
+    echo -e "${GREEN}    ✓ No stale processes on K8s ports${NC}"
+}
+
+# ── _stop_crictl_workloads ────────────────────────────────────────────────────
+# Force-stops and removes ALL running containers and pods via crictl.
+# Must be called BEFORE stopping the container runtime so crictl can still
+# communicate with the runtime socket.
+#
+# The root cause of Port-6443 persisting after --destroy:
+#   containerd / crio manage static pods (kube-apiserver, etcd, etc.) as
+#   containers internally.  When kubelet.service is stopped, those containers
+#   keep running inside the runtime — kubelet is not needed to keep them alive.
+#   kubeadm reset only removes manifest files; it does not talk to containerd
+#   to actually stop the containers.  So after a --destroy the runtime is still
+#   hosting a live kube-apiserver process, which holds port 6443.
+#
+# This function stops and removes those containers BEFORE the runtime is stopped,
+# guaranteeing the ports are released cleanly.
+#
+# OS/runtime note: crictl works identically on Ubuntu, Debian, Rocky, RHEL, and
+# AlmaLinux — it speaks the CRI gRPC protocol and is runtime-agnostic.
+#
+# Usage:  _stop_crictl_workloads "containerd"   # or "crio"
+_stop_crictl_workloads() {
+  local _rt="${1:-}"
+  local _SOCK=""
+
+  case "$_rt" in
+    containerd) _SOCK="unix:///run/containerd/containerd.sock" ;;
+    crio)       _SOCK="unix:///var/run/crio/crio.sock"         ;;
+    *)
+      # Auto-detect from live socket
+      [[ -S /run/containerd/containerd.sock ]] && _SOCK="unix:///run/containerd/containerd.sock"
+      [[ -S /var/run/crio/crio.sock          ]] && _SOCK="unix:///var/run/crio/crio.sock"
+      ;;
+  esac
+
+  if ! command -v crictl &>/dev/null; then
+    echo -e "${CYAN}    ℹ️  crictl not found — skipping container drain${NC}"
+    return 0
+  fi
+
+  if [[ -z "$_SOCK" ]]; then
+    echo -e "${CYAN}    ℹ️  No runtime socket found — skipping container drain${NC}"
+    return 0
+  fi
+
+  export CONTAINER_RUNTIME_ENDPOINT="$_SOCK"
+
+  echo -e "${CYAN}    Stopping all crictl pods (${_rt:-auto})...${NC}"
+  local _pods; _pods=$(crictl pods -q 2>/dev/null || true)
+  if [[ -n "$_pods" ]]; then
+    while IFS= read -r _pod; do
+      [[ -z "$_pod" ]] && continue
+      crictl stopp "$_pod"  2>/dev/null || true
+      crictl rmp   "$_pod"  2>/dev/null || true
+    done <<< "$_pods"
+    echo -e "${GREEN}    ✓ Pods stopped and removed${NC}"
+    log "_stop_crictl_workloads: stopped/removed all pods"
+  else
+    echo -e "${GREEN}    ✓ No running pods found${NC}"
+  fi
+
+  echo -e "${CYAN}    Stopping all crictl containers...${NC}"
+  local _ctrs; _ctrs=$(crictl ps -aq 2>/dev/null || true)
+  if [[ -n "$_ctrs" ]]; then
+    while IFS= read -r _ctr; do
+      [[ -z "$_ctr" ]] && continue
+      crictl stop "$_ctr" 2>/dev/null || true
+      crictl rm -f "$_ctr" 2>/dev/null || true
+    done <<< "$_ctrs"
+    echo -e "${GREEN}    ✓ Containers stopped and removed${NC}"
+    log "_stop_crictl_workloads: stopped/removed all containers"
+  else
+    echo -e "${GREEN}    ✓ No containers found${NC}"
+  fi
+
+  unset CONTAINER_RUNTIME_ENDPOINT
 }
 
 # ── _resolve_node_type ────────────────────────────────────────────────────────
@@ -3043,11 +3183,31 @@ run_reset() {
   _protect_ssh
 
   # [1/6] Stop services
+  # Same ordering discipline as --destroy [1/8]:
+  #   drain containers (crictl) → kill stale port holders → stop kubelet → stop runtime
+  # This prevents Port-6443 / Port-2379 errors on the next --init run.
   RESET_STEP=$(( RESET_STEP + 1 ))
   _render_mode_progress "Reset" "$RESET_STEP" "$RESET_TOTAL" "$CYAN"
-  echo -e "${YELLOW}  [1/6] Stopping kubelet and runtime...${NC}"
+  echo -e "${YELLOW}  [1/6] Stopping kubelet and runtime (${RNT^^})...${NC}"
+
+  # Step A — drain containers via crictl BEFORE stopping the runtime socket
+  echo -e "${CYAN}    [1a] Draining all containers via crictl (${RRT:-auto})...${NC}"
+  _stop_crictl_workloads "$RRT"
+
+  # Step B — kill any stale process still holding a K8s port
+  echo -e "${CYAN}    [1b] Killing stale processes on K8s ports (${RNT^^})...${NC}"
+  _kill_stale_k8s_processes "$RNT"
+
+  # Step C — stop kubelet (containers already gone)
+  echo -e "${CYAN}    [1c] Stopping kubelet...${NC}"
   systemctl stop kubelet 2>/dev/null || true
+  echo -e "${GREEN}    ✓ kubelet stopped${NC}"
+
+  # Step D — stop runtime (no containers running at this point)
+  echo -e "${CYAN}    [1d] Stopping container runtime (${RRT:-none detected})...${NC}"
   [[ -n "$RRT" ]] && systemctl stop "$RRT" 2>/dev/null || true
+  echo -e "${GREEN}    ✓ Container runtime stopped${NC}"
+
   echo -e "${GREEN}  ✓ Services stopped${NC}"
 
   # [2/6] kubeadm reset
@@ -3265,15 +3425,72 @@ run_destroy() {
   _protect_ssh
 
   # ── [1/8] Stop & disable all services ───────────────────────────────────
+  # WHY this order matters:
+  #   1. Drain crictl containers FIRST (while runtime socket still alive)
+  #      → stops kube-apiserver, etcd, kube-controller-manager, scheduler
+  #        (and kube-proxy on workers) which are still running inside the
+  #        runtime even after 'systemctl stop kubelet'.
+  #   2. Kill any process still holding a K8s port (covers edge cases where
+  #      crictl drain did not reach the process — e.g. host-network pods).
+  #   3. Stop kubelet AFTER container drain (so kubelet doesn't restart them).
+  #   4. Stop and disable the container runtime last.
+  #
+  # This sequence is what ensures port 6443 (and 2379/2380/10250/10256) is
+  # fully released before kubeadm reset and before the next --init run.
   DESTROY_STEP=$(( DESTROY_STEP + 1 ))
   _render_mode_progress "Destroy" "$DESTROY_STEP" "$DESTROY_TOTAL" "$RED"
-  echo -e "${YELLOW}  [1/8] Stopping and disabling services...${NC}"
+  echo -e "${YELLOW}  [1/8] Stopping and disabling services (${NT_D^^})...${NC}"
+
+  # Step A — Drain all containers via crictl (before kubelet or runtime stop)
+  echo -e "${CYAN}  [1a] Draining all containers via crictl...${NC}"
+  _stop_crictl_workloads "$RRT"
+
+  # Step B — Kill any stale processes still holding K8s ports
+  # This handles host-network static pods that crictl may not reach.
+  echo -e "${CYAN}  [1b] Killing any stale processes on K8s ports (${NT_D^^})...${NC}"
+  _kill_stale_k8s_processes "$NT_D"
+
+  # Step C — Stop kubelet (now safe: containers already stopped above)
+  echo -e "${CYAN}  [1c] Stopping kubelet...${NC}"
   systemctl stop    kubelet    2>/dev/null || true
   systemctl disable kubelet    2>/dev/null || true
+  echo -e "${GREEN}    ✓ kubelet stopped and disabled${NC}"
+
+  # Step D — Stop container runtime (now safe: no containers running)
+  echo -e "${CYAN}  [1d] Stopping container runtime...${NC}"
   systemctl stop    containerd 2>/dev/null || true
   systemctl disable containerd 2>/dev/null || true
   systemctl stop    crio       2>/dev/null || true
   systemctl disable crio       2>/dev/null || true
+  echo -e "${GREEN}    ✓ Container runtime stopped and disabled${NC}"
+
+  # Step E — Final port verification (prints any remaining holders for info)
+  echo -e "${CYAN}  [1e] Verifying K8s ports are clear...${NC}"
+  local _PORT_CHECK_PORTS=()
+  if [[ "$NT_D" == "master" ]]; then
+    _PORT_CHECK_PORTS=(6443 2379 2380 10250 10257 10259)
+  else
+    _PORT_CHECK_PORTS=(10250 10256)
+  fi
+  local _ALL_CLEAR=true
+  for _chk_port in "${_PORT_CHECK_PORTS[@]}"; do
+    local _chk_pid=""
+    command -v ss &>/dev/null && \
+      _chk_pid=$(ss -tlnp "sport = :${_chk_port}" 2>/dev/null \
+        | awk 'NR>1 { match($0,/pid=([0-9]+)/,a); if(a[1]) print a[1] }' | head -1)
+    if [[ -n "$_chk_pid" ]]; then
+      local _chk_cmd; _chk_cmd=$(ps -p "$_chk_pid" -o comm= 2>/dev/null || echo "unknown")
+      echo -e "${YELLOW}    ⚠️  Port ${_chk_port} still held by PID ${_chk_pid} (${_chk_cmd}) — force-killing${NC}"
+      kill -9 "$_chk_pid" 2>/dev/null || true
+      sleep 1
+      _ALL_CLEAR=false
+      log "destroy [1e]: force-killed PID ${_chk_pid} (${_chk_cmd}) on port ${_chk_port}"
+    fi
+  done
+  [[ "$_ALL_CLEAR" == true ]] && \
+    echo -e "${GREEN}    ✓ All K8s ports are clear${NC}" || \
+    echo -e "${GREEN}    ✓ Remaining holders force-killed${NC}"
+
   echo -e "${GREEN}  ✓ Services stopped and disabled${NC}"
 
   echo -e "${CYAN}  Releasing pod network namespaces and CNI interfaces...${NC}"
@@ -3289,23 +3506,13 @@ run_destroy() {
   command -v kubeadm &>/dev/null &&     kubeadm reset -f --ignore-preflight-errors=all >> "$LOG_FILE" 2>&1 || true
   echo -e "${GREEN}  ✓ kubeadm reset complete${NC}"
 
-  # ── [3/8] Drain crictl containers/pods before removing runtime ──────────
+  # ── [3/8] Crictl drain already performed in [1/8] ───────────────────────
+  # Container drain was moved to step [1a] so pods are stopped BEFORE the
+  # runtime is shut down.  This placeholder keeps step numbering intact.
   DESTROY_STEP=$(( DESTROY_STEP + 1 ))
   _render_mode_progress "Destroy" "$DESTROY_STEP" "$DESTROY_TOTAL" "$RED"
-  echo -e "${YELLOW}  [3/8] Stopping crictl pods and containers...${NC}"
-  if command -v crictl &>/dev/null; then
-    local SOCK=""
-    [[ "$RRT" == "containerd" ]] && SOCK="unix:///run/containerd/containerd.sock"
-    [[ "$RRT" == "crio"       ]] && SOCK="unix:///var/run/crio/crio.sock"
-    [[ -n "$SOCK" ]] && export CONTAINER_RUNTIME_ENDPOINT="$SOCK"
-    for pod in $(crictl pods -q 2>/dev/null); do
-      crictl stopp "$pod" 2>/dev/null || true; crictl rmp "$pod" 2>/dev/null || true
-    done
-    for ctr in $(crictl ps -aq 2>/dev/null); do
-      crictl stop "$ctr" 2>/dev/null || true; crictl rm -f "$ctr" 2>/dev/null || true
-    done
-  fi
-  echo -e "${GREEN}  ✓ Containers and pods stopped${NC}"
+  echo -e "${CYAN}  [3/8] Container drain already completed in step [1a] — skipping${NC}"
+  echo -e "${GREEN}  ✓ Containers and pods stopped (done in step 1)${NC}"
 
   # ── [4/8] Remove Kubernetes packages + crictl ───────────────────────────
   DESTROY_STEP=$(( DESTROY_STEP + 1 ))
