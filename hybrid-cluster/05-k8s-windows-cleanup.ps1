@@ -161,14 +161,40 @@ Write-Host "  $('-'*60)" -ForegroundColor DarkGray
 $hnsToRemove = @('Calico','nat','cbr0','vxlan0','External')
 
 $removedAny = $false
-foreach ($netName in $hnsToRemove) {
-    $hnsNet = Get-HnsNetwork -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -eq $netName }
-    if ($hnsNet) {
-        $hnsNet | ForEach-Object {
-            $_ | Remove-HnsNetwork -ErrorAction SilentlyContinue
-            OK "HNS network removed: $netName"
-            $removedAny = $true
+
+# Get all HNS networks first — on a fresh node this may return nothing or
+# objects without a Name property. StrictMode -Version Latest throws on missing
+# properties inside Where-Object, so we collect safely into an array first.
+$allHnsNetworks = @()
+try {
+    $raw = Get-HnsNetwork -ErrorAction SilentlyContinue
+    if ($raw) {
+        # Wrap in array to handle both single object and collection
+        @($raw) | ForEach-Object {
+            if ($_ -and $_.PSObject.Properties['Name']) {
+                $allHnsNetworks += $_
+            }
+        }
+    }
+} catch {
+    # Get-HnsNetwork not available or HNS service not running — skip silently
+}
+
+if ($allHnsNetworks.Count -eq 0) {
+    Skip "No HNS networks found on this node"
+} else {
+    foreach ($netName in $hnsToRemove) {
+        $hnsNet = $allHnsNetworks | Where-Object { $_.Name -eq $netName }
+        if ($hnsNet) {
+            @($hnsNet) | ForEach-Object {
+                try {
+                    $_ | Remove-HnsNetwork -ErrorAction SilentlyContinue
+                    OK "HNS network removed: $netName"
+                    $removedAny = $true
+                } catch {
+                    Warn "Could not remove HNS network ${netName}: $_"
+                }
+            }
         }
     }
 }
