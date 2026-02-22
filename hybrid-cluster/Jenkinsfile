@@ -169,6 +169,26 @@ pipeline {
                                        sudo bash ${env.REMOTE_MASTER_SCRIPT}
                                    """
 
+                        // -------------------------------------------------------
+                        // Setup .kube/config for the SSH user (e.g. ubuntu)
+                        // The master script configures kubectl for root only.
+                        // This copies admin.conf to the SSH user home directory
+                        // so kubectl works without sudo for that user.
+                        // -------------------------------------------------------
+                        echo "Setting up .kube/config for user: ${env.SSH_USER} ..."
+                        sshCommand remote: remote,
+                                   command: """
+                                       mkdir -p \$HOME/.kube && \
+                                       sudo cp /etc/kubernetes/admin.conf \$HOME/.kube/config && \
+                                       sudo chown \$(id -u):\$(id -g) \$HOME/.kube/config && \
+                                       chmod 600 \$HOME/.kube/config
+                                   """
+
+                        // Verify kubectl works as the SSH user without sudo
+                        sshCommand remote: remote,
+                                   command: 'kubectl get nodes'
+
+                        echo "kubectl configured for user: ${env.SSH_USER} at ~/.kube/config"
                         echo "Master provisioning COMPLETE: ${masterIp}"
                     }
                 }
