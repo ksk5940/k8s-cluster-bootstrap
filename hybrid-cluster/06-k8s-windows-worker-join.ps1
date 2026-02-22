@@ -25,6 +25,11 @@
     powershell -ExecutionPolicy Bypass -File 06-k8s-windows-worker-join.ps1
 #>
 
+param(
+    [string]$JoinCommand = '',   # Pass full kubeadm join command to skip interactive prompt
+    [switch]$AutoApprove         # Pass -AutoApprove to skip "Proceed?" confirmation
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -182,8 +187,12 @@ Write-Host ""
 Write-Host "  K8s $K8S_VERSION  |  ContainerD $CONTAINERD_VERSION  |  Calico $CALICO_VERSION" -ForegroundColor DarkGray
 Write-Host ""
 
-$ans = Read-Host "  Proceed? [Y/n]"
-if ($ans -match '^[Nn]') { exit 0 }
+if (-not $AutoApprove) {
+    $ans = Read-Host "  Proceed? [Y/n]"
+    if ($ans -match '^[Nn]') { exit 0 }
+} else {
+    Write-Host "  Auto-approved (running non-interactively)" -ForegroundColor DarkGray
+}
 New-Item -ItemType Directory -Force -Path $LOG_DIR | Out-Null
 Log "===== SESSION START node=$env:COMPUTERNAME ====="
 
@@ -464,9 +473,16 @@ if ($alreadyJoined) {
     Write-Host "  +----------------------------------------------------------------+" -ForegroundColor Yellow
     Write-Host ""
 
-    $JOIN_CMD = ''
-    while ($JOIN_CMD -notmatch 'kubeadm\s+join') {
-        $JOIN_CMD = (Read-Host "  Paste kubeadm join command").Trim()
+    # Use -JoinCommand parameter if provided (non-interactive/Jenkins mode)
+    # Otherwise prompt interactively
+    if ($JoinCommand -and $JoinCommand -match 'kubeadm\s+join') {
+        $JOIN_CMD = $JoinCommand.Trim()
+        Write-Host "  Using provided join command." -ForegroundColor DarkGray
+    } else {
+        $JOIN_CMD = ''
+        while ($JOIN_CMD -notmatch 'kubeadm\s+join') {
+            $JOIN_CMD = (Read-Host "  Paste kubeadm join command").Trim()
+        }
     }
     $TOKEN           = ([regex]::Match($JOIN_CMD,'--token\s+(\S+)')).Groups[1].Value
     $CA_HASH         = ([regex]::Match($JOIN_CMD,'--discovery-token-ca-cert-hash\s+(\S+)')).Groups[1].Value
