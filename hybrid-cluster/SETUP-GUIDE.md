@@ -2,26 +2,26 @@
 ## Complete Setup Guide with All Known Issues Fixed
 
 ## For Jenkins Automation 
-# Create user with bash shell (needed for SSH commands)
+#### Create user with bash shell (needed for SSH commands)
 useradd -m -s /bin/bash k8sadmin
 
-# Set a password (Jenkins uses this for SSH auth)
+#### Set a password (Jenkins uses this for SSH auth)
 echo "k8sadmin:StrongPassword123" | chpasswd
 
-# Grant passwordless sudo
+#### Grant passwordless sudo
 echo "k8sadmin ALL=(ALL) NOPASSWD:ALL" | tee /etc/sudoers.d/k8sadmin
 chmod 440 /etc/sudoers.d/k8sadmin
 
-# Lock interactive terminal login (can't login via console/TTY)
-# But SSH remote commands still work
+#### Lock interactive terminal login (can't login via console/TTY)
+#### But SSH remote commands still work
 echo "k8sadmin" | tee -a /etc/security/access.conf
 cat >> /etc/security/access.conf <<EOF
 -:k8sadmin:LOCAL
 EOF
 
-# Verify sudo works
+#### Verify sudo works
 su -s /bin/bash k8sadmin -c "sudo whoami"
-# Should print: root
+#### Should print: root
 
 ---
 
