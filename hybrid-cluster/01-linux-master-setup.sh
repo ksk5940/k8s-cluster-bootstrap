@@ -31,7 +31,14 @@ APT_OPTS="-y -q \
 # ── Detect OS ─────────────────────────────────────────────────────────────────
 if   [[ -f /etc/os-release ]]; then source /etc/os-release; OS_ID="${ID}"; OS_VER="${VERSION_ID%%.*}"
 else die "Cannot detect OS"; fi
-[[ "$OS_ID" =~ ^(ubuntu|debian)$ ]] && PKG_MGR="apt" || PKG_MGR="dnf"
+# Broad Linux family detection: apt for Debian-based, dnf for RHEL-based, zypper for SUSE
+if   [[ "${OS_ID}" =~ ^(ubuntu|debian|linuxmint|pop|elementary|kali|raspbian)$ ]]; then PKG_MGR="apt"
+elif [[ "${OS_ID}" =~ ^(rhel|centos|rocky|almalinux|fedora|ol|scientific)$ ]];     then PKG_MGR="dnf"
+elif [[ "${OS_ID}" =~ ^(opensuse|sles|suse)$ ]];                                    then PKG_MGR="zypper"
+elif command -v apt-get &>/dev/null;  then PKG_MGR="apt"
+elif command -v dnf     &>/dev/null;  then PKG_MGR="dnf"
+elif command -v zypper  &>/dev/null;  then PKG_MGR="zypper"
+else die "Unsupported OS: ${OS_ID}. Only Debian/RHEL/SUSE families are supported."; fi
 
 echo -e "
   ${CY}+================================================================+${NC}

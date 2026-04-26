@@ -1,14 +1,38 @@
 // =============================================================================
-//  Jenkinsfile  —  Kubernetes Cluster Bootstrap / Destroy  (dispatcher)
-//  Calls Jenkinsfile.provision or Jenkinsfile.destroy based on ACTION param.
+//  Jenkinsfile  —  Kubernetes Cluster Management
+//  Actions: bootstrap | destroy | reset | upgrade
 //
-//  Fix applied: removed ansiColor('xterm') from options{} — that step requires
-//  the AnsiColor plugin AND must live inside wrap{}, not options{}.
-//  Separate provision / destroy pipeline files are now the recommended pattern.
+//  FIXES vs original:
+//    - Removed synchronized(timings) — unsupported in CPS (Jenkins pipeline)
+//      Replaced with a @NonCPS helper method that collects into a plain Map.
+//    - Added reset action: destroy + re-bootstrap in one pipeline run
+//    - Added upgrade action: version-gap-aware (minor-by-minor if gap > 1)
+//    - Static-IP / hostname pre-flight using 00-set-static-ip-hostname.sh
 // =============================================================================
 
-def isWindowsAgent() { !isUnix() }
+// ── @NonCPS helper — may use Java threading primitives; CPS must NOT ─────────
+@NonCPS
+def recordTiming(Map timings, String key, long start, long end) {
+  timings[key] = [start: start, end: end]
+}
 
+@NonCPS
+def buildVersionPath(String from, String to) {
+  // Returns ordered list of minor versions to pass through, e.g. 1.30→1.32
+  // Input: "1.30.5", "1.32.3"  Output: ["1.31", "1.32"]
+  def fromParts = from.split('\\.').collect { it.toInteger() }
+  def toParts   = to.split('\\.').collect   { it.toInteger() }
+  def steps = []
+  int major = fromParts[0]
+  int startMinor = fromParts[1] + 1
+  int endMinor   = toParts[1]
+  for (int m = startMinor; m <= endMinor; m++) {
+    steps << "${major}.${m}"
+  }
+  return steps
+}
+
+// ── Pipeline ──────────────────────────────────────────────────────────────────
 def timings   = [:]
 def pipeStart = 0L
 
@@ -19,8 +43,11 @@ pipeline {
   parameters {
     choice(
       name: 'ACTION',
-      choices: ['bootstrap', 'destroy'],
-      description: 'bootstrap — provision full cluster | destroy — tear down all nodes'
+      choices: ['bootstrap', 'destroy', 'reset', 'upgrade'],
+      description: '''bootstrap — provision fresh cluster
+destroy  — tear down all nodes (full cleanup)
+reset    — destroy then bootstrap (clean re-provision)
+upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
     )
     string(
       name: 'MASTER_IP',
@@ -41,7 +68,7 @@ pipeline {
       name: 'SSH_CREDS_ID',
       credentialType: 'com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl',
       defaultValue: 'K8S_SSH_CREDS',
-      description: 'Jenkins credential ID for SSH username+password'
+      description: 'Jenkins credential ID — SSH username + password'
     )
     choice(
       name: 'RUNTIME',
@@ -56,21 +83,28 @@ pipeline {
     string(
       name: 'K8S_VERSION',
       defaultValue: '1.32.3',
-      description: 'Kubernetes version (e.g. 1.32.3)'
+      description: 'Target Kubernetes version (e.g. 1.32.3)'
+    )
+    string(
+      name: 'K8S_CURRENT_VERSION',
+      defaultValue: '',
+      description: '[upgrade only] Current installed version (e.g. 1.30.5). Leave blank to auto-detect.'
     )
     string(
       name: 'POD_CIDR',
       defaultValue: '10.244.0.0/16',
-      description: 'Pod network CIDR (10.244.0.0/16 for Flannel/Weave; Calico adapts automatically)'
+      description: 'Pod network CIDR'
+    )
+    booleanParam(
+      name: 'SET_STATIC_IP',
+      defaultValue: false,
+      description: 'Run 00-set-static-ip-hostname.sh on all nodes before provisioning'
     )
   }
 
-  // ── ansiColor removed from options — it is not a valid option type.
-  //    Use wrap([$class: 'AnsiColorBuildWrapper', colorMapName: 'xterm']) { }
-  //    around specific steps if ANSI colour output is needed.
   options {
     timestamps()
-    timeout(time: 60, unit: 'MINUTES')
+    timeout(time: 120, unit: 'MINUTES')
     disableConcurrentBuilds()
   }
 
@@ -80,15 +114,13 @@ pipeline {
 
   stages {
 
-    // ──────────────────────────────────────────────────────────────────────────
+    // ── 0. Validate ───────────────────────────────────────────────────────────
     stage('Validate Inputs') {
       steps {
         script {
           pipeStart = System.currentTimeMillis()
-          def agentOS = isWindowsAgent() ? 'Windows' : 'Linux/Mac'
           def workers = params.WORKER_IPS.tokenize(',').collect { it.trim() }
 
-          echo "Jenkins agent OS : ${agentOS}"
           echo "ACTION           : ${params.ACTION}"
           echo "Master IP        : ${params.MASTER_IP}"
           echo "Worker IPs       : ${workers.join(', ')}"
@@ -96,14 +128,21 @@ pipeline {
           echo "CNI              : ${params.CNI_PLUGIN}"
           echo "K8s version      : ${params.K8S_VERSION}"
           echo "Pod CIDR         : ${params.POD_CIDR}"
+          echo "Set Static IP    : ${params.SET_STATIC_IP}"
 
-          if (!params.MASTER_IP?.trim())  error("MASTER_IP is required")
-          if (!params.WORKER_IPS?.trim()) error("WORKER_IPS is required")
+          if (!params.MASTER_IP?.trim())  error('MASTER_IP is required')
+          if (!params.WORKER_IPS?.trim()) error('WORKER_IPS is required')
+          if (!params.K8S_VERSION?.trim()) error('K8S_VERSION is required')
+
+          // validate version format
+          if (!(params.K8S_VERSION ==~ /\d+\.\d+\.\d+/)) {
+            error("K8S_VERSION must be in format MAJOR.MINOR.PATCH (e.g. 1.32.3)")
+          }
         }
       }
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
+    // ── 1. SSH Connectivity ───────────────────────────────────────────────────
     stage('Verify SSH Connectivity') {
       steps {
         withCredentials([usernamePassword(
@@ -117,13 +156,8 @@ pipeline {
             allIPs.each { ip ->
               def host = ip
               branches["ssh-check: ${host}"] = {
-                def remote = [
-                  name        : host,
-                  host        : host,
-                  user        : params.SSH_USER,
-                  password    : env.SSH_PASS,
-                  allowAnyHosts: true
-                ]
+                def remote = [name: host, host: host, user: params.SSH_USER,
+                              password: env.SSH_PASS, allowAnyHosts: true]
                 sshCommand remote: remote,
                   command: "echo \"SSH OK from \$(hostname) as \$(whoami)\""
                 sshCommand remote: remote,
@@ -131,18 +165,15 @@ pipeline {
               }
             }
             parallel branches
-            echo "All ${allIPs.size()} node(s) reachable. SSH + sudo verified."
+            echo "All ${allIPs.size()} node(s) reachable."
           }
         }
       }
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    //  BOOTSTRAP PATH
-    // ══════════════════════════════════════════════════════════════════════════
-
-    stage('Provision Master Node') {
-      when { expression { params.ACTION == 'bootstrap' } }
+    // ── 1b. Optional: Set Static IP + Hostname ────────────────────────────────
+    stage('Set Static IP and Hostname') {
+      when { expression { params.SET_STATIC_IP } }
       steps {
         withCredentials([usernamePassword(
             credentialsId: params.SSH_CREDS_ID,
@@ -150,29 +181,59 @@ pipeline {
             passwordVariable: 'SSH_PASS'
         )]) {
           script {
-            def masterRemote = [
-              name        : params.MASTER_IP,
-              host        : params.MASTER_IP,
-              user        : params.SSH_USER,
-              password    : env.SSH_PASS,
-              allowAnyHosts: true
-            ]
+            def masterIp  = params.MASTER_IP
+            def workerList = params.WORKER_IPS.tokenize(',').collect { it.trim() }
+            def allNodes  = [[ip: masterIp, role: 'master', hostname: 'k8s-master']]
+            workerList.eachWithIndex { ip, idx ->
+              allNodes << [ip: ip, role: 'worker', hostname: "k8s-worker-${idx + 1}"]
+            }
 
-            echo "============================================================"
-            echo " Provisioning MASTER: ${params.MASTER_IP}"
-            echo " Runtime: ${params.RUNTIME}  |  CNI: ${params.CNI_PLUGIN}"
-            echo "============================================================"
+            def localScript = "${env.WORKSPACE}/${SCRIPT_DIR}/00-set-static-ip-hostname.sh"
+            def branches = [:]
 
-            def localScript = isWindowsAgent()
-              ? "${env.WORKSPACE}\\${SCRIPT_DIR}\\01-linux-master-setup.sh"
-              : "${env.WORKSPACE}/${SCRIPT_DIR}/01-linux-master-setup.sh"
+            allNodes.each { node ->
+              def n = node
+              branches["static-ip: ${n.ip}"] = {
+                def remote = [name: n.ip, host: n.ip, user: params.SSH_USER,
+                              password: env.SSH_PASS, allowAnyHosts: true]
+                sshPut remote: remote, from: localScript, into: '/tmp/00-set-static-ip-hostname.sh'
+                sshCommand remote: remote, command: """
+                  sed -i 's/\\r//' /tmp/00-set-static-ip-hostname.sh && \\
+                  chmod +x /tmp/00-set-static-ip-hostname.sh && \\
+                  export STATIC_IP='${n.ip}' \\
+                         NEW_HOSTNAME='${n.hostname}' \\
+                         NODE_ROLE='${n.role}' && \\
+                  sudo -E bash /tmp/00-set-static-ip-hostname.sh
+                """.stripIndent().trim()
+              }
+            }
+            parallel branches
+            echo "Static IP + hostname configured on all nodes."
+          }
+        }
+      }
+    }
 
-            sshPut remote: masterRemote,
-              from: localScript,
-              into: '/tmp/01-linux-master-setup.sh'
+    // ═════════════════════════════════════════════════════════════════════════
+    //  BOOTSTRAP
+    // ═════════════════════════════════════════════════════════════════════════
+    stage('Provision Master Node') {
+      when { expression { params.ACTION in ['bootstrap', 'reset'] } }
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: params.SSH_CREDS_ID,
+            usernameVariable: 'SSH_USER_VAR',
+            passwordVariable: 'SSH_PASS'
+        )]) {
+          script {
+            def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
+                                user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
+            def localScript = "${env.WORKSPACE}/${SCRIPT_DIR}/01-linux-master-setup.sh"
 
-            timings['master'] = [start: System.currentTimeMillis(), end: 0L]
+            echo "Provisioning MASTER: ${params.MASTER_IP}"
+            sshPut remote: masterRemote, from: localScript, into: '/tmp/01-linux-master-setup.sh'
 
+            def tStart = System.currentTimeMillis()
             sshCommand remote: masterRemote, command: """
               sed -i 's/\\r//' /tmp/01-linux-master-setup.sh && \\
               chmod +x /tmp/01-linux-master-setup.sh && \\
@@ -186,7 +247,7 @@ pipeline {
               sudo -E bash /tmp/01-linux-master-setup.sh
             """.stripIndent().trim()
 
-            timings['master'].end = System.currentTimeMillis()
+            recordTiming(timings, 'master', tStart, System.currentTimeMillis())
             echo "Master provisioning complete."
           }
         }
@@ -194,7 +255,7 @@ pipeline {
     }
 
     stage('Extract Join Command') {
-      when { expression { params.ACTION == 'bootstrap' } }
+      when { expression { params.ACTION in ['bootstrap', 'reset'] } }
       steps {
         withCredentials([usernamePassword(
             credentialsId: params.SSH_CREDS_ID,
@@ -202,16 +263,10 @@ pipeline {
             passwordVariable: 'SSH_PASS'
         )]) {
           script {
-            def masterRemote = [
-              name        : params.MASTER_IP,
-              host        : params.MASTER_IP,
-              user        : params.SSH_USER,
-              password    : env.SSH_PASS,
-              allowAnyHosts: true
-            ]
+            def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
+                                user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
             def joinCmd = sshCommand remote: masterRemote,
               command: "sudo cat /tmp/k8s-join-command.sh"
-
             if (!joinCmd?.trim()) error("Failed to retrieve join command from master")
             env.JOIN_COMMAND = joinCmd.trim()
             echo "Join command extracted."
@@ -221,7 +276,7 @@ pipeline {
     }
 
     stage('Provision Worker Nodes (Parallel)') {
-      when { expression { params.ACTION == 'bootstrap' } }
+      when { expression { params.ACTION in ['bootstrap', 'reset'] } }
       steps {
         withCredentials([usernamePassword(
             credentialsId: params.SSH_CREDS_ID,
@@ -234,20 +289,10 @@ pipeline {
             workers.each { workerIp ->
               def ip = workerIp
               branches["worker: ${ip}"] = {
-                def workerRemote = [
-                  name        : ip,
-                  host        : ip,
-                  user        : params.SSH_USER,
-                  password    : env.SSH_PASS,
-                  allowAnyHosts: true
-                ]
-                def localScript = isWindowsAgent()
-                  ? "${env.WORKSPACE}\\${SCRIPT_DIR}\\02-linux-worker-setup.sh"
-                  : "${env.WORKSPACE}/${SCRIPT_DIR}/02-linux-worker-setup.sh"
-
-                sshPut remote: workerRemote,
-                  from: localScript,
-                  into: '/tmp/02-linux-worker-setup.sh'
+                def workerRemote = [name: ip, host: ip, user: params.SSH_USER,
+                                    password: env.SSH_PASS, allowAnyHosts: true]
+                def localScript = "${env.WORKSPACE}/${SCRIPT_DIR}/02-linux-worker-setup.sh"
+                sshPut remote: workerRemote, from: localScript, into: '/tmp/02-linux-worker-setup.sh'
 
                 def tStart = System.currentTimeMillis()
                 sshCommand remote: workerRemote, command: """
@@ -262,10 +307,7 @@ pipeline {
                   sudo -E bash /tmp/02-linux-worker-setup.sh
                 """.stripIndent().trim()
 
-                def tEnd = System.currentTimeMillis()
-                synchronized(timings) {
-                  timings["worker-${ip}"] = [start: tStart, end: tEnd]
-                }
+                recordTiming(timings, "worker-${ip}", tStart, System.currentTimeMillis())
                 echo "Worker ${ip} provisioning complete."
               }
             }
@@ -276,7 +318,7 @@ pipeline {
     }
 
     stage('Verify Cluster') {
-      when { expression { params.ACTION == 'bootstrap' } }
+      when { expression { params.ACTION in ['bootstrap', 'reset'] } }
       steps {
         withCredentials([usernamePassword(
             credentialsId: params.SSH_CREDS_ID,
@@ -284,36 +326,28 @@ pipeline {
             passwordVariable: 'SSH_PASS'
         )]) {
           script {
-            def masterRemote = [
-              name        : params.MASTER_IP,
-              host        : params.MASTER_IP,
-              user        : params.SSH_USER,
-              password    : env.SSH_PASS,
-              allowAnyHosts: true
-            ]
-            echo "Waiting up to 3 minutes for all nodes to be Ready..."
-            def allReady = false
+            def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
+                                user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
             def workers  = params.WORKER_IPS.tokenize(',').collect { it.trim() }
             def expected = workers.size() + 1
+            def allReady = false
 
+            echo "Waiting up to 3 minutes for ${expected} nodes to be Ready..."
             for (int attempt = 0; attempt < 36; attempt++) {
               def output = sshCommand remote: masterRemote,
                 command: "sudo kubectl get nodes --no-headers 2>/dev/null || true"
-              def readyCount = output.split('\n').findAll { it.contains('Ready') && !it.contains('NotReady') }.size()
+              def readyCount = output.split('\n').findAll {
+                it.contains('Ready') && !it.contains('NotReady')
+              }.size()
               echo "Attempt ${attempt+1}/36 — ${readyCount}/${expected} nodes Ready"
               if (readyCount >= expected) { allReady = true; break }
               sleep 5
             }
 
-            def nodesOut = sshCommand remote: masterRemote,
-              command: "sudo kubectl get nodes -o wide 2>/dev/null || true"
-            echo "── kubectl get nodes ──────────────────────────────────"
-            echo nodesOut
-
-            def podsOut = sshCommand remote: masterRemote,
-              command: "sudo kubectl get pods -n kube-system 2>/dev/null || true"
-            echo "── kube-system pods ───────────────────────────────────"
-            echo podsOut
+            echo sshCommand(remote: masterRemote,
+              command: "sudo kubectl get nodes -o wide 2>/dev/null || true")
+            echo sshCommand(remote: masterRemote,
+              command: "sudo kubectl get pods -n kube-system 2>/dev/null || true")
 
             if (!allReady) unstable("Not all nodes reached Ready state within timeout")
           }
@@ -321,12 +355,11 @@ pipeline {
       }
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    //  DESTROY PATH
-    // ══════════════════════════════════════════════════════════════════════════
-
+    // ═════════════════════════════════════════════════════════════════════════
+    //  DESTROY  (standalone + first half of reset)
+    // ═════════════════════════════════════════════════════════════════════════
     stage('Destroy Cluster') {
-      when { expression { params.ACTION == 'destroy' } }
+      when { expression { params.ACTION in ['destroy', 'reset'] } }
       steps {
         withCredentials([usernamePassword(
             credentialsId: params.SSH_CREDS_ID,
@@ -334,46 +367,157 @@ pipeline {
             passwordVariable: 'SSH_PASS'
         )]) {
           script {
-            def allIPs   = ([params.MASTER_IP] + params.WORKER_IPS.tokenize(',').collect { it.trim() }).unique()
+            def allIPs = ([params.MASTER_IP] + params.WORKER_IPS.tokenize(',').collect { it.trim() }).unique()
+            def localDestroy = "${env.WORKSPACE}/${SCRIPT_DIR}/03-linux-destroy.sh"
             def branches = [:]
-
-            def localDestroy = isWindowsAgent()
-              ? "${env.WORKSPACE}\\${SCRIPT_DIR}\\03-linux-destroy.sh"
-              : "${env.WORKSPACE}/${SCRIPT_DIR}/03-linux-destroy.sh"
 
             allIPs.each { ip ->
               def host = ip
               branches["destroy: ${host}"] = {
-                def remote = [
-                  name        : host,
-                  host        : host,
-                  user        : params.SSH_USER,
-                  password    : env.SSH_PASS,
-                  allowAnyHosts: true
-                ]
-                def start = System.currentTimeMillis()
+                def remote = [name: host, host: host, user: params.SSH_USER,
+                              password: env.SSH_PASS, allowAnyHosts: true]
+                sshPut remote: remote, from: localDestroy, into: '/tmp/03-linux-destroy.sh'
 
-                sshPut remote: remote,
-                  from: localDestroy,
-                  into: '/tmp/03-linux-destroy.sh'
+                def tStart = System.currentTimeMillis()
+                sshCommand remote: remote, command: """
+                  sed -i 's/\\r//' /tmp/03-linux-destroy.sh && \\
+                  chmod +x /tmp/03-linux-destroy.sh && \\
+                  export RUNTIME='${params.RUNTIME}' \\
+                         CNI_PLUGIN='${params.CNI_PLUGIN}' \\
+                         DEBIAN_FRONTEND=noninteractive && \\
+                  sudo -E bash /tmp/03-linux-destroy.sh
+                """.stripIndent().trim()
 
-                sshCommand remote: remote,
-                  command: """
-                    sed -i 's/\\r//' /tmp/03-linux-destroy.sh && \\
-                    chmod +x /tmp/03-linux-destroy.sh && \\
-                    export RUNTIME='${params.RUNTIME}' \\
-                           CNI_PLUGIN='${params.CNI_PLUGIN}' \\
-                           DEBIAN_FRONTEND=noninteractive && \\
-                    sudo -E bash /tmp/03-linux-destroy.sh
-                  """.stripIndent().trim()
-
-                synchronized(timings) {
-                  timings["destroy-${host}"] = [start: start, end: System.currentTimeMillis()]
-                }
+                recordTiming(timings, "destroy-${host}", tStart, System.currentTimeMillis())
                 echo "Destroy complete on ${host}"
               }
             }
             parallel branches
+          }
+        }
+      }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  UPGRADE  (version-gap aware: upgrades minor-by-minor)
+    // ═════════════════════════════════════════════════════════════════════════
+    stage('Detect Current K8s Version') {
+      when { expression { params.ACTION == 'upgrade' } }
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: params.SSH_CREDS_ID,
+            usernameVariable: 'SSH_USER_VAR',
+            passwordVariable: 'SSH_PASS'
+        )]) {
+          script {
+            if (params.K8S_CURRENT_VERSION?.trim()) {
+              env.CURRENT_K8S_VERSION = params.K8S_CURRENT_VERSION.trim()
+              echo "Using provided current version: ${env.CURRENT_K8S_VERSION}"
+            } else {
+              def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
+                                  user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
+              def raw = sshCommand remote: masterRemote,
+                command: "sudo kubectl version --short 2>/dev/null | grep 'Server Version' | grep -oP '\\d+\\.\\d+\\.\\d+' || kubelet --version 2>/dev/null | grep -oP '\\d+\\.\\d+\\.\\d+' | head -1"
+              env.CURRENT_K8S_VERSION = raw.trim()
+              echo "Auto-detected current version: ${env.CURRENT_K8S_VERSION}"
+            }
+            if (!(env.CURRENT_K8S_VERSION ==~ /\d+\.\d+\.\d+/)) {
+              error("Could not determine current K8s version. Set K8S_CURRENT_VERSION parameter.")
+            }
+          }
+        }
+      }
+    }
+
+    stage('Compute Upgrade Path') {
+      when { expression { params.ACTION == 'upgrade' } }
+      steps {
+        script {
+          def from = env.CURRENT_K8S_VERSION
+          def to   = params.K8S_VERSION
+
+          def fromMinor = from.split('\\.')[1].toInteger()
+          def toMinor   = to.split('\\.')[1].toInteger()
+
+          if (fromMinor == toMinor) {
+            // Same minor — patch-level upgrade
+            env.UPGRADE_PATH = to
+            echo "Patch upgrade: ${from} → ${to}"
+          } else if (toMinor < fromMinor) {
+            error("Downgrade not supported: current=${from} target=${to}")
+          } else {
+            // Build minor-by-minor hop list
+            def steps = buildVersionPath(from, to)
+            // last step uses exact target version; intermediate use .0
+            def hops = steps.collect { minor ->
+              minor == "${to.split('\\.')[0]}.${toMinor}" ? to : "${minor}.0"
+            }
+            env.UPGRADE_PATH = hops.join(',')
+            echo "Multi-step upgrade path: ${from} → ${hops.join(' → ')}"
+          }
+        }
+      }
+    }
+
+    stage('Upgrade Cluster') {
+      when { expression { params.ACTION == 'upgrade' } }
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: params.SSH_CREDS_ID,
+            usernameVariable: 'SSH_USER_VAR',
+            passwordVariable: 'SSH_PASS'
+        )]) {
+          script {
+            def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
+                                user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
+            def workers      = params.WORKER_IPS.tokenize(',').collect { it.trim() }
+            def localUpgrade = "${env.WORKSPACE}/${SCRIPT_DIR}/04-linux-upgrade.sh"
+            def hopVersions  = env.UPGRADE_PATH.split(',').collect { it.trim() }
+
+            hopVersions.each { hopVer ->
+              echo "━━━ Upgrading to ${hopVer} ━━━"
+
+              // --- Upgrade master first ---
+              sshPut remote: masterRemote, from: localUpgrade, into: '/tmp/04-linux-upgrade.sh'
+              def tStart = System.currentTimeMillis()
+              sshCommand remote: masterRemote, command: """
+                sed -i 's/\\r//' /tmp/04-linux-upgrade.sh && \\
+                chmod +x /tmp/04-linux-upgrade.sh && \\
+                export K8S_VERSION='${hopVer}' \\
+                       NODE_ROLE='master' \\
+                       RUNTIME='${params.RUNTIME}' \\
+                       MASTER_IP='${params.MASTER_IP}' \\
+                       DEBIAN_FRONTEND=noninteractive && \\
+                sudo -E bash /tmp/04-linux-upgrade.sh
+              """.stripIndent().trim()
+              recordTiming(timings, "upgrade-master-${hopVer}", tStart, System.currentTimeMillis())
+
+              // --- Upgrade workers in parallel ---
+              def wBranches = [:]
+              workers.each { workerIp ->
+                def ip = workerIp
+                wBranches["upgrade-worker-${ip}-${hopVer}"] = {
+                  def workerRemote = [name: ip, host: ip, user: params.SSH_USER,
+                                      password: env.SSH_PASS, allowAnyHosts: true]
+                  sshPut remote: workerRemote, from: localUpgrade, into: '/tmp/04-linux-upgrade.sh'
+                  def wStart = System.currentTimeMillis()
+                  sshCommand remote: workerRemote, command: """
+                    sed -i 's/\\r//' /tmp/04-linux-upgrade.sh && \\
+                    chmod +x /tmp/04-linux-upgrade.sh && \\
+                    export K8S_VERSION='${hopVer}' \\
+                           NODE_ROLE='worker' \\
+                           RUNTIME='${params.RUNTIME}' \\
+                           MASTER_IP='${params.MASTER_IP}' \\
+                           DEBIAN_FRONTEND=noninteractive && \\
+                    sudo -E bash /tmp/04-linux-upgrade.sh
+                  """.stripIndent().trim()
+                  recordTiming(timings, "upgrade-worker-${ip}-${hopVer}", wStart, System.currentTimeMillis())
+                }
+              }
+              parallel wBranches
+
+              echo "All nodes upgraded to ${hopVer}"
+            }
           }
         }
       }
@@ -385,61 +529,41 @@ pipeline {
     always {
       script {
         def pipeEnd   = System.currentTimeMillis()
-        def totalSecs = (pipeEnd - pipeStart) / 1000
+        def totalMs   = pipeEnd - pipeStart
 
         def fmtDur = { long ms ->
           if (ms <= 0) return 'N/A'
           def s = (ms / 1000) as int
-          def m = s.intdiv(60)
-          s = s % 60
+          def m = s.intdiv(60); s = s % 60
           "${m}m ${s}s"
         }
 
-        def header  = String.format("%-30s  %10s  %10s  %10s",
-                                    "Node", "Start (rel)", "End (rel)", "Duration")
-        def divider = '-' * header.length()
-
         def rows = timings.collect { label, t ->
-          def relStart = t.start > 0 ? fmtDur(t.start - pipeStart) : 'N/A'
-          def relEnd   = t.end   > 0 ? fmtDur(t.end   - pipeStart) : 'N/A'
-          def dur      = (t.start > 0 && t.end > 0) ? fmtDur(t.end - t.start) : 'N/A'
-          [label: label, relStart: relStart, relEnd: relEnd, dur: dur]
-        }.sort { a, b -> a.label <=> b.label }
-
-        def tableLines = [
-          '',
-          '╔══════════════════════════════════════════════════════════════════════════╗',
-          "║   ${params.ACTION.toUpperCase()} TIMING SUMMARY${' ' * (54 - params.ACTION.length())}║",
-          '╠══════════════════════════════════════════════════════════════════════════╣',
-          "║  ${header}  ║",
-          "║  ${divider}  ║",
-        ]
-        rows.each { r ->
-          def line = String.format("%-30s  %10s  %10s  %10s",
-                                   r.label, r.relStart, r.relEnd, r.dur)
-          tableLines << "║  ${line}  ║"
-        }
-        tableLines += [
-          '╠══════════════════════════════════════════════════════════════════════════╣',
-          "║  ${'TOTAL PIPELINE TIME:'.padRight(42)} ${fmtDur((long)(totalSecs * 1000))}  ║",
-          '╚══════════════════════════════════════════════════════════════════════════╝',
-          '',
-        ]
-        echo tableLines.join('\n')
-
-        def status = currentBuild.currentResult
-        def icon   = status == 'SUCCESS' ? '[OK]' : (status == 'UNSTABLE' ? '[WARN]' : '[FAIL]')
+          def dur = (t.start > 0 && t.end > 0) ? fmtDur(t.end - t.start) : 'N/A'
+          "  ${label.padRight(38)} ${dur}"
+        }.sort()
 
         echo """
-+==================================================================+
-|  ${icon}  Kubernetes Cluster ${params.ACTION.toUpperCase().padRight(10)} -- ${status.padRight(8)}              |
-+==================================================================+
-|  Master    : ${params.MASTER_IP.padRight(48)}|
-|  Workers   : ${params.WORKER_IPS.padRight(48)}|
-|  Runtime   : ${params.RUNTIME.padRight(48)}|
-|  CNI       : ${params.CNI_PLUGIN.padRight(48)}|
-|  K8s ver   : ${params.K8S_VERSION.padRight(48)}|
-+==================================================================+
+╔══════════════════════════════════════════════════════╗
+║  ${params.ACTION.toUpperCase()} TIMING SUMMARY
+╠══════════════════════════════════════════════════════╣
+${rows.join('\n')}
+╠══════════════════════════════════════════════════════╣
+║  TOTAL : ${fmtDur(totalMs).padRight(43)}║
+╚══════════════════════════════════════════════════════╝
+"""
+
+        def icon = currentBuild.currentResult == 'SUCCESS' ? '[OK]' :
+                   currentBuild.currentResult == 'UNSTABLE' ? '[WARN]' : '[FAIL]'
+        echo """
++==============================================================+
+|  ${icon}  K8s Cluster ${params.ACTION.toUpperCase()}  —  ${currentBuild.currentResult}
++==============================================================+
+|  Master  : ${params.MASTER_IP}
+|  Workers : ${params.WORKER_IPS}
+|  Runtime : ${params.RUNTIME}  |  CNI: ${params.CNI_PLUGIN}
+|  Version : ${params.K8S_VERSION}
++==============================================================+
 """
       }
     }

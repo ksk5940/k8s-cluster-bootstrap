@@ -61,7 +61,12 @@ if [[ -f /etc/os-release ]]; then
 else
   OS_ID="unknown"; OS_VER="?"
 fi
-[[ "${OS_ID}" =~ ^(ubuntu|debian)$ ]] && PKG_MGR="apt" || PKG_MGR="dnf"
+if   [[ "${OS_ID}" =~ ^(ubuntu|debian|linuxmint|pop|elementary|kali|raspbian)$ ]]; then PKG_MGR="apt"
+elif [[ "${OS_ID}" =~ ^(rhel|centos|rocky|almalinux|fedora|ol|scientific)$ ]];     then PKG_MGR="dnf"
+elif [[ "${OS_ID}" =~ ^(opensuse|sles|suse)$ ]];                                    then PKG_MGR="zypper"
+elif command -v apt-get &>/dev/null;  then PKG_MGR="apt"
+elif command -v dnf     &>/dev/null;  then PKG_MGR="dnf"
+else PKG_MGR="dnf"; fi
 
 echo -e "
   ${CY}+================================================================+${NC}
