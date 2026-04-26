@@ -1,438 +1,512 @@
 // =============================================================================
-// Jenkinsfile — Kubernetes Cluster Bootstrap Pipeline
-// Compatible with: Jenkins on Windows OR Linux (auto-detected at runtime)
-// Target nodes  : Ubuntu / Rocky Linux
-//
-// Uses: SSH Pipeline Steps Plugin → https://plugins.jenkins.io/ssh-steps/
-//
-// SECURITY: Uses a non-root sudo user instead of root.
-//
-// Pre-requisite on EACH node (run once manually):
-//   For Ubuntu nodes:
-//     usermod -aG sudo ubuntu
-//     echo "ubuntu ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/ubuntu
-//
-//   For Rocky nodes:
-//     usermod -aG wheel rocky
-//     echo "rocky ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/rocky
-//
-// Jenkins Credential Setup (once):
-//   Manage Jenkins → Credentials → global → Add Credentials
-//     Kind     : Username with password
-//     Username : ubuntu   (or rocky — whichever user exists on your nodes)
-//     Password : <user password>
-//     ID       : K8S_SSH_CREDS
-//
-// Scripts live in the SAME repo as this Jenkinsfile:
-//   hybrid-cluster/01-linux-master-setup.sh
-//   hybrid-cluster/02-linux-worker-setup.sh
+//  Jenkinsfile  —  Kubernetes Cluster Bootstrap / Destroy
+//  Jenkins on Windows → SSH to Linux nodes (Ubuntu master, Rocky workers)
+//  Supports: ContainerD | CRI-O  x  Calico | Flannel
 // =============================================================================
+
+def isWindowsAgent() { !isUnix() }
+
+// ── Timing registry ───────────────────────────────────────────────────────────
+def timings   = [:]    // node_label -> [start: long, end: long]
+def pipeStart = 0L
 
 pipeline {
 
-    agent any
+  agent any
 
-    parameters {
-        string(
-            name: 'MASTER_IP',
-            defaultValue: '',
-            description: 'IP address of the Kubernetes MASTER node.\nExample: 192.168.56.11'
-        )
-        string(
-            name: 'WORKER_IPS',
-            defaultValue: '',
-            description: 'Comma-separated WORKER node IPs.\nExample: 192.168.56.12,192.168.56.13\nAdd as many as needed — all provisioned in parallel.'
-        )
-        string(
-            name: 'SSH_CREDENTIALS_ID',
-            defaultValue: 'K8S_SSH_CREDS',
-            description: 'Jenkins Credentials ID (Username + Password).\nUsername should be a sudo user (e.g. ubuntu or rocky), NOT root.'
-        )
+  // ── Build parameters ────────────────────────────────────────────────────────
+  parameters {
+    choice(
+      name: 'ACTION',
+      choices: ['bootstrap', 'destroy'],
+      description: 'bootstrap — provision full cluster | destroy — tear down all nodes'
+    )
+    string(
+      name: 'MASTER_IP',
+      defaultValue: '192.168.56.11',
+      description: 'Control-plane node IP'
+    )
+    string(
+      name: 'WORKER_IPS',
+      defaultValue: '192.168.56.12,192.168.56.13',
+      description: 'Comma-separated worker IPs'
+    )
+    string(
+      name: 'SSH_USER',
+      defaultValue: 'k8sadmin',
+      description: 'SSH user on all nodes (must have NOPASSWD sudo)'
+    )
+    credentials(
+      name: 'SSH_CREDS_ID',
+      credentialType: 'com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl',
+      defaultValue: 'K8S_SSH_CREDS',
+      description: 'Jenkins credential ID for SSH username+password'
+    )
+    choice(
+      name: 'RUNTIME',
+      choices: ['containerd', 'crio'],
+      description: 'Container runtime to install on every node'
+    )
+    choice(
+      name: 'CNI_PLUGIN',
+      choices: ['calico', 'flannel'],
+      description: 'CNI plugin to deploy on the master after init'
+    )
+    string(
+      name: 'K8S_VERSION',
+      defaultValue: '1.32.3',
+      description: 'Kubernetes version (e.g. 1.32.3)'
+    )
+    string(
+      name: 'POD_CIDR',
+      defaultValue: '10.244.0.0/16',
+      description: 'Pod network CIDR (10.244.0.0/16 = Flannel default; Calico adapts automatically)'
+    )
+  }
+
+  // ── Never interpret shell as Unix on a Windows agent ────────────────────────
+  options {
+    timestamps()
+    timeout(time: 60, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    ansiColor('xterm')
+  }
+
+  // ── Workspace-relative paths (Windows uses backslash but Groovy handles it) ──
+  environment {
+    SCRIPT_DIR = 'hybrid-cluster'
+  }
+
+  stages {
+
+    // ──────────────────────────────────────────────────────────────────────────
+    stage('Validate Inputs') {
+      steps {
+        script {
+          pipeStart = System.currentTimeMillis()
+
+          def agentOS = isWindowsAgent() ? 'Windows' : 'Linux/Mac'
+          def workers = params.WORKER_IPS.tokenize(',').collect { it.trim() }
+
+          echo "Jenkins agent OS: ${agentOS}"
+          echo "ACTION       : ${params.ACTION}"
+          echo "Master IP    : ${params.MASTER_IP}"
+          echo "Worker IPs   : ${workers.join(', ')}"
+          echo "Worker count : ${workers.size()}"
+          echo "Runtime      : ${params.RUNTIME}"
+          echo "CNI          : ${params.CNI_PLUGIN}"
+          echo "K8s version  : ${params.K8S_VERSION}"
+          echo "Pod CIDR     : ${params.POD_CIDR}"
+          echo "Credentials  : ${params.SSH_CREDS_ID}"
+
+          if (!params.MASTER_IP?.trim())  error("MASTER_IP is required")
+          if (!params.WORKER_IPS?.trim()) error("WORKER_IPS is required")
+        }
+      }
     }
 
-    environment {
-        REMOTE_MASTER_SCRIPT = '/tmp/01-linux-master-setup.sh'
-        REMOTE_WORKER_SCRIPT = '/tmp/02-linux-worker-setup.sh'
+    // ──────────────────────────────────────────────────────────────────────────
+    stage('Verify SSH Connectivity') {
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: params.SSH_CREDS_ID,
+            usernameVariable: 'SSH_USER_VAR',
+            passwordVariable: 'SSH_PASS'
+        )]) {
+          script {
+            def allIPs = ([params.MASTER_IP] + params.WORKER_IPS.tokenize(',').collect { it.trim() }).unique()
+            def branches = [:]
+
+            allIPs.each { ip ->
+              def host = ip
+              branches["ssh-check: ${host}"] = {
+                def remote = [
+                  name        : host,
+                  host        : host,
+                  user        : params.SSH_USER,
+                  password    : env.SSH_PASS,
+                  allowAnyHosts: true
+                ]
+                sshCommand remote: remote,
+                  command: "echo \"SSH OK from \$(hostname) as \$(whoami)\""
+                sshCommand remote: remote,
+                  command: "sudo -n whoami | grep -q root && echo 'SUDO OK' || (echo 'SUDO FAILED — ensure NOPASSWD is configured' && exit 1)"
+              }
+            }
+
+            parallel branches
+            echo "All ${allIPs.size()} node(s) reachable. SSH + sudo verified."
+          }
+        }
+      }
     }
 
-    stages {
+    // ══════════════════════════════════════════════════════════════════════════
+    //  BOOTSTRAP PATH
+    // ══════════════════════════════════════════════════════════════════════════
 
-        // =====================================================================
-        // Stage 0 — Detect Jenkins OS + Validate Inputs
-        // =====================================================================
-        stage('Validate Inputs') {
-            steps {
-                script {
-                    // Auto-detect Jenkins agent OS
-                    env.IS_UNIX = isUnix() ? 'true' : 'false'
-                    echo "Jenkins agent OS: ${isUnix() ? 'Linux/Mac' : 'Windows'}"
+    // ──────────────────────────────────────────────────────────────────────────
+    stage('Provision Master Node') {
+      when { expression { params.ACTION == 'bootstrap' } }
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: params.SSH_CREDS_ID,
+            usernameVariable: 'SSH_USER_VAR',
+            passwordVariable: 'SSH_PASS'
+        )]) {
+          script {
+            def masterRemote = [
+              name        : params.MASTER_IP,
+              host        : params.MASTER_IP,
+              user        : params.SSH_USER,
+              password    : env.SSH_PASS,
+              allowAnyHosts: true
+            ]
 
-                    // Set correct path separator for local script paths
-                    if (isUnix()) {
-                        env.LOCAL_MASTER_SCRIPT = 'hybrid-cluster/01-linux-master-setup.sh'
-                        env.LOCAL_WORKER_SCRIPT = 'hybrid-cluster/02-linux-worker-setup.sh'
-                    } else {
-                        env.LOCAL_MASTER_SCRIPT = 'hybrid-cluster\\01-linux-master-setup.sh'
-                        env.LOCAL_WORKER_SCRIPT = 'hybrid-cluster\\02-linux-worker-setup.sh'
-                    }
+            echo "============================================================"
+            echo " Provisioning MASTER: ${params.MASTER_IP}"
+            echo " Runtime: ${params.RUNTIME}  |  CNI: ${params.CNI_PLUGIN}"
+            echo "============================================================"
 
-                    if (!params.MASTER_IP?.trim()) {
-                        error('MASTER_IP cannot be empty.')
-                    }
-                    if (!params.WORKER_IPS?.trim()) {
-                        error('WORKER_IPS cannot be empty.')
-                    }
+            // ── Transfer script ──────────────────────────────────────────────
+            def localScript = isWindowsAgent()
+              ? "${env.WORKSPACE}\\${SCRIPT_DIR}\\01-linux-master-setup.sh"
+              : "${env.WORKSPACE}/${SCRIPT_DIR}/01-linux-master-setup.sh"
 
-                    def workers = params.WORKER_IPS.split(',').collect { it.trim() }.findAll { it }
-                    if (workers.isEmpty()) {
-                        error('No valid worker IPs found after parsing.')
-                    }
+            sshPut remote: masterRemote,
+              from: localScript,
+              into: '/tmp/01-linux-master-setup.sh'
 
-                    echo "Master IP    : ${params.MASTER_IP.trim()}"
-                    echo "Worker IPs   : ${workers.join(', ')}"
-                    echo "Worker count : ${workers.size()}"
-                    echo "Credentials  : ${params.SSH_CREDENTIALS_ID}"
-                }
-            }
+            // ── Record start ─────────────────────────────────────────────────
+            timings['master'] = [start: System.currentTimeMillis(), end: 0L]
+
+            // ── Execute — strip CR, chmod, then sudo bash ────────────────────
+            //    env vars injected so scripts can read them
+            sshCommand remote: masterRemote, command: """
+              sed -i 's/\\r//' /tmp/01-linux-master-setup.sh && \\
+              chmod +x /tmp/01-linux-master-setup.sh && \\
+              export MASTER_IP='${params.MASTER_IP}' \\
+                     K8S_VERSION='${params.K8S_VERSION}' \\
+                     RUNTIME='${params.RUNTIME}' \\
+                     CNI_PLUGIN='${params.CNI_PLUGIN}' \\
+                     POD_CIDR='${params.POD_CIDR}' \\
+                     SETUP_USER='${params.SSH_USER}' \\
+                     DEBIAN_FRONTEND=noninteractive && \\
+              sudo -E bash /tmp/01-linux-master-setup.sh
+            """.stripIndent().trim()
+
+            timings['master'].end = System.currentTimeMillis()
+            echo "Master provisioning complete."
+          }
         }
-
-        // =====================================================================
-        // Stage 1 — Verify SSH Connectivity + Confirm sudo Access
-        // =====================================================================
-        stage('Verify SSH Connectivity') {
-            steps {
-                withCredentials([usernamePassword(
-                    credentialsId: params.SSH_CREDENTIALS_ID,
-                    usernameVariable: 'SSH_USER',
-                    passwordVariable: 'SSH_PASS'
-                )]) {
-                    script {
-                        def workers  = params.WORKER_IPS.split(',').collect { it.trim() }.findAll { it }
-                        def allNodes = [params.MASTER_IP.trim()] + workers
-                        def checks   = [:]
-
-                        allNodes.each { ip ->
-                            checks["ssh-check: ${ip}"] = {
-                                def remote = buildRemote(ip, env.SSH_USER, env.SSH_PASS)
-
-                                // Check SSH works
-                                sshCommand remote: remote,
-                                           command: 'echo "SSH OK from $(hostname) as $(whoami)"'
-
-                                // Check sudo works without password (NOPASSWD)
-                                sshCommand remote: remote,
-                                           command: 'sudo -n whoami | grep -q root && echo "SUDO OK" || (echo "SUDO FAILED - ensure NOPASSWD is configured" && exit 1)'
-                            }
-                        }
-
-                        parallel checks
-                        echo "All ${allNodes.size()} node(s) reachable. SSH + sudo verified."
-                    }
-                }
-            }
-        }
-
-        // =====================================================================
-        // Stage 2 — Provision Master Node
-        //
-        // sshPut  → copies script as the sudo user to /tmp
-        // sed     → strips Windows CRLF (safe no-op if already LF)
-        // sudo    → runs script with root privileges
-        // =====================================================================
-        stage('Provision Master Node') {
-            steps {
-                withCredentials([usernamePassword(
-                    credentialsId: params.SSH_CREDENTIALS_ID,
-                    usernameVariable: 'SSH_USER',
-                    passwordVariable: 'SSH_PASS'
-                )]) {
-                    script {
-                        def masterIp = params.MASTER_IP.trim()
-                        def remote   = buildRemote(masterIp, env.SSH_USER, env.SSH_PASS)
-
-                        echo "============================================================"
-                        echo " Jenkins OS  : ${env.IS_UNIX == 'true' ? 'Linux/Mac' : 'Windows'}"
-                        echo " SSH User    : ${env.SSH_USER} (sudo)"
-                        echo " Provisioning MASTER: ${masterIp}"
-                        echo "============================================================"
-
-                        // Copy script to /tmp (writable by any user)
-                        sshPut remote: remote,
-                               from: env.LOCAL_MASTER_SCRIPT,
-                               into: env.REMOTE_MASTER_SCRIPT
-
-                        // Strip CRLF → make executable → run with sudo
-                        sshCommand remote: remote,
-                                   command: """
-                                       sed -i 's/\\r//' ${env.REMOTE_MASTER_SCRIPT} && \
-                                       chmod +x ${env.REMOTE_MASTER_SCRIPT} && \
-                                       sudo bash ${env.REMOTE_MASTER_SCRIPT}
-                                   """
-
-                        // -------------------------------------------------------
-                        // Setup .kube/config for the SSH user (e.g. ubuntu)
-                        // The master script configures kubectl for root only.
-                        // This copies admin.conf to the SSH user home directory
-                        // so kubectl works without sudo for that user.
-                        // -------------------------------------------------------
-                        echo "Setting up .kube/config for user: ${env.SSH_USER} ..."
-                        sshCommand remote: remote,
-                                   command: """
-                                       mkdir -p \$HOME/.kube && \
-                                       sudo cp /etc/kubernetes/admin.conf \$HOME/.kube/config && \
-                                       sudo chown \$(id -u):\$(id -g) \$HOME/.kube/config && \
-                                       chmod 600 \$HOME/.kube/config
-                                   """
-
-                        // Verify kubectl works as the SSH user without sudo
-                        sshCommand remote: remote,
-                                   command: 'kubectl get nodes'
-
-                        echo "kubectl configured for user: ${env.SSH_USER} at ~/.kube/config"
-                        echo "Master provisioning COMPLETE: ${masterIp}"
-                    }
-                }
-            }
-        }
-
-        // =====================================================================
-        // Stage 3 — Extract kubeadm join command from master
-        // =====================================================================
-        stage('Extract Join Command') {
-            steps {
-                withCredentials([usernamePassword(
-                    credentialsId: params.SSH_CREDENTIALS_ID,
-                    usernameVariable: 'SSH_USER',
-                    passwordVariable: 'SSH_PASS'
-                )]) {
-                    script {
-                        def masterIp = params.MASTER_IP.trim()
-                        def remote   = buildRemote(masterIp, env.SSH_USER, env.SSH_PASS)
-
-                        echo "Fetching kubeadm join command from master ${masterIp} ..."
-
-                        // sudo required — kubeadm needs root
-                        def rawOutput = sshCommand(
-                            remote      : remote,
-                            command     : 'sudo kubeadm token create --print-join-command 2>/dev/null',
-                            returnStdout: true
-                        ).trim()
-
-                        def joinLine = rawOutput.split('\n')
-                                               .collect { it.trim() }
-                                               .find { it.startsWith('kubeadm join') }
-
-                        if (!joinLine) {
-                            error("Could not find 'kubeadm join' line.\nRaw output:\n${rawOutput}")
-                        }
-
-                        env.JOIN_COMMAND = joinLine
-                        echo "Join command captured."
-                        echo "Preview: ${joinLine.take(72)}..."
-                    }
-                }
-            }
-        }
-
-        // =====================================================================
-        // Stage 4 — Provision Worker Nodes IN PARALLEL
-        // =====================================================================
-        stage('Provision Worker Nodes (Parallel)') {
-            steps {
-                withCredentials([usernamePassword(
-                    credentialsId: params.SSH_CREDENTIALS_ID,
-                    usernameVariable: 'SSH_USER',
-                    passwordVariable: 'SSH_PASS'
-                )]) {
-                    script {
-                        def workers    = params.WORKER_IPS.split(',').collect { it.trim() }.findAll { it }
-                        def joinCmd    = env.JOIN_COMMAND
-                        def workerJobs = [:]
-
-                        workers.eachWithIndex { ip, idx ->
-                            def workerIp = ip
-                            def num      = idx + 1
-
-                            workerJobs["worker-${num} [${workerIp}]"] = {
-                                def remote = buildRemote(workerIp, env.SSH_USER, env.SSH_PASS)
-
-                                echo "============================================================"
-                                echo " Provisioning WORKER ${num}: ${workerIp}"
-                                echo "============================================================"
-
-                                // Copy script to /tmp
-                                sshPut remote: remote,
-                                       from: env.LOCAL_WORKER_SCRIPT,
-                                       into: env.REMOTE_WORKER_SCRIPT
-
-                                // Strip CRLF → make executable → inject join cmd → run with sudo
-                                def escapedJoin = joinCmd.replace("'", "'\\''")
-                                sshCommand remote: remote, command: """
-                                    sed -i 's/\\r//' ${env.REMOTE_WORKER_SCRIPT} && \
-                                    chmod +x ${env.REMOTE_WORKER_SCRIPT} && \
-                                    sed -i "s|read -r JOIN_CMD|JOIN_CMD='${escapedJoin}'|g" ${env.REMOTE_WORKER_SCRIPT} && \
-                                    sudo bash ${env.REMOTE_WORKER_SCRIPT}
-                                """
-
-                                echo "Worker ${num} (${workerIp}) joined successfully."
-                            }
-                        }
-
-                        workerJobs.failFast = false
-                        parallel workerJobs
-                    }
-                }
-            }
-        }
-
-        // =====================================================================
-        // Stage 5 — Wait for ALL Nodes Ready + ALL Pods Running
-        //
-        // Polls every 15 seconds (up to 10 minutes).
-        // Pipeline only exits SUCCESS when:
-        //   ✅ Every node   → STATUS = Ready
-        //   ✅ Every pod    → STATUS = Running or Completed
-        //   ✅ Every pod    → READY  = x/x (no 0/1 containers)
-        // If not healthy within 10 min → pipeline fails with clear message.
-        // =====================================================================
-        stage('Verify Cluster') {
-            steps {
-                withCredentials([usernamePassword(
-                    credentialsId: params.SSH_CREDENTIALS_ID,
-                    usernameVariable: 'SSH_USER',
-                    passwordVariable: 'SSH_PASS'
-                )]) {
-                    script {
-                        def masterIp     = params.MASTER_IP.trim()
-                        def remote       = buildRemote(masterIp, env.SSH_USER, env.SSH_PASS)
-                        def maxWaitSecs  = 600   // 10 minutes max
-                        def pollInterval = 15    // poll every 15 seconds
-                        def elapsed      = 0
-                        def clusterReady = false
-
-                        echo "============================================================"
-                        echo " Polling cluster health every ${pollInterval}s (max ${maxWaitSecs}s)"
-                        echo " Waiting for ALL nodes Ready + ALL pods Running..."
-                        echo "============================================================"
-
-                        while (!clusterReady && elapsed < maxWaitSecs) {
-
-                            sleep(pollInterval)
-                            elapsed += pollInterval
-
-                            // Count nodes that are NOT Ready
-                            def notReadyNodes = sshCommand(
-                                remote      : remote,
-                                command     : "kubectl get nodes --no-headers | grep -vc ' Ready' || true",
-                                returnStdout: true
-                            ).trim().toInteger()
-
-                            // Count pods NOT in Running or Completed state
-                            def notRunningPods = sshCommand(
-                                remote      : remote,
-                                command     : "kubectl get pods -A --no-headers | awk '\$4 != \"Running\" && \$4 != \"Completed\"' | wc -l",
-                                returnStdout: true
-                            ).trim().toInteger()
-
-                            // Count pods where READY column is not x/x (e.g. 0/1)
-                            def notReadyContainers = sshCommand(
-                                remote      : remote,
-                                command     : "kubectl get pods -A --no-headers | awk -F' ' '{split(\$3,a,\"/\"); if(a[1]!=a[2]) print}' | wc -l",
-                                returnStdout: true
-                            ).trim().toInteger()
-
-                            echo "[${elapsed}s/${maxWaitSecs}s] Not-Ready nodes: ${notReadyNodes} | Non-Running pods: ${notRunningPods} | Unready containers: ${notReadyContainers}"
-
-                            if (notReadyNodes == 0 && notRunningPods == 0 && notReadyContainers == 0) {
-                                clusterReady = true
-                            }
-                        }
-
-                        // ---- Print final status regardless ----
-                        def nodeStatus = sshCommand(
-                            remote      : remote,
-                            command     : 'kubectl get nodes -o wide',
-                            returnStdout: true
-                        )
-                        def podStatus = sshCommand(
-                            remote      : remote,
-                            command     : 'kubectl get pods -A',
-                            returnStdout: true
-                        )
-
-                        echo "============================================================"
-                        echo " FINAL NODE STATUS"
-                        echo "============================================================"
-                        echo nodeStatus
-
-                        echo "============================================================"
-                        echo " FINAL POD STATUS"
-                        echo "============================================================"
-                        echo podStatus
-
-                        // ---- Fail pipeline if cluster never became healthy ----
-                        if (!clusterReady) {
-                            error("❌ Cluster did not reach fully healthy state within ${maxWaitSecs}s.\nSee node/pod status above for details.")
-                        }
-
-                        echo "============================================================"
-                        echo " ✅ ALL NODES READY | ALL PODS RUNNING — Cluster is healthy!"
-                        echo "============================================================"
-                    }
-                }
-            }
-        }
+      }
     }
 
-    // -------------------------------------------------------------------------
-    // POST
-    // -------------------------------------------------------------------------
-    post {
-        success {
-            script {
-                def workers = params.WORKER_IPS.split(',').collect { it.trim() }.findAll { it }
-                echo """
+    // ──────────────────────────────────────────────────────────────────────────
+    stage('Extract Join Command') {
+      when { expression { params.ACTION == 'bootstrap' } }
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: params.SSH_CREDS_ID,
+            usernameVariable: 'SSH_USER_VAR',
+            passwordVariable: 'SSH_PASS'
+        )]) {
+          script {
+            def masterRemote = [
+              name        : params.MASTER_IP,
+              host        : params.MASTER_IP,
+              user        : params.SSH_USER,
+              password    : env.SSH_PASS,
+              allowAnyHosts: true
+            ]
+
+            // The setup script already called kubeadm token create --print-join-command
+            // and saved it; retrieve it
+            def joinCmd = sshCommand remote: masterRemote,
+              command: "sudo cat /tmp/k8s-join-command.sh"
+
+            if (!joinCmd?.trim()) {
+              error("Failed to retrieve join command from master")
+            }
+
+            env.JOIN_COMMAND = joinCmd.trim()
+            echo "Join command extracted."
+          }
+        }
+      }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    stage('Provision Worker Nodes (Parallel)') {
+      when { expression { params.ACTION == 'bootstrap' } }
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: params.SSH_CREDS_ID,
+            usernameVariable: 'SSH_USER_VAR',
+            passwordVariable: 'SSH_PASS'
+        )]) {
+          script {
+            def workers  = params.WORKER_IPS.tokenize(',').collect { it.trim() }
+            def branches = [:]
+
+            workers.each { workerIp ->
+              def ip = workerIp
+              branches["worker: ${ip}"] = {
+                def workerRemote = [
+                  name        : ip,
+                  host        : ip,
+                  user        : params.SSH_USER,
+                  password    : env.SSH_PASS,
+                  allowAnyHosts: true
+                ]
+
+                def localScript = isWindowsAgent()
+                  ? "${env.WORKSPACE}\\${SCRIPT_DIR}\\02-linux-worker-setup.sh"
+                  : "${env.WORKSPACE}/${SCRIPT_DIR}/02-linux-worker-setup.sh"
+
+                sshPut remote: workerRemote,
+                  from: localScript,
+                  into: '/tmp/02-linux-worker-setup.sh'
+
+                // thread-safe timing
+                def tStart = System.currentTimeMillis()
+
+                sshCommand remote: workerRemote, command: """
+                  sed -i 's/\\r//' /tmp/02-linux-worker-setup.sh && \\
+                  chmod +x /tmp/02-linux-worker-setup.sh && \\
+                  export K8S_VERSION='${params.K8S_VERSION}' \\
+                         RUNTIME='${params.RUNTIME}' \\
+                         JOIN_COMMAND='${env.JOIN_COMMAND}' \\
+                         NODE_IP='${ip}' \\
+                         SETUP_USER='${params.SSH_USER}' \\
+                         DEBIAN_FRONTEND=noninteractive && \\
+                  sudo -E bash /tmp/02-linux-worker-setup.sh
+                """.stripIndent().trim()
+
+                def tEnd = System.currentTimeMillis()
+                // Groovy closures capture by reference — use synchronized map write
+                synchronized(timings) {
+                  timings["worker-${ip}"] = [start: tStart, end: tEnd]
+                }
+                echo "Worker ${ip} provisioning complete."
+              }
+            }
+
+            parallel branches
+          }
+        }
+      }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    stage('Verify Cluster') {
+      when { expression { params.ACTION == 'bootstrap' } }
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: params.SSH_CREDS_ID,
+            usernameVariable: 'SSH_USER_VAR',
+            passwordVariable: 'SSH_PASS'
+        )]) {
+          script {
+            def masterRemote = [
+              name        : params.MASTER_IP,
+              host        : params.MASTER_IP,
+              user        : params.SSH_USER,
+              password    : env.SSH_PASS,
+              allowAnyHosts: true
+            ]
+
+            echo "Waiting up to 3 minutes for all nodes to be Ready..."
+            def allReady = false
+            def workers  = params.WORKER_IPS.tokenize(',').collect { it.trim() }
+            def expected = workers.size() + 1  // master + workers
+
+            for (int attempt = 0; attempt < 36; attempt++) {
+              def output = sshCommand remote: masterRemote,
+                command: "sudo kubectl get nodes --no-headers 2>/dev/null || true"
+              def readyCount = output.split('\n').findAll { it.contains('Ready') && !it.contains('NotReady') }.size()
+              echo "Attempt ${attempt+1}/36 — ${readyCount}/${expected} nodes Ready"
+              if (readyCount >= expected) { allReady = true; break }
+              sleep 5
+            }
+
+            def nodesOut = sshCommand remote: masterRemote,
+              command: "sudo kubectl get nodes -o wide 2>/dev/null || true"
+            echo "── kubectl get nodes ──────────────────────────────────"
+            echo nodesOut
+
+            def podsOut = sshCommand remote: masterRemote,
+              command: "sudo kubectl get pods -n kube-system 2>/dev/null || true"
+            echo "── kube-system pods ───────────────────────────────────"
+            echo podsOut
+
+            if (!allReady) {
+              unstable("Not all nodes reached Ready state within timeout")
+            }
+          }
+        }
+      }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  DESTROY PATH
+    // ══════════════════════════════════════════════════════════════════════════
+
+    stage('Destroy Cluster') {
+      when { expression { params.ACTION == 'destroy' } }
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: params.SSH_CREDS_ID,
+            usernameVariable: 'SSH_USER_VAR',
+            passwordVariable: 'SSH_PASS'
+        )]) {
+          script {
+            def allIPs   = ([params.MASTER_IP] + params.WORKER_IPS.tokenize(',').collect { it.trim() }).unique()
+            def branches = [:]
+
+            def destroyScript = '''
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+
+              echo "[destroy] Resetting kubeadm..."
+              kubeadm reset -f 2>/dev/null || true
+
+              echo "[destroy] Stopping services..."
+              for svc in kubelet containerd crio docker; do
+                systemctl stop    $svc 2>/dev/null || true
+                systemctl disable $svc 2>/dev/null || true
+              done
+
+              echo "[destroy] Removing packages (apt)..."
+              if command -v apt-get &>/dev/null; then
+                apt-get remove -y -q \
+                  -o Dpkg::Options::=--force-confold \
+                  -o Dpkg::Options::=--force-confdef \
+                  kubelet kubeadm kubectl containerd.io cri-o 2>/dev/null || true
+                apt-get autoremove -y -q 2>/dev/null || true
+              fi
+
+              echo "[destroy] Removing packages (dnf)..."
+              if command -v dnf &>/dev/null; then
+                dnf remove -y kubelet kubeadm kubectl containerd.io cri-o 2>/dev/null || true
+              fi
+
+              echo "[destroy] Cleaning state directories..."
+              rm -rf /etc/kubernetes /var/lib/etcd /var/lib/kubelet \
+                     /var/lib/cni /etc/cni /opt/cni \
+                     /var/run/kubernetes /run/containerd \
+                     /etc/containerd /etc/crio /tmp/k8s-join-command.sh \
+                     $HOME/.kube /root/.kube
+
+              echo "[destroy] Flushing iptables..."
+              iptables -F 2>/dev/null || true
+              iptables -X 2>/dev/null || true
+              iptables -t nat -F 2>/dev/null || true
+              iptables -t nat -X 2>/dev/null || true
+              ip link delete cni0   2>/dev/null || true
+              ip link delete flannel.1 2>/dev/null || true
+              ip link delete dummy0 2>/dev/null || true
+
+              echo "[destroy] Done on $(hostname)"
+            '''.stripIndent().trim()
+
+            allIPs.each { ip ->
+              def host = ip
+              branches["destroy: ${host}"] = {
+                def remote = [
+                  name        : host,
+                  host        : host,
+                  user        : params.SSH_USER,
+                  password    : env.SSH_PASS,
+                  allowAnyHosts: true
+                ]
+                def start = System.currentTimeMillis()
+                sshCommand remote: remote,
+                  command: "sudo bash -c '${destroyScript.replace("'", "'\\''")}'"
+                synchronized(timings) {
+                  timings["destroy-${host}"] = [
+                    start: start,
+                    end  : System.currentTimeMillis()
+                  ]
+                }
+                echo "Destroy complete on ${host}"
+              }
+            }
+
+            parallel branches
+          }
+        }
+      }
+    }
+
+  } // end stages
+
+  // ── Post-build summary ──────────────────────────────────────────────────────
+  post {
+    always {
+      script {
+        def pipeEnd   = System.currentTimeMillis()
+        def totalSecs = (pipeEnd - pipeStart) / 1000
+
+        def fmtDur = { long ms ->
+          if (ms <= 0) return 'N/A'
+          def s = (ms / 1000) as int
+          def m = s.intdiv(60)
+          s = s % 60
+          "${m}m ${s}s"
+        }
+
+        // ── Timing table ────────────────────────────────────────────────────
+        def header  = String.format("%-30s  %10s  %10s  %10s",
+                                    "Node", "Start (rel)", "End (rel)", "Duration")
+        def divider = '-' * header.length()
+
+        def rows = timings.collect { label, t ->
+          def relStart = t.start > 0 ? fmtDur(t.start - pipeStart) : 'N/A'
+          def relEnd   = t.end   > 0 ? fmtDur(t.end   - pipeStart) : 'N/A'
+          def dur      = (t.start > 0 && t.end > 0) ? fmtDur(t.end - t.start) : 'N/A'
+          [label: label, relStart: relStart, relEnd: relEnd, dur: dur]
+        }.sort { a, b -> a.label <=> b.label }
+
+        def tableLines = [
+          '',
+          '╔══════════════════════════════════════════════════════════════════════════╗',
+          "║   ${params.ACTION.toUpperCase()} TIMING SUMMARY${' ' * (54 - params.ACTION.length())}║",
+          '╠══════════════════════════════════════════════════════════════════════════╣',
+          "║  ${header}  ║",
+          "║  ${divider}  ║",
+        ]
+
+        rows.each { r ->
+          def line = String.format("%-30s  %10s  %10s  %10s",
+                                   r.label, r.relStart, r.relEnd, r.dur)
+          tableLines << "║  ${line}  ║"
+        }
+
+        tableLines += [
+          '╠══════════════════════════════════════════════════════════════════════════╣',
+          "║  ${'TOTAL PIPELINE TIME:'.padRight(42)} ${fmtDur((long)(totalSecs * 1000))}  ║",
+          '╚══════════════════════════════════════════════════════════════════════════╝',
+          '',
+        ]
+        echo tableLines.join('\n')
+
+        // ── Final status banner ─────────────────────────────────────────────
+        def status = currentBuild.currentResult
+        def icon   = status == 'SUCCESS' ? '✅' : (status == 'UNSTABLE' ? '⚠️' : '❌')
+
+        echo """
 ╔══════════════════════════════════════════════════════════════════╗
-║        Kubernetes Cluster Bootstrap — SUCCESS                   ║
+║  ${icon}  Kubernetes Cluster ${params.ACTION.toUpperCase().padRight(10)} — ${status.padRight(8)}                    ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Master  : ${params.MASTER_IP.trim()}
-║  Workers : ${params.WORKER_IPS.trim()}
-║  Total   : 1 master + ${workers.size()} worker(s)
-╠══════════════════════════════════════════════════════════════════╣
-║  Verify:  sudo kubectl get nodes -o wide                        ║
-╚══════════════════════════════════════════════════════════════════╝"""
-            }
-        }
-        failure {
-            echo """
-╔══════════════════════════════════════════════════════════════════╗
-║        Kubernetes Cluster Bootstrap — FAILED                    ║
-╠══════════════════════════════════════════════════════════════════╣
-║  Troubleshooting checklist:                                     ║
-║   1. SSH user has NOPASSWD sudo configured on all nodes         ║
-║   2. SSH credentials correct in Jenkins credential store        ║
-║   3. SSH Pipeline Steps plugin installed                        ║
-║   4. All nodes reachable on port 22                             ║
-║   5. Nodes have 2GB+ RAM and 20GB+ disk                         ║
-╚══════════════════════════════════════════════════════════════════╝"""
-        }
-        always {
-            echo "Pipeline finished at: ${new Date()}"
-        }
+║  Master    : ${params.MASTER_IP.padRight(48)}║
+║  Workers   : ${params.WORKER_IPS.padRight(48)}║
+║  Runtime   : ${params.RUNTIME.padRight(48)}║
+║  CNI       : ${params.CNI_PLUGIN.padRight(48)}║
+║  K8s ver   : ${params.K8S_VERSION.padRight(48)}║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+      }
     }
-}
-
-// =============================================================================
-// HELPER — Build SSH remote map for SSH Pipeline Steps plugin
-// =============================================================================
-def buildRemote(String ip, String user, String password) {
-    return [
-        name         : ip,
-        host         : ip,
-        port         : 22,
-        user         : user,
-        password     : password,
-        allowAnyHosts: true,
-        timeoutSec   : 3600
-    ]
+  }
 }
