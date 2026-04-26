@@ -8,7 +8,7 @@ set -euo pipefail
 
 # ── Passed by Jenkins via env ─────────────────────────────────────────────────
 K8S_VERSION="${K8S_VERSION:-1.32.3}"
-RUNTIME="${RUNTIME:-containerd}"      # containerd | crio
+RUNTIME="${RUNTIME:-containerd}"      # containerd | crio (CRI-O)
 JOIN_COMMAND="${JOIN_COMMAND:-}"      # full kubeadm join ... string
 SETUP_USER="${SETUP_USER:-k8sadmin}"
 NODE_IP="${NODE_IP:-$(hostname -I | awk '{print $1}')}"

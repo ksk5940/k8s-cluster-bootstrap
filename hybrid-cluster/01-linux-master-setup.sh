@@ -10,7 +10,7 @@ set -euo pipefail
 MASTER_IP="${MASTER_IP:-$(hostname -I | awk '{print $1}')}"
 K8S_VERSION="${K8S_VERSION:-1.32.3}"
 RUNTIME="${RUNTIME:-containerd}"          # containerd | crio
-CNI_PLUGIN="${CNI_PLUGIN:-calico}"        # calico | flannel
+CNI_PLUGIN="${CNI_PLUGIN:-calico}"        # calico | flannel | weave
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 SETUP_USER="${SETUP_USER:-k8sadmin}"
 
@@ -276,10 +276,22 @@ install_flannel() {
   ok "Flannel CNI applied"
 }
 
+install_weave() {
+  # Weave Net — peer-to-peer overlay, no external dependency
+  local WEAVE_VER
+  WEAVE_VER=$(curl -sSL https://api.github.com/repos/weaveworks/weave/releases/latest \
+    | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+  WEAVE_VER="${WEAVE_VER:-2.8.1}"
+  kubectl apply -f \
+    "https://github.com/weaveworks/weave/releases/download/v${WEAVE_VER}/weave-daemonset-k8s.yaml"
+  ok "Weave Net CNI applied (v${WEAVE_VER})"
+}
+
 case "${CNI_PLUGIN}" in
   calico)  install_calico  ;;
   flannel) install_flannel ;;
-  *)       die "Unknown CNI: ${CNI_PLUGIN}. Choose calico or flannel" ;;
+  weave)   install_weave   ;;
+  *)       die "Unknown CNI: ${CNI_PLUGIN}. Choose calico, flannel, or weave" ;;
 esac
 
 # =============================================================================
@@ -322,7 +334,7 @@ echo -e "  ${GR}|        MASTER NODE BOOTSTRAP COMPLETE                         
 echo -e "  ${GR}+================================================================+${NC}"
 echo -e "  Master IP  : ${MASTER_IP}"
 echo -e "  Runtime    : ${RUNTIME}"
-echo -e "  CNI        : ${CNI_PLUGIN}"
+echo -e "  CNI        : ${CNI_PLUGIN}  (calico | flannel | weave)"
 echo -e "  Pod CIDR   : ${POD_CIDR}"
 echo -e "  K8s version: v${K8S_VERSION}"
 echo ""

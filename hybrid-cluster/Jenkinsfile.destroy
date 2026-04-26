@@ -1,0 +1,231 @@
+// =============================================================================
+//  Jenkinsfile.destroy  —  Kubernetes Cluster Destroy ONLY
+//  Use this file when you want a dedicated "destroy / teardown" pipeline job.
+//
+//  Calls 03-linux-destroy.sh on every Linux node in parallel.
+//  Also accepts optional Windows node IPs and runs 05-k8s-windows-cleanup.ps1.
+// =============================================================================
+
+def isWindowsAgent() { !isUnix() }
+def timings   = [:]
+def pipeStart = 0L
+
+pipeline {
+
+  agent any
+
+  parameters {
+    string(
+      name: 'MASTER_IP',
+      defaultValue: '192.168.56.11',
+      description: 'Control-plane node IP'
+    )
+    string(
+      name: 'WORKER_IPS',
+      defaultValue: '192.168.56.12,192.168.56.13',
+      description: 'Comma-separated Linux worker IPs'
+    )
+    string(
+      name: 'WINDOWS_WORKER_IPS',
+      defaultValue: '',
+      description: '(Optional) Comma-separated Windows worker IPs — leave blank if none'
+    )
+    string(
+      name: 'SSH_USER',
+      defaultValue: 'k8sadmin',
+      description: 'SSH user on Linux nodes (must have NOPASSWD sudo)'
+    )
+    credentials(
+      name: 'SSH_CREDS_ID',
+      credentialType: 'com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl',
+      defaultValue: 'K8S_SSH_CREDS',
+      description: 'Jenkins credential ID for SSH username+password'
+    )
+    choice(
+      name: 'RUNTIME',
+      choices: ['containerd', 'crio'],
+      description: 'Runtime that was installed (used to remove correct packages)'
+    )
+    choice(
+      name: 'CNI_PLUGIN',
+      choices: ['calico', 'flannel', 'weave'],
+      description: 'CNI that was installed (used to clean correct interfaces/state)'
+    )
+    booleanParam(
+      name: 'CONFIRM_DESTROY',
+      defaultValue: false,
+      description: 'MUST tick this box to confirm you want to destroy the cluster'
+    )
+  }
+
+  options {
+    timestamps()
+    timeout(time: 30, unit: 'MINUTES')
+    disableConcurrentBuilds()
+  }
+
+  environment {
+    SCRIPT_DIR = 'hybrid-cluster'
+  }
+
+  stages {
+
+    stage('Safety Check') {
+      steps {
+        script {
+          pipeStart = System.currentTimeMillis()
+          if (!params.CONFIRM_DESTROY) {
+            error("Destroy aborted — tick CONFIRM_DESTROY to proceed.")
+          }
+          echo "=== DESTROY — Kubernetes Cluster ==="
+          echo "Master IP        : ${params.MASTER_IP}"
+          echo "Linux workers    : ${params.WORKER_IPS}"
+          echo "Windows workers  : ${params.WINDOWS_WORKER_IPS ?: '(none)'}"
+          echo "Runtime          : ${params.RUNTIME}"
+        }
+      }
+    }
+
+    stage('Verify SSH — Linux Nodes') {
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: params.SSH_CREDS_ID,
+            usernameVariable: 'SSH_USER_VAR',
+            passwordVariable: 'SSH_PASS'
+        )]) {
+          script {
+            def allIPs   = ([params.MASTER_IP] + params.WORKER_IPS.tokenize(',').collect { it.trim() }).unique()
+            def branches = [:]
+            allIPs.each { ip ->
+              def host = ip
+              branches["ssh: ${host}"] = {
+                def remote = [name: host, host: host, user: params.SSH_USER,
+                              password: env.SSH_PASS, allowAnyHosts: true]
+                sshCommand remote: remote, command: "echo \"SSH OK — \$(hostname)\""
+              }
+            }
+            parallel branches
+          }
+        }
+      }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    stage('Destroy Linux Nodes (Parallel)') {
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: params.SSH_CREDS_ID,
+            usernameVariable: 'SSH_USER_VAR',
+            passwordVariable: 'SSH_PASS'
+        )]) {
+          script {
+            def allIPs   = ([params.MASTER_IP] + params.WORKER_IPS.tokenize(',').collect { it.trim() }).unique()
+            def branches = [:]
+
+            def localDestroy = isWindowsAgent()
+              ? "${env.WORKSPACE}\\${SCRIPT_DIR}\\03-linux-destroy.sh"
+              : "${env.WORKSPACE}/${SCRIPT_DIR}/03-linux-destroy.sh"
+
+            allIPs.each { ip ->
+              def host = ip
+              branches["destroy: ${host}"] = {
+                def remote = [name: host, host: host, user: params.SSH_USER,
+                              password: env.SSH_PASS, allowAnyHosts: true]
+                def start = System.currentTimeMillis()
+
+                sshPut remote: remote, from: localDestroy, into: '/tmp/03-linux-destroy.sh'
+                sshCommand remote: remote, command: """
+                  sed -i 's/\\r//' /tmp/03-linux-destroy.sh && \\
+                  chmod +x /tmp/03-linux-destroy.sh && \\
+                  export RUNTIME='${params.RUNTIME}' \\
+                         CNI_PLUGIN='${params.CNI_PLUGIN}' \\
+                         DEBIAN_FRONTEND=noninteractive && \\
+                  sudo -E bash /tmp/03-linux-destroy.sh
+                """.stripIndent().trim()
+
+                synchronized(timings) {
+                  timings["linux-${host}"] = [start: start, end: System.currentTimeMillis()]
+                }
+                echo "Linux destroy complete on ${host}"
+              }
+            }
+            parallel branches
+          }
+        }
+      }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    stage('Destroy Windows Workers (Parallel)') {
+      when { expression { params.WINDOWS_WORKER_IPS?.trim() } }
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: params.SSH_CREDS_ID,
+            usernameVariable: 'SSH_USER_VAR',
+            passwordVariable: 'SSH_PASS'
+        )]) {
+          script {
+            def winIPs   = params.WINDOWS_WORKER_IPS.tokenize(',').collect { it.trim() }
+            def branches = [:]
+
+            def localCleanup = isWindowsAgent()
+              ? "${env.WORKSPACE}\\${SCRIPT_DIR}\\05-k8s-windows-cleanup.ps1"
+              : "${env.WORKSPACE}/${SCRIPT_DIR}/05-k8s-windows-cleanup.ps1"
+
+            winIPs.each { ip ->
+              def host = ip
+              branches["win-destroy: ${host}"] = {
+                def remote = [name: host, host: host, user: params.SSH_USER,
+                              password: env.SSH_PASS, allowAnyHosts: true]
+                def start = System.currentTimeMillis()
+
+                sshPut remote: remote, from: localCleanup,
+                  into: 'C:\\Temp\\05-k8s-windows-cleanup.ps1'
+
+                sshCommand remote: remote,
+                  command: "powershell -ExecutionPolicy Bypass -File C:\\Temp\\05-k8s-windows-cleanup.ps1 -AutoApprove"
+
+                synchronized(timings) {
+                  timings["windows-${host}"] = [start: start, end: System.currentTimeMillis()]
+                }
+                echo "Windows destroy complete on ${host}"
+              }
+            }
+            parallel branches
+          }
+        }
+      }
+    }
+
+  } // end stages
+
+  post {
+    always {
+      script {
+        def totalMs = System.currentTimeMillis() - pipeStart
+        def fmtDur = { long ms ->
+          if (ms <= 0) return 'N/A'
+          def s = (ms / 1000) as int; def m = s.intdiv(60); s = s % 60; "${m}m ${s}s"
+        }
+        def status = currentBuild.currentResult
+        def rows = timings.collect { label, t ->
+          String.format("  %-28s  %s", label, fmtDur(t.end - t.start))
+        }.sort().join('\n')
+
+        echo """
++==================================================================+
+|  DESTROY RESULT : ${status.padRight(45)}|
++==================================================================+
+|  Master    : ${params.MASTER_IP.padRight(48)}|
+|  Workers   : ${params.WORKER_IPS.padRight(48)}|
+|  Runtime   : ${params.RUNTIME.padRight(48)}|
+|  CNI       : ${params.CNI_PLUGIN.padRight(48)}|
+|  Duration  : ${fmtDur(totalMs).padRight(48)}|
++==================================================================+
+Per-node timings:
+${rows}
+"""
+      }
+    }
+  }
+}

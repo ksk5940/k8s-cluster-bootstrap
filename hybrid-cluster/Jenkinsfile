@@ -1,20 +1,21 @@
 // =============================================================================
-//  Jenkinsfile  —  Kubernetes Cluster Bootstrap / Destroy
-//  Jenkins on Windows → SSH to Linux nodes (Ubuntu master, Rocky workers)
-//  Supports: ContainerD | CRI-O  x  Calico | Flannel
+//  Jenkinsfile  —  Kubernetes Cluster Bootstrap / Destroy  (dispatcher)
+//  Calls Jenkinsfile.provision or Jenkinsfile.destroy based on ACTION param.
+//
+//  Fix applied: removed ansiColor('xterm') from options{} — that step requires
+//  the AnsiColor plugin AND must live inside wrap{}, not options{}.
+//  Separate provision / destroy pipeline files are now the recommended pattern.
 // =============================================================================
 
 def isWindowsAgent() { !isUnix() }
 
-// ── Timing registry ───────────────────────────────────────────────────────────
-def timings   = [:]    // node_label -> [start: long, end: long]
+def timings   = [:]
 def pipeStart = 0L
 
 pipeline {
 
   agent any
 
-  // ── Build parameters ────────────────────────────────────────────────────────
   parameters {
     choice(
       name: 'ACTION',
@@ -45,12 +46,12 @@ pipeline {
     choice(
       name: 'RUNTIME',
       choices: ['containerd', 'crio'],
-      description: 'Container runtime to install on every node'
+      description: 'Container runtime: containerd | crio'
     )
     choice(
       name: 'CNI_PLUGIN',
-      choices: ['calico', 'flannel'],
-      description: 'CNI plugin to deploy on the master after init'
+      choices: ['calico', 'flannel', 'weave'],
+      description: 'CNI plugin: calico | flannel | weave'
     )
     string(
       name: 'K8S_VERSION',
@@ -60,19 +61,19 @@ pipeline {
     string(
       name: 'POD_CIDR',
       defaultValue: '10.244.0.0/16',
-      description: 'Pod network CIDR (10.244.0.0/16 = Flannel default; Calico adapts automatically)'
+      description: 'Pod network CIDR (10.244.0.0/16 for Flannel/Weave; Calico adapts automatically)'
     )
   }
 
-  // ── Never interpret shell as Unix on a Windows agent ────────────────────────
+  // ── ansiColor removed from options — it is not a valid option type.
+  //    Use wrap([$class: 'AnsiColorBuildWrapper', colorMapName: 'xterm']) { }
+  //    around specific steps if ANSI colour output is needed.
   options {
     timestamps()
     timeout(time: 60, unit: 'MINUTES')
     disableConcurrentBuilds()
-    ansiColor('xterm')
   }
 
-  // ── Workspace-relative paths (Windows uses backslash but Groovy handles it) ──
   environment {
     SCRIPT_DIR = 'hybrid-cluster'
   }
@@ -84,20 +85,17 @@ pipeline {
       steps {
         script {
           pipeStart = System.currentTimeMillis()
-
           def agentOS = isWindowsAgent() ? 'Windows' : 'Linux/Mac'
           def workers = params.WORKER_IPS.tokenize(',').collect { it.trim() }
 
-          echo "Jenkins agent OS: ${agentOS}"
-          echo "ACTION       : ${params.ACTION}"
-          echo "Master IP    : ${params.MASTER_IP}"
-          echo "Worker IPs   : ${workers.join(', ')}"
-          echo "Worker count : ${workers.size()}"
-          echo "Runtime      : ${params.RUNTIME}"
-          echo "CNI          : ${params.CNI_PLUGIN}"
-          echo "K8s version  : ${params.K8S_VERSION}"
-          echo "Pod CIDR     : ${params.POD_CIDR}"
-          echo "Credentials  : ${params.SSH_CREDS_ID}"
+          echo "Jenkins agent OS : ${agentOS}"
+          echo "ACTION           : ${params.ACTION}"
+          echo "Master IP        : ${params.MASTER_IP}"
+          echo "Worker IPs       : ${workers.join(', ')}"
+          echo "Runtime          : ${params.RUNTIME}"
+          echo "CNI              : ${params.CNI_PLUGIN}"
+          echo "K8s version      : ${params.K8S_VERSION}"
+          echo "Pod CIDR         : ${params.POD_CIDR}"
 
           if (!params.MASTER_IP?.trim())  error("MASTER_IP is required")
           if (!params.WORKER_IPS?.trim()) error("WORKER_IPS is required")
@@ -116,7 +114,6 @@ pipeline {
           script {
             def allIPs = ([params.MASTER_IP] + params.WORKER_IPS.tokenize(',').collect { it.trim() }).unique()
             def branches = [:]
-
             allIPs.each { ip ->
               def host = ip
               branches["ssh-check: ${host}"] = {
@@ -130,10 +127,9 @@ pipeline {
                 sshCommand remote: remote,
                   command: "echo \"SSH OK from \$(hostname) as \$(whoami)\""
                 sshCommand remote: remote,
-                  command: "sudo -n whoami | grep -q root && echo 'SUDO OK' || (echo 'SUDO FAILED — ensure NOPASSWD is configured' && exit 1)"
+                  command: "sudo -n whoami | grep -q root && echo 'SUDO OK' || (echo 'SUDO FAILED' && exit 1)"
               }
             }
-
             parallel branches
             echo "All ${allIPs.size()} node(s) reachable. SSH + sudo verified."
           }
@@ -145,7 +141,6 @@ pipeline {
     //  BOOTSTRAP PATH
     // ══════════════════════════════════════════════════════════════════════════
 
-    // ──────────────────────────────────────────────────────────────────────────
     stage('Provision Master Node') {
       when { expression { params.ACTION == 'bootstrap' } }
       steps {
@@ -168,7 +163,6 @@ pipeline {
             echo " Runtime: ${params.RUNTIME}  |  CNI: ${params.CNI_PLUGIN}"
             echo "============================================================"
 
-            // ── Transfer script ──────────────────────────────────────────────
             def localScript = isWindowsAgent()
               ? "${env.WORKSPACE}\\${SCRIPT_DIR}\\01-linux-master-setup.sh"
               : "${env.WORKSPACE}/${SCRIPT_DIR}/01-linux-master-setup.sh"
@@ -177,11 +171,8 @@ pipeline {
               from: localScript,
               into: '/tmp/01-linux-master-setup.sh'
 
-            // ── Record start ─────────────────────────────────────────────────
             timings['master'] = [start: System.currentTimeMillis(), end: 0L]
 
-            // ── Execute — strip CR, chmod, then sudo bash ────────────────────
-            //    env vars injected so scripts can read them
             sshCommand remote: masterRemote, command: """
               sed -i 's/\\r//' /tmp/01-linux-master-setup.sh && \\
               chmod +x /tmp/01-linux-master-setup.sh && \\
@@ -202,7 +193,6 @@ pipeline {
       }
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
     stage('Extract Join Command') {
       when { expression { params.ACTION == 'bootstrap' } }
       steps {
@@ -219,16 +209,10 @@ pipeline {
               password    : env.SSH_PASS,
               allowAnyHosts: true
             ]
-
-            // The setup script already called kubeadm token create --print-join-command
-            // and saved it; retrieve it
             def joinCmd = sshCommand remote: masterRemote,
               command: "sudo cat /tmp/k8s-join-command.sh"
 
-            if (!joinCmd?.trim()) {
-              error("Failed to retrieve join command from master")
-            }
-
+            if (!joinCmd?.trim()) error("Failed to retrieve join command from master")
             env.JOIN_COMMAND = joinCmd.trim()
             echo "Join command extracted."
           }
@@ -236,7 +220,6 @@ pipeline {
       }
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
     stage('Provision Worker Nodes (Parallel)') {
       when { expression { params.ACTION == 'bootstrap' } }
       steps {
@@ -248,7 +231,6 @@ pipeline {
           script {
             def workers  = params.WORKER_IPS.tokenize(',').collect { it.trim() }
             def branches = [:]
-
             workers.each { workerIp ->
               def ip = workerIp
               branches["worker: ${ip}"] = {
@@ -259,7 +241,6 @@ pipeline {
                   password    : env.SSH_PASS,
                   allowAnyHosts: true
                 ]
-
                 def localScript = isWindowsAgent()
                   ? "${env.WORKSPACE}\\${SCRIPT_DIR}\\02-linux-worker-setup.sh"
                   : "${env.WORKSPACE}/${SCRIPT_DIR}/02-linux-worker-setup.sh"
@@ -268,9 +249,7 @@ pipeline {
                   from: localScript,
                   into: '/tmp/02-linux-worker-setup.sh'
 
-                // thread-safe timing
                 def tStart = System.currentTimeMillis()
-
                 sshCommand remote: workerRemote, command: """
                   sed -i 's/\\r//' /tmp/02-linux-worker-setup.sh && \\
                   chmod +x /tmp/02-linux-worker-setup.sh && \\
@@ -284,21 +263,18 @@ pipeline {
                 """.stripIndent().trim()
 
                 def tEnd = System.currentTimeMillis()
-                // Groovy closures capture by reference — use synchronized map write
                 synchronized(timings) {
                   timings["worker-${ip}"] = [start: tStart, end: tEnd]
                 }
                 echo "Worker ${ip} provisioning complete."
               }
             }
-
             parallel branches
           }
         }
       }
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
     stage('Verify Cluster') {
       when { expression { params.ACTION == 'bootstrap' } }
       steps {
@@ -315,11 +291,10 @@ pipeline {
               password    : env.SSH_PASS,
               allowAnyHosts: true
             ]
-
             echo "Waiting up to 3 minutes for all nodes to be Ready..."
             def allReady = false
             def workers  = params.WORKER_IPS.tokenize(',').collect { it.trim() }
-            def expected = workers.size() + 1  // master + workers
+            def expected = workers.size() + 1
 
             for (int attempt = 0; attempt < 36; attempt++) {
               def output = sshCommand remote: masterRemote,
@@ -340,9 +315,7 @@ pipeline {
             echo "── kube-system pods ───────────────────────────────────"
             echo podsOut
 
-            if (!allReady) {
-              unstable("Not all nodes reached Ready state within timeout")
-            }
+            if (!allReady) unstable("Not all nodes reached Ready state within timeout")
           }
         }
       }
@@ -364,51 +337,9 @@ pipeline {
             def allIPs   = ([params.MASTER_IP] + params.WORKER_IPS.tokenize(',').collect { it.trim() }).unique()
             def branches = [:]
 
-            def destroyScript = '''
-              set -euo pipefail
-              export DEBIAN_FRONTEND=noninteractive
-
-              echo "[destroy] Resetting kubeadm..."
-              kubeadm reset -f 2>/dev/null || true
-
-              echo "[destroy] Stopping services..."
-              for svc in kubelet containerd crio docker; do
-                systemctl stop    $svc 2>/dev/null || true
-                systemctl disable $svc 2>/dev/null || true
-              done
-
-              echo "[destroy] Removing packages (apt)..."
-              if command -v apt-get &>/dev/null; then
-                apt-get remove -y -q \
-                  -o Dpkg::Options::=--force-confold \
-                  -o Dpkg::Options::=--force-confdef \
-                  kubelet kubeadm kubectl containerd.io cri-o 2>/dev/null || true
-                apt-get autoremove -y -q 2>/dev/null || true
-              fi
-
-              echo "[destroy] Removing packages (dnf)..."
-              if command -v dnf &>/dev/null; then
-                dnf remove -y kubelet kubeadm kubectl containerd.io cri-o 2>/dev/null || true
-              fi
-
-              echo "[destroy] Cleaning state directories..."
-              rm -rf /etc/kubernetes /var/lib/etcd /var/lib/kubelet \
-                     /var/lib/cni /etc/cni /opt/cni \
-                     /var/run/kubernetes /run/containerd \
-                     /etc/containerd /etc/crio /tmp/k8s-join-command.sh \
-                     $HOME/.kube /root/.kube
-
-              echo "[destroy] Flushing iptables..."
-              iptables -F 2>/dev/null || true
-              iptables -X 2>/dev/null || true
-              iptables -t nat -F 2>/dev/null || true
-              iptables -t nat -X 2>/dev/null || true
-              ip link delete cni0   2>/dev/null || true
-              ip link delete flannel.1 2>/dev/null || true
-              ip link delete dummy0 2>/dev/null || true
-
-              echo "[destroy] Done on $(hostname)"
-            '''.stripIndent().trim()
+            def localDestroy = isWindowsAgent()
+              ? "${env.WORKSPACE}\\${SCRIPT_DIR}\\03-linux-destroy.sh"
+              : "${env.WORKSPACE}/${SCRIPT_DIR}/03-linux-destroy.sh"
 
             allIPs.each { ip ->
               def host = ip
@@ -421,18 +352,27 @@ pipeline {
                   allowAnyHosts: true
                 ]
                 def start = System.currentTimeMillis()
+
+                sshPut remote: remote,
+                  from: localDestroy,
+                  into: '/tmp/03-linux-destroy.sh'
+
                 sshCommand remote: remote,
-                  command: "sudo bash -c '${destroyScript.replace("'", "'\\''")}'"
+                  command: """
+                    sed -i 's/\\r//' /tmp/03-linux-destroy.sh && \\
+                    chmod +x /tmp/03-linux-destroy.sh && \\
+                    export RUNTIME='${params.RUNTIME}' \\
+                           CNI_PLUGIN='${params.CNI_PLUGIN}' \\
+                           DEBIAN_FRONTEND=noninteractive && \\
+                    sudo -E bash /tmp/03-linux-destroy.sh
+                  """.stripIndent().trim()
+
                 synchronized(timings) {
-                  timings["destroy-${host}"] = [
-                    start: start,
-                    end  : System.currentTimeMillis()
-                  ]
+                  timings["destroy-${host}"] = [start: start, end: System.currentTimeMillis()]
                 }
                 echo "Destroy complete on ${host}"
               }
             }
-
             parallel branches
           }
         }
@@ -441,7 +381,6 @@ pipeline {
 
   } // end stages
 
-  // ── Post-build summary ──────────────────────────────────────────────────────
   post {
     always {
       script {
@@ -456,7 +395,6 @@ pipeline {
           "${m}m ${s}s"
         }
 
-        // ── Timing table ────────────────────────────────────────────────────
         def header  = String.format("%-30s  %10s  %10s  %10s",
                                     "Node", "Start (rel)", "End (rel)", "Duration")
         def divider = '-' * header.length()
@@ -476,13 +414,11 @@ pipeline {
           "║  ${header}  ║",
           "║  ${divider}  ║",
         ]
-
         rows.each { r ->
           def line = String.format("%-30s  %10s  %10s  %10s",
                                    r.label, r.relStart, r.relEnd, r.dur)
           tableLines << "║  ${line}  ║"
         }
-
         tableLines += [
           '╠══════════════════════════════════════════════════════════════════════════╣',
           "║  ${'TOTAL PIPELINE TIME:'.padRight(42)} ${fmtDur((long)(totalSecs * 1000))}  ║",
@@ -491,20 +427,19 @@ pipeline {
         ]
         echo tableLines.join('\n')
 
-        // ── Final status banner ─────────────────────────────────────────────
         def status = currentBuild.currentResult
-        def icon   = status == 'SUCCESS' ? '✅' : (status == 'UNSTABLE' ? '⚠️' : '❌')
+        def icon   = status == 'SUCCESS' ? '[OK]' : (status == 'UNSTABLE' ? '[WARN]' : '[FAIL]')
 
         echo """
-╔══════════════════════════════════════════════════════════════════╗
-║  ${icon}  Kubernetes Cluster ${params.ACTION.toUpperCase().padRight(10)} — ${status.padRight(8)}                    ║
-╠══════════════════════════════════════════════════════════════════╣
-║  Master    : ${params.MASTER_IP.padRight(48)}║
-║  Workers   : ${params.WORKER_IPS.padRight(48)}║
-║  Runtime   : ${params.RUNTIME.padRight(48)}║
-║  CNI       : ${params.CNI_PLUGIN.padRight(48)}║
-║  K8s ver   : ${params.K8S_VERSION.padRight(48)}║
-╚══════════════════════════════════════════════════════════════════╝
++==================================================================+
+|  ${icon}  Kubernetes Cluster ${params.ACTION.toUpperCase().padRight(10)} -- ${status.padRight(8)}              |
++==================================================================+
+|  Master    : ${params.MASTER_IP.padRight(48)}|
+|  Workers   : ${params.WORKER_IPS.padRight(48)}|
+|  Runtime   : ${params.RUNTIME.padRight(48)}|
+|  CNI       : ${params.CNI_PLUGIN.padRight(48)}|
+|  K8s ver   : ${params.K8S_VERSION.padRight(48)}|
++==================================================================+
 """
       }
     }
