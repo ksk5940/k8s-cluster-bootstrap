@@ -1,29 +1,33 @@
 # k8s-cluster-bootstrap
 
-Automated Kubernetes cluster lifecycle management via Jenkins CI/CD.  
-Supports **bootstrap · destroy · reset · upgrade** on bare-metal and VM-based Linux nodes.
+Automated Kubernetes cluster lifecycle management via Jenkins.  
+Supports **bootstrap · destroy · reset · upgrade** on any Linux distribution.
 
 ---
 
 ## Table of Contents
 
-1. [Supported OS and Runtimes](#supported-os-and-runtimes)
-2. [Repository Structure](#repository-structure)
-3. [Step 0 — Pre-flight: Create the k8sadmin User](#step-0--pre-flight-create-the-k8sadmin-user)
-4. [Step 1 — Set Static IP and Hostname on Each Node](#step-1--set-static-ip-and-hostname-on-each-node)
-5. [Step 2 — Jenkins Setup](#step-2--jenkins-setup)
-6. [Step 3 — Create Jenkins Pipeline Job](#step-3--create-jenkins-pipeline-job)
-7. [Step 4 — Run the Pipeline](#step-4--run-the-pipeline)
-8. [Pipeline Actions Explained](#pipeline-actions-explained)
-9. [Standalone Script Usage (Without Jenkins)](#standalone-script-usage-without-jenkins)
-10. [Troubleshooting](#troubleshooting)
-11. [Bug Fixes Changelog](#bug-fixes-changelog)
-12. [Architecture Overview](#architecture-overview)
-13. [Security Notes](#security-notes)
+1. [Supported Operating Systems](#1-supported-operating-systems)
+2. [File Overview](#2-file-overview)
+3. [Pre-Flight: Create the Bootstrap User on Every Node](#3-pre-flight-create-the-bootstrap-user-on-every-node)
+4. [Pre-Flight: Set Static IP and Hostname](#4-pre-flight-set-static-ip-and-hostname)
+5. [Jenkins Install](#5-jenkins-install)
+6. [Jenkins: Install Plugins](#6-jenkins-install-plugins)
+7. [Jenkins: Add SSH Credentials](#7-jenkins-add-ssh-credentials)
+8. [Jenkins: Add GitHub Credentials](#8-jenkins-add-github-credentials-private-repo-only)
+9. [Jenkins: Create the Pipeline Job](#9-jenkins-create-the-pipeline-job)
+10. [Jenkins: Run the Pipeline](#10-jenkins-run-the-pipeline)
+11. [Pipeline Parameters Reference](#11-pipeline-parameters-reference)
+12. [Pipeline Actions Explained](#12-pipeline-actions-explained)
+13. [Standalone Script Usage](#13-standalone-script-usage-without-jenkins)
+14. [Troubleshooting](#14-troubleshooting)
+15. [Architecture Overview](#15-architecture-overview)
+16. [Node IP Planning](#16-node-ip-planning)
+17. [Security Notes](#17-security-notes)
 
 ---
 
-## Supported OS and Runtimes
+## 1. Supported Operating Systems
 
 | Family | Distributions |
 |---|---|
@@ -36,557 +40,746 @@ CNI plugins: `calico` (default) · `flannel` · `weave`
 
 ---
 
-## Repository Structure
+## 2. File Overview
 
 ```
 hybrid-cluster/
-├── Jenkinsfile                    ← Main pipeline (bootstrap | destroy | reset | upgrade)
-├── 00-set-static-ip-hostname.sh  ← Static IP + hostname configuration
+├── Jenkinsfile                    ← Main pipeline (all 4 actions)
+├── 00-set-static-ip-hostname.sh  ← Static IP + hostname (all network managers)
 ├── 01-linux-master-setup.sh      ← Control-plane bootstrap
 ├── 02-linux-worker-setup.sh      ← Worker node bootstrap
-├── 03-linux-destroy.sh           ← Full node teardown and cleanup
-├── 04-linux-upgrade.sh           ← In-place K8s version upgrade
-├── 07-validate.sh                ← Post-install validation
+├── 03-linux-destroy.sh           ← Full node teardown
+├── 04-linux-upgrade.sh           ← In-place version upgrade (minor-by-minor)
+├── 07-validate.sh                ← Post-install cluster validation
 └── README.md                     ← This file
 ```
 
 ---
 
-## Step 0 — Pre-flight: Create the k8sadmin User
+## 3. Pre-Flight: Create the Bootstrap User on Every Node
 
-> **This is the most common reason the pipeline fails.**  
-> The SSH user (`k8sadmin` by default) must exist on **every node** before the pipeline runs.
-> The SSH connectivity check will time out or refuse connection if this user is missing.
-
-Run the following on **each node** (master and all workers) as root or a user with sudo:
-
-### Ubuntu / Debian
-
-```bash
-# Create user with home directory, no password login
-sudo useradd -m -s /bin/bash k8sadmin
-
-# Set a password (Jenkins will use this to SSH in)
-sudo passwd k8sadmin
-# Enter your chosen password twice when prompted
-
-# Grant passwordless sudo — required by all bootstrap scripts
-echo "k8sadmin ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/k8sadmin
-sudo chmod 0440 /etc/sudoers.d/k8sadmin
-
-# Verify sudo works without a password prompt
-sudo -u k8sadmin sudo -n whoami
-# Expected output: root
-```
-
-### Rocky Linux / RHEL / AlmaLinux
-
-```bash
-# Create user
-sudo useradd -m -s /bin/bash k8sadmin
-sudo passwd k8sadmin
-
-# Grant passwordless sudo
-echo "k8sadmin ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/k8sadmin
-sudo chmod 0440 /etc/sudoers.d/k8sadmin
-
-# On RHEL/Rocky, also disable requiretty in sudoers if present
-sudo sed -i 's/^Defaults.*requiretty/# &/' /etc/sudoers
-
-# Verify
-sudo -u k8sadmin sudo -n whoami
-# Expected output: root
-```
-
-### Verify SSH access from Jenkins host
-
-Before running the pipeline, manually verify SSH connectivity from the Jenkins machine:
-
-```bash
-# Replace 192.168.56.11 with each node's IP
-ssh k8sadmin@192.168.56.11 "echo SSH OK && sudo -n whoami"
-# Expected output:
-# SSH OK
-# root
-```
-
-If SSH is refused, ensure:
-- Port 22 is open on the node: `sudo ss -tlnp | grep :22`
-- sshd is running: `sudo systemctl status sshd`
-- The password you set matches what you store in Jenkins credentials
+> **Do this first — on every node (master + all workers).**  
+> Jenkins SSHes into each node as a dedicated user (`k8sadmin`).  
+> That user must exist, have a password, and have **passwordless sudo**.
 
 ---
 
-## Step 1 — Set Static IP and Hostname on Each Node
+### 3a. One-Shot Setup Script (recommended)
 
-Each node needs a static IP so that the cluster addresses don't change across reboots. Run this on each node **before** the Jenkins pipeline, or enable `SET_STATIC_IP=true` in the pipeline parameters to do it automatically.
-
-### Manual (recommended for first-time setup)
-
-SSH into each node and run as root:
+Copy the script below, save it as `create-k8sadmin.sh` on each node, and run it as root. It handles all four required steps automatically.
 
 ```bash
-# Download the script to the node first
-curl -fsSL https://raw.githubusercontent.com/ksk5940/k8s-cluster-bootstrap/main/hybrid-cluster/00-set-static-ip-hostname.sh \
-  -o /tmp/00-set-static-ip-hostname.sh
+#!/bin/bash
+# create-k8sadmin.sh
+# Run as root (or with sudo) on EVERY node — master and each worker
+set -euo pipefail
 
-# On the master node (192.168.56.11)
+USERNAME="k8sadmin"
+PASSWORD="YourStr0ngP@ssword"   # ← CHANGE THIS before running
+
+echo "=== Creating bootstrap user: ${USERNAME} ==="
+
+# Step 1 — Create user if not already present
+if id "${USERNAME}" &>/dev/null; then
+  echo "[SKIP] User ${USERNAME} already exists"
+else
+  useradd -m -s /bin/bash "${USERNAME}"
+  echo "[OK]   User ${USERNAME} created"
+fi
+
+# Set password
+echo "${USERNAME}:${PASSWORD}" | chpasswd
+echo "[OK]   Password set"
+
+# Step 2 — Passwordless sudo
+echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME}
+chmod 0440 /etc/sudoers.d/${USERNAME}
+# Validate sudoers file syntax
+visudo -c -f /etc/sudoers.d/${USERNAME} >/dev/null 2>&1 \
+  && echo "[OK]   Sudoers entry validated" \
+  || { echo "[FAIL] Sudoers syntax error — check /etc/sudoers.d/${USERNAME}"; exit 1; }
+
+# Step 3 — Enable SSH password authentication
+SSHD_CFG="/etc/ssh/sshd_config"
+sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' "${SSHD_CFG}"
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' "${SSHD_CFG}"
+# Restart SSH service (name varies by distro)
+systemctl restart sshd 2>/dev/null \
+  || systemctl restart ssh 2>/dev/null \
+  || service ssh restart 2>/dev/null \
+  || true
+echo "[OK]   SSH password authentication enabled"
+
+# Step 4 — Verify sudo works without password
+RESULT=$(sudo -u "${USERNAME}" sudo -n whoami 2>&1)
+if [[ "${RESULT}" == "root" ]]; then
+  echo "[OK]   NOPASSWD sudo verified: sudo whoami → root"
+else
+  echo "[WARN] sudo check returned: ${RESULT}"
+  echo "       Check /etc/sudoers.d/${USERNAME}"
+fi
+
+NODE_IP=$(hostname -I | awk '{print $1}')
+echo ""
+echo "======================================================"
+echo "  Bootstrap user ready: ${USERNAME}@${NODE_IP}"
+echo "  Password:             ${PASSWORD}"
+echo "  Add this to Jenkins:  ID=K8S_SSH_CREDS"
+echo "======================================================"
+```
+
+Run on each node:
+
+```bash
+sudo bash create-k8sadmin.sh
+```
+
+---
+
+### 3b. Manual Steps (if you prefer step by step)
+
+**Step 1 — Create the user:**
+```bash
+sudo useradd -m -s /bin/bash k8sadmin
+sudo passwd k8sadmin
+# Enter and confirm the password
+```
+
+**Step 2 — Grant passwordless sudo:**
+```bash
+echo "k8sadmin ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/k8sadmin
+sudo chmod 0440 /etc/sudoers.d/k8sadmin
+```
+
+**Step 3 — Enable SSH password auth:**
+```bash
+sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sudo systemctl restart sshd || sudo service ssh restart
+```
+
+**Step 4 — Verify everything works:**
+```bash
+# Must print "root" with no password prompt
+sudo -u k8sadmin sudo -n whoami
+```
+
+---
+
+### 3c. Verify from the Jenkins server
+
+From your Jenkins machine, test SSH connectivity to every node:
+
+```bash
+ssh k8sadmin@192.168.56.11 "sudo whoami && echo SSH+SUDO_OK"
+ssh k8sadmin@192.168.56.12 "sudo whoami && echo SSH+SUDO_OK"
+ssh k8sadmin@192.168.56.13 "sudo whoami && echo SSH+SUDO_OK"
+```
+
+Every node must return `root` followed by `SSH+SUDO_OK`. If any node fails, do not proceed until the issue is fixed.
+
+---
+
+## 4. Pre-Flight: Set Static IP and Hostname
+
+Kubernetes requires stable IPs. Set a static IP and hostname on every node before bootstrapping. You can run `00-set-static-ip-hostname.sh` manually, or enable the `SET_STATIC_IP=true` pipeline parameter to have Jenkins do it automatically.
+
+### Manual method
+
+```bash
+# On master node
 sudo STATIC_IP=192.168.56.11 \
      GATEWAY=192.168.56.1 \
      NEW_HOSTNAME=k8s-master \
      NODE_ROLE=master \
-     bash /tmp/00-set-static-ip-hostname.sh
+     bash 00-set-static-ip-hostname.sh
 
-# On worker-1 (192.168.56.12)
+# On worker-1
 sudo STATIC_IP=192.168.56.12 \
      GATEWAY=192.168.56.1 \
      NEW_HOSTNAME=k8s-worker-1 \
      NODE_ROLE=worker \
-     bash /tmp/00-set-static-ip-hostname.sh
+     bash 00-set-static-ip-hostname.sh
 
-# On worker-2 (192.168.56.13)
+# On worker-2
 sudo STATIC_IP=192.168.56.13 \
      GATEWAY=192.168.56.1 \
      NEW_HOSTNAME=k8s-worker-2 \
      NODE_ROLE=worker \
-     bash /tmp/00-set-static-ip-hostname.sh
+     bash 00-set-static-ip-hostname.sh
 ```
 
-### Environment Variables for the Static IP Script
+### Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `STATIC_IP` | **required** | Target static IP address |
-| `GATEWAY` | auto-detect | Network gateway (router IP) |
-| `DNS_SERVERS` | `8.8.8.8 1.1.1.1` | Space-separated DNS servers |
-| `PREFIX_LENGTH` | `24` | Subnet prefix (24 = /24 = 255.255.255.0) |
-| `NETWORK_IFACE` | auto-detect | NIC name (e.g. `eth0`, `ens33`, `enp0s3`) |
-| `NEW_HOSTNAME` | unchanged | Desired hostname for this node |
-| `NODE_ROLE` | `worker` | Informational: `master` or `worker` |
+| `STATIC_IP` | **required** | IP address to assign to this node |
+| `GATEWAY` | auto-detected | Default gateway / router IP |
+| `DNS_SERVERS` | `8.8.8.8 1.1.1.1` | Space-separated DNS server IPs |
+| `PREFIX_LENGTH` | `24` | Subnet mask length (`24` = `/24` = `255.255.255.0`) |
+| `NETWORK_IFACE` | auto-detected | NIC name — e.g. `eth0`, `ens33`, `enp0s3` |
+| `NEW_HOSTNAME` | unchanged | New hostname to set |
+| `NODE_ROLE` | `worker` | Informational only: `master` or `worker` |
 
-The script auto-detects and configures: `netplan` (Ubuntu), `nmcli` (Rocky/RHEL), `wicked` (openSUSE), `dhcpcd` (Raspbian), or `ifupdown` (Debian classic). It is idempotent — safe to run multiple times.
+The script auto-detects the network manager (`netplan` / `nmcli` / `wicked` / `dhcpcd` / `ifupdown`) and applies the correct configuration. It is **idempotent** — safe to run multiple times.
 
-### Verify After Running
+### Verify
 
 ```bash
-ip addr show          # Check the static IP is applied on the correct interface
-hostname              # Should print the new hostname (e.g. k8s-master)
-ping 8.8.8.8 -c 3    # Verify internet access still works
+ip addr show       # Confirm static IP is applied to the NIC
+hostname           # Confirm hostname matches NEW_HOSTNAME
+ping 8.8.8.8 -c 3 # Confirm internet access
 ```
 
 ---
 
-## Step 2 — Jenkins Setup
+## 5. Jenkins Install
 
-### 2.1 Install Jenkins
-
-**Ubuntu / Debian:**
+### Ubuntu / Debian
 
 ```bash
-# Install Java (Jenkins requires JDK 17+)
 sudo apt-get update
 sudo apt-get install -y openjdk-17-jdk
 
-# Add Jenkins APT repo and key
 curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key \
   | sudo tee /usr/share/keyrings/jenkins-keyring.asc > /dev/null
+
 echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] \
   https://pkg.jenkins.io/debian-stable binary/" \
   | sudo tee /etc/apt/sources.list.d/jenkins.list > /dev/null
 
-sudo apt-get update
-sudo apt-get install -y jenkins
+sudo apt-get update && sudo apt-get install -y jenkins
 sudo systemctl enable --now jenkins
 ```
 
-**Rocky Linux / RHEL:**
+### RHEL / Rocky / AlmaLinux
 
 ```bash
 sudo dnf install -y java-17-openjdk
+
 sudo wget -O /etc/yum.repos.d/jenkins.repo \
   https://pkg.jenkins.io/redhat-stable/jenkins.repo
 sudo rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+
 sudo dnf install -y jenkins
 sudo systemctl enable --now jenkins
 ```
 
-Jenkins runs on port `8080`. Get the initial admin password:
+### Unlock Jenkins
+
+Jenkins starts on port **8080**. Open `http://<jenkins-ip>:8080` in a browser.
 
 ```bash
+# Get the unlock password
 sudo cat /var/lib/jenkins/secrets/initialAdminPassword
 ```
 
-Open `http://<jenkins-host>:8080` in your browser and complete the setup wizard.
+Paste it into the browser, choose **Install suggested plugins**, and create an admin user.
 
 ---
 
-### 2.2 Install Required Jenkins Plugins
+## 6. Jenkins: Install Plugins
 
-Go to **Manage Jenkins → Plugins → Available plugins** and install:
+Go to **Manage Jenkins → Plugins → Available plugins**, search for each plugin, tick it, and click **Install without restart**.
 
-| Plugin | Why it's needed |
-|---|---|
-| **SSH Pipeline Steps** | Provides `sshCommand` and `sshPut` used by every stage |
-| **Credentials Binding** | Provides `withCredentials` for secure password injection |
-| **Pipeline** | Core declarative pipeline support |
-| **Git** | Clones the Jenkinsfile from GitHub |
-| **Timestamper** | Adds timestamps to console output |
-| **AnsiColor** *(optional)* | Renders ANSI color codes in console output |
+| Plugin Name | Search Term | Why Needed |
+|---|---|---|
+| **SSH Pipeline Steps** | `ssh pipeline steps` | Provides `sshCommand` and `sshPut` — the core of the pipeline |
+| **Credentials Binding** | `credentials binding` | Enables `withCredentials` block to safely inject passwords |
+| **Pipeline** | `pipeline` | Core declarative pipeline engine |
+| **Pipeline: Stage View** | `stage view` | Renders the visual stage progress in the Jenkins UI |
+| **Git** | `git` | Clones the Jenkinsfile and scripts from your GitHub repo |
+| **Timestamper** | `timestamper` | Prepends timestamps to every console line |
+| **Build With Parameters** | `build with parameters` | Renders parameter dropdowns in the Build UI |
+| **AnsiColor** *(optional)* | `ansicolor` | Renders the colored output from the bash scripts |
 
-After installing, restart Jenkins: `sudo systemctl restart jenkins`
+After installing all plugins, go to **Manage Jenkins → Plugins → Installed** and confirm all appear. Restart Jenkins if prompted:
 
----
-
-### 2.3 Add SSH Credentials to Jenkins
-
-The pipeline uses **Username with Password** credentials where:
-- The **password** field is used as the SSH password for all nodes.
-- The **username** field in the credential is **not used for SSH login** — the `SSH_USER` pipeline parameter controls the actual login user.
-
-Steps:
-
-1. Go to **Manage Jenkins → Credentials → System → Global credentials (unrestricted)**
-2. Click **Add Credentials**
-3. Set the following:
-
-| Field | Value |
-|---|---|
-| **Kind** | `Username with password` |
-| **Scope** | `Global` |
-| **Username** | `k8sadmin` *(or any value — it is not used by the pipeline)* |
-| **Password** | The password you set for `k8sadmin` on your nodes |
-| **ID** | `K8S_SSH_CREDS` *(must match the `SSH_CREDS_ID` pipeline default)* |
-| **Description** | `K8s node SSH credentials` |
-
-4. Click **Create**
-
-> **Important:** The `SSH_USER` parameter in the pipeline (default: `k8sadmin`) controls which OS user Jenkins SSHs as. This was a bug in the original pipeline — the credential's username field was incorrectly used instead. This version always uses `params.SSH_USER`.
+```bash
+sudo systemctl restart jenkins
+```
 
 ---
 
-### 2.4 Add GitHub Credentials (if repository is private)
+## 7. Jenkins: Add SSH Credentials
 
-If your fork of this repository is private:
+This stores the `k8sadmin` username and password inside Jenkins so the pipeline can SSH into your nodes without hardcoding secrets.
 
-1. Go to **Manage Jenkins → Credentials → System → Global credentials**
-2. Click **Add Credentials**
-3. Set:
+**Navigation:** Manage Jenkins → Credentials → System → Global credentials (unrestricted) → + Add Credentials
+
+| Field | Value | Notes |
+|---|---|---|
+| **Kind** | `Username with password` | Must be this type — not SSH key |
+| **Scope** | `Global` | Makes it available to the pipeline job |
+| **Username** | `k8sadmin` | Must match the user you created on the nodes |
+| **Password** | `YourStr0ngP@ssword` | The password set in `create-k8sadmin.sh` |
+| **ID** | `K8S_SSH_CREDS` | **Critical — must match exactly.** This is what the Jenkinsfile looks up |
+| **Description** | `K8s node SSH credentials (k8sadmin)` | Human-readable label |
+
+Click **Create**.
+
+> **Important:** The credential **ID** (`K8S_SSH_CREDS`) is referenced in the Jenkinsfile as the default value for the `SSH_CREDS_ID` parameter. If you change the ID here, you must also change `defaultValue: 'K8S_SSH_CREDS'` in the Jenkinsfile, or select the correct credential ID each time you run the pipeline.
+
+---
+
+## 8. Jenkins: Add GitHub Credentials (private repo only)
+
+Skip this section if your repository is **public**.
+
+**Navigation:** Manage Jenkins → Credentials → System → Global credentials → + Add Credentials
 
 | Field | Value |
 |---|---|
 | **Kind** | `Username with password` |
 | **Username** | Your GitHub username |
-| **Password** | A GitHub [Personal Access Token](https://github.com/settings/tokens) with `repo` scope |
+| **Password** | A GitHub **Personal Access Token (PAT)** — not your GitHub account password |
 | **ID** | `github-creds` |
+| **Description** | `GitHub PAT for k8s-cluster-bootstrap` |
+
+**To create a GitHub PAT:**
+
+1. Go to GitHub.com → click your profile picture → **Settings**
+2. Left sidebar → **Developer settings** → **Personal access tokens** → **Tokens (classic)**
+3. Click **Generate new token (classic)**
+4. Set **Note**: `Jenkins k8s-cluster-bootstrap`
+5. Set **Expiration**: 90 days (or longer for long-lived setups)
+6. Check scope: **repo** (grants full private repo access)
+7. Click **Generate token** — copy it immediately (shown only once)
+
+Paste the token as the **Password** in the Jenkins credential form.
 
 ---
 
-## Step 3 — Create Jenkins Pipeline Job
+## 9. Jenkins: Create the Pipeline Job
 
-1. From the Jenkins dashboard, click **New Item**
+### 9a. Create the item
+
+1. From the Jenkins dashboard, click **+ New Item**
 2. Enter name: `k8s-cluster-bootstrap`
-3. Select **Pipeline** → click **OK**
-4. Scroll to the **Pipeline** section and configure:
+3. Select **Pipeline**
+4. Click **OK**
+
+---
+
+### 9b. General section
+
+| Setting | Value |
+|---|---|
+| **Description** | `Kubernetes cluster: bootstrap / destroy / reset / upgrade` |
+| **Discard old builds** | ✅ Enable — set Max builds to keep: `10` |
+
+---
+
+### 9c. Build Triggers section
+
+Leave all triggers **unchecked** for manual execution. Optional:
+
+- **GitHub hook trigger for GITScm polling** — triggers the pipeline on every `git push` to the repo (requires configuring a GitHub webhook: Settings → Webhooks → Add webhook → Payload URL = `http://<jenkins-ip>:8080/github-webhook/`)
+
+---
+
+### 9d. Pipeline section — fill in exactly as shown
 
 | Field | Value |
 |---|---|
 | **Definition** | `Pipeline script from SCM` |
 | **SCM** | `Git` |
 | **Repository URL** | `https://github.com/ksk5940/k8s-cluster-bootstrap.git` |
-| **Credentials** | Select `github-creds` if the repo is private; leave blank if public |
+| **Credentials** | `github-creds` if private, or `- none -` if public |
 | **Branch Specifier** | `*/main` |
+| **Repository browser** | `(Auto)` |
 | **Script Path** | `hybrid-cluster/Jenkinsfile` |
+| **Lightweight checkout** | ✅ Check — faster, only fetches the Jenkinsfile for SCM polling |
 
-5. Click **Save**
-
-The pipeline will appear with a **Build with Parameters** button after the first scan.
-
-> **First build note:** Jenkins needs to parse the Jenkinsfile once to register the parameters. The very first build (triggered by "Build Now") will fail immediately with "Started by user" — this is normal. After that, "Build with Parameters" appears with all the fields.
+Click **Save**.
 
 ---
 
-## Step 4 — Run the Pipeline
+### 9e. Set up global Git identity (one-time)
 
-1. Click **Build with Parameters** on the `k8s-cluster-bootstrap` job
-2. Fill in the parameters:
+Jenkins needs a Git identity to perform checkouts.
 
-| Parameter | Default | Description |
-|---|---|---|
-| `ACTION` | `bootstrap` | `bootstrap` / `destroy` / `reset` / `upgrade` |
-| `MASTER_IP` | `192.168.56.11` | Control-plane node IP |
-| `WORKER_IPS` | `192.168.56.12,192.168.56.13` | Comma-separated worker IPs |
-| `SSH_USER` | `k8sadmin` | Linux OS user on all nodes (must have NOPASSWD sudo) |
-| `SSH_CREDS_ID` | `K8S_SSH_CREDS` | Jenkins credential ID (password used for SSH auth) |
-| `RUNTIME` | `containerd` | `containerd` or `crio` |
-| `CNI_PLUGIN` | `calico` | `calico`, `flannel`, or `weave` |
-| `K8S_VERSION` | `1.32.3` | Target Kubernetes version (`MAJOR.MINOR.PATCH`) |
-| `K8S_CURRENT_VERSION` | *(blank)* | `[upgrade only]` Current installed version. Blank = auto-detect |
-| `POD_CIDR` | `10.244.0.0/16` | Pod network CIDR |
-| `SET_STATIC_IP` | `false` | Set `true` to auto-configure static IPs via script 00 |
+1. Go to **Manage Jenkins → System**
+2. Scroll to the **Git plugin** section
+3. Set:
+   - **Global Config user.name**: `Jenkins`
+   - **Global Config user.email**: `jenkins@k8s-bootstrap`
+4. Click **Save**
 
+---
+
+## 10. Jenkins: Run the Pipeline
+
+### First run
+
+On the first run, Jenkins clones the repo and reads the Jenkinsfile parameters. The first execution may show just **Build Now** with no parameter UI — that is normal.
+
+1. Click **Build Now** once
+2. The build will fail immediately (no parameters yet) — that is expected
+3. After this first run, the job learns its parameters
+4. Click **Build with Parameters** — the full parameter UI now appears
+
+### Every run after the first
+
+1. Click **Build with Parameters**
+2. Fill in parameters (see [Section 11](#11-pipeline-parameters-reference))
 3. Click **Build**
-4. Click the build number → **Console Output** to follow progress
+4. Watch progress in **Stage View** or **Console Output**
 
-A successful bootstrap takes approximately **8–15 minutes** depending on network speed and node hardware.
+### Successful bootstrap console output pattern
+
+```
+[Validate Inputs]                 ✔  1s
+[Verify SSH Connectivity]         ✔  4s    ← all nodes checked in parallel
+[Set Static IP and Hostname]      ✔  skipped  (SET_STATIC_IP=false)
+[Provision Master Node]           ✔  4m 28s
+[Extract Join Command]            ✔  2s
+[Provision Worker Nodes]          ✔  3m 12s  ← workers run in parallel
+[Verify Cluster]                  ✔  38s
+
+BOOTSTRAP TIMING SUMMARY
+  master            4m 28s
+  worker-192.168.56.12  3m 05s
+  worker-192.168.56.13  3m 12s
+  TOTAL             8m 22s
+
+[OK]  K8s Cluster BOOTSTRAP — SUCCESS
+```
 
 ---
 
-## Pipeline Actions Explained
+## 11. Pipeline Parameters Reference
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `ACTION` | Choice | `bootstrap` | `bootstrap` — fresh cluster · `destroy` — full teardown · `reset` — destroy + bootstrap · `upgrade` — in-place version upgrade |
+| `MASTER_IP` | String | `192.168.56.11` | IP address of the control-plane node |
+| `WORKER_IPS` | String | `192.168.56.12,192.168.56.13` | Comma-separated IPs of all worker nodes |
+| `SSH_USER` | String | `k8sadmin` | SSH username — must be the user created in Section 3 |
+| `SSH_CREDS_ID` | Credential | `K8S_SSH_CREDS` | Jenkins credential ID — must match what you created in Section 7 |
+| `RUNTIME` | Choice | `containerd` | Container runtime: `containerd` or `crio` |
+| `CNI_PLUGIN` | Choice | `calico` | CNI plugin: `calico`, `flannel`, or `weave` |
+| `K8S_VERSION` | String | `1.32.3` | Target Kubernetes version in `MAJOR.MINOR.PATCH` format |
+| `K8S_CURRENT_VERSION` | String | *(blank)* | **Upgrade only** — current version. Leave blank to auto-detect from the master |
+| `POD_CIDR` | String | `10.244.0.0/16` | Pod network CIDR. Use `10.244.0.0/16` for all CNI plugins |
+| `SET_STATIC_IP` | Boolean | `false` | Run `00-set-static-ip-hostname.sh` on all nodes before provisioning |
+
+---
+
+## 12. Pipeline Actions Explained
 
 ### `bootstrap`
 
-Provisions a brand-new cluster from scratch:
+Provisions a complete Kubernetes cluster from scratch:
 
-1. Validates all parameters
-2. SSH connectivity and `sudo` check — all nodes in parallel
-3. *(Optional)* Sets static IP + hostname via `00-set-static-ip-hostname.sh`
-4. Uploads and runs `01-linux-master-setup.sh` on the master:
-   - Disables swap, loads kernel modules, applies sysctl
-   - Installs containerd or cri-o
-   - Installs kubeadm / kubelet / kubectl
-   - Runs `kubeadm init` with the specified CNI and CIDR
-   - Installs the CNI plugin (calico / flannel / weave)
-   - Saves the join command to `/tmp/k8s-join-command.sh`
-5. Fetches the join command from master
-6. Uploads and runs `02-linux-worker-setup.sh` on all workers in parallel
-7. Polls until all nodes reach `Ready` state (up to 3 minutes)
+```
+1. SSH connectivity + sudo check on all nodes (parallel)
+2. Optional static IP + hostname (if SET_STATIC_IP=true)
+3. Master: install runtime, kubeadm, kubelet, kubectl → kubeadm init → CNI
+4. Extract join command from master
+5. Workers: install runtime + K8s → kubeadm join (parallel)
+6. Poll until all nodes are Ready (max 3 minutes)
+```
 
 ### `destroy`
 
-Full teardown on every node in parallel:
+Completely wipes Kubernetes from every node (all nodes in parallel):
 
-- `kubeadm reset --force`
-- Removes: kubelet, kubeadm, kubectl, containerd/crio and all their data
-- Removes: CNI interfaces (vxlan.calico, flannel.1, weave, cali*) and iptables rules
-- Removes: all package repos, keyrings, systemd units, logs, and temp files
-- Flushes: iptables, ip6tables, ipvs, pod/service routes
-- Restores swap from `fstab.bak` if present
+- `kubeadm reset -f` with CRI socket
+- Remove: kubelet, kubeadm, kubectl, containerd/crio packages
+- Remove: all CNI network interfaces and iptables rules
+- Remove: all repos, keyrings, systemd units, data directories, logs, temp files
+- Remove: kubeconfig files for all users
+- Flush: iptables, ip6tables, ipvs, pod network routes
+- Restore: swap if `fstab.bak` was created by the bootstrap
 
 ### `reset`
 
-Runs `destroy` immediately followed by `bootstrap` in a single pipeline run. Use when the cluster state is corrupted or you want a clean re-provision without manually triggering two builds.
+Runs `destroy` then `bootstrap` in a single pipeline execution. Use when:
+- Cluster is broken and needs a clean rebuild
+- You are changing the CNI plugin or runtime
+- You want a completely fresh cluster without manually running two pipelines
 
 ### `upgrade`
 
-Version-gap-aware in-place upgrade. Kubernetes only allows upgrading **one minor version at a time**. If you are on `1.30.x` and want `1.32.x`, the pipeline automatically hops:
+Version-gap-aware in-place upgrade. Kubernetes supports upgrading **one minor version at a time**.
 
-```
-1.30.x → 1.31.0 → 1.32.3
-```
+**Example:** Current `1.30.5`, target `1.32.3`  
+Pipeline automatically builds the path: `1.30.5 → 1.31.0 → 1.32.3`
 
-Per hop, per node:
+Per-hop sequence:
+1. Update apt/dnf repo to the new minor version
+2. Upgrade `kubeadm` → run `kubeadm upgrade apply` (master) or `kubeadm upgrade node` (workers)
+3. Drain the node
+4. Upgrade `kubelet` + `kubectl`
+5. Restart `kubelet`
+6. Uncordon the node
 
-1. Updates apt/dnf repo to the target minor version
-2. Upgrades `kubeadm`, runs `kubeadm upgrade apply` (master) or `kubeadm upgrade node` (workers)
-3. Drains the node gracefully
-4. Upgrades `kubelet` + `kubectl`, restarts kubelet
-5. Uncordons the node
-
-Master is always upgraded before workers. Workers within the same hop run in parallel.
+Master upgrades first. Workers run in parallel per hop.
 
 ---
 
-## Standalone Script Usage (Without Jenkins)
+## 13. Standalone Script Usage (Without Jenkins)
 
-All scripts accept environment variables and can be run directly on the target nodes.
-
-### Create k8sadmin user (prerequisite)
+### Create bootstrap user
 
 ```bash
-sudo useradd -m -s /bin/bash k8sadmin
-sudo passwd k8sadmin
-echo "k8sadmin ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/k8sadmin
-sudo chmod 0440 /etc/sudoers.d/k8sadmin
+sudo bash create-k8sadmin.sh
 ```
 
-### Bootstrap master node
+### Set static IP
 
 ```bash
-sudo MASTER_IP=192.168.56.11 \
-     K8S_VERSION=1.32.3 \
-     RUNTIME=containerd \
-     CNI_PLUGIN=calico \
-     POD_CIDR=10.244.0.0/16 \
-     SETUP_USER=k8sadmin \
+sudo STATIC_IP=192.168.56.11 GATEWAY=192.168.56.1 NEW_HOSTNAME=k8s-master \
+     bash 00-set-static-ip-hostname.sh
+```
+
+### Bootstrap master
+
+```bash
+sudo MASTER_IP=192.168.56.11 K8S_VERSION=1.32.3 RUNTIME=containerd \
+     CNI_PLUGIN=calico POD_CIDR=10.244.0.0/16 SETUP_USER=k8sadmin \
      bash 01-linux-master-setup.sh
 ```
 
-### Bootstrap worker node
+### Bootstrap worker
 
 ```bash
-# Get the join command from the master first:
-# ssh k8sadmin@192.168.56.11 "sudo cat /tmp/k8s-join-command.sh"
+# Get the join command from master
+JOIN=$(ssh k8sadmin@192.168.56.11 "sudo cat /tmp/k8s-join-command.sh")
 
-sudo K8S_VERSION=1.32.3 \
-     RUNTIME=containerd \
-     JOIN_COMMAND="kubeadm join 192.168.56.11:6443 --token abc123 --discovery-token-ca-cert-hash sha256:..." \
-     NODE_IP=192.168.56.12 \
-     SETUP_USER=k8sadmin \
+sudo K8S_VERSION=1.32.3 RUNTIME=containerd \
+     JOIN_COMMAND="${JOIN}" NODE_IP=192.168.56.12 SETUP_USER=k8sadmin \
      bash 02-linux-worker-setup.sh
 ```
 
 ### Destroy a node
 
 ```bash
-sudo RUNTIME=containerd \
-     CNI_PLUGIN=calico \
-     bash 03-linux-destroy.sh
+sudo RUNTIME=containerd CNI_PLUGIN=calico bash 03-linux-destroy.sh
 ```
 
-### Upgrade a node (one minor at a time)
+### Upgrade (one hop at a time)
 
 ```bash
 # Master — hop 1
-sudo K8S_VERSION=1.31.0 NODE_ROLE=master RUNTIME=containerd \
-     SETUP_USER=k8sadmin bash 04-linux-upgrade.sh
+sudo K8S_VERSION=1.31.0 NODE_ROLE=master RUNTIME=containerd bash 04-linux-upgrade.sh
+# Master — hop 2
+sudo K8S_VERSION=1.32.3 NODE_ROLE=master RUNTIME=containerd bash 04-linux-upgrade.sh
 
-# Master — hop 2 (final target)
-sudo K8S_VERSION=1.32.3 NODE_ROLE=master RUNTIME=containerd \
-     SETUP_USER=k8sadmin bash 04-linux-upgrade.sh
-
-# Workers — must run AFTER each master hop completes
+# Each worker — hop 1
 sudo K8S_VERSION=1.31.0 NODE_ROLE=worker RUNTIME=containerd \
-     MASTER_IP=192.168.56.11 SETUP_USER=k8sadmin bash 04-linux-upgrade.sh
-```
-
-### Run validation after bootstrap
-
-```bash
-# Run on the master node
-sudo bash 07-validate.sh
+     MASTER_IP=192.168.56.11 bash 04-linux-upgrade.sh
+# Each worker — hop 2
+sudo K8S_VERSION=1.32.3 NODE_ROLE=worker RUNTIME=containerd \
+     MASTER_IP=192.168.56.11 bash 04-linux-upgrade.sh
 ```
 
 ---
 
-## Troubleshooting
+## 14. Troubleshooting
 
-### SSH connection timed out (most common failure)
+### `SUDO FAILED` in the Jenkins SSH connectivity stage
 
-The pipeline's SSH connectivity stage will fail with `Connection timed out: connect` if:
-
-1. **The VM/node is not running** — verify the node is powered on and accessible
-2. **The k8sadmin user does not exist** — follow [Step 0](#step-0--pre-flight-create-the-k8sadmin-user)
-3. **Port 22 is blocked** — check firewall on the node: `sudo ufw status` or `sudo firewall-cmd --list-all`
-4. **Wrong IP in pipeline parameters** — verify `MASTER_IP` and `WORKER_IPS` match the actual node IPs
-5. **Wrong password in Jenkins credential** — re-test manually: `ssh k8sadmin@<node-ip>`
+The user exists but NOPASSWD sudo is not configured correctly.
 
 ```bash
-# Quick check from Jenkins host
-ssh k8sadmin@192.168.56.11 "echo OK && sudo -n whoami"
-# Expected: OK\nroot
+# On the failing node
+ssh k8sadmin@<node-ip>
+sudo -n whoami      # If this asks for a password, sudoers is wrong
+
+# Fix
+echo "k8sadmin ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/k8sadmin
+sudo chmod 0440 /etc/sudoers.d/k8sadmin
+sudo visudo -c      # Verify no syntax errors — must print "parsed OK"
 ```
 
----
+### `Permission denied (publickey,gssapi-keyex,gssapi-with-mic)`
+
+SSH password authentication is disabled on the node.
+
+```bash
+sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sudo systemctl restart sshd
+```
+
+### `Connection refused` on port 22
+
+SSH is not running or the port is blocked.
+
+```bash
+# Check SSH service
+sudo systemctl status sshd
+
+# Start if not running
+sudo systemctl start sshd
+sudo systemctl enable sshd
+
+# Check firewall (Ubuntu)
+sudo ufw status
+sudo ufw allow 22
+
+# Check firewall (RHEL/Rocky)
+sudo firewall-cmd --permanent --add-service=ssh
+sudo firewall-cmd --reload
+```
+
+### Jenkins credential ID mismatch
+
+`CredentialsUnavailableException` or similar in the pipeline.
+
+1. Go to **Manage Jenkins → Credentials → System → Global credentials**
+2. Find the row with Username `k8sadmin` — check the **ID** column
+3. The ID must be exactly `K8S_SSH_CREDS`
+4. If it is different (e.g. `k8s-creds`), either:
+   - Edit the credential and change the ID to `K8S_SSH_CREDS`, **or**
+   - Edit the Jenkinsfile `defaultValue` in the `SSH_CREDS_ID` parameter to match
+
+### `dpkg was interrupted` on Ubuntu master
+
+```bash
+sudo dpkg --configure -a
+sudo apt-get install -f
+```
+
+The scripts now do this automatically at startup, but running it manually clears the state immediately.
+
+### `dnf: command not found` on Ubuntu
+
+This was caused by the `&&/||` dispatch bug in older script versions. This version uses proper `if/else` for all package manager calls. Ensure you are using the latest scripts.
 
 ### Nodes stuck in `NotReady`
 
 ```bash
-# On master
-kubectl get nodes
-kubectl describe node <node-name>
-
-# Check kubelet
-sudo journalctl -u kubelet -n 100 --no-pager
-
-# Check containerd
-sudo journalctl -u containerd -n 50 --no-pager
-
-# Check CNI pods
+# On master — check node and system pod state
+kubectl get nodes -o wide
 kubectl get pods -n kube-system -o wide
+
+# On the stuck node — check kubelet
+sudo journalctl -u kubelet -n 100 --no-pager | grep -E 'error|Error|fail|FAIL'
+
+# Check container runtime
+sudo journalctl -u containerd -n 50 --no-pager
+sudo crictl info 2>/dev/null | head -20
+
+# Common fix: CNI not ready yet — wait 60s then retry
+kubectl describe node <node-name> | grep -A5 Conditions
 ```
 
-Common causes: CNI pod not yet ready, wrong `POD_CIDR` for the CNI chosen, or `br_netfilter` module not loaded.
+### `kubeadm init` fails: address already in use
 
----
-
-### kubeadm init fails: "port already in use" or "etcd already exists"
-
-The destroy script cleans this up. If running manually:
+Leftover state from a previous run:
 
 ```bash
-sudo kubeadm reset -f --cri-socket unix:///run/containerd/containerd.sock
-sudo rm -rf /etc/kubernetes /var/lib/etcd /var/lib/kubelet/config.yaml
+sudo kubeadm reset -f
+sudo rm -rf /etc/kubernetes /var/lib/etcd
+sudo systemctl restart containerd
+# Then re-run the master bootstrap
 ```
-
----
-
-### SUDO FAILED during SSH check
-
-The `k8sadmin` user exists but doesn't have passwordless sudo:
-
-```bash
-# Fix on the failing node
-echo "k8sadmin ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/k8sadmin
-sudo chmod 0440 /etc/sudoers.d/k8sadmin
-# Verify
-sudo -u k8sadmin sudo -n whoami   # must print: root
-```
-
----
 
 ### Upgrade stuck: node not draining
 
-Pods with `PodDisruptionBudget` can block drain. Force it:
+Pods with PodDisruptionBudgets blocking eviction:
 
 ```bash
 kubectl drain <node-name> \
   --ignore-daemonsets \
   --delete-emptydir-data \
   --force \
-  --disable-eviction
+  --disable-eviction     # bypasses PodDisruptionBudgets
+```
+
+### Join token expired
+
+Tokens expire after 24 hours. Generate a fresh one:
+
+```bash
+# On master
+kubeadm token create --print-join-command
+```
+
+Use the output as `JOIN_COMMAND` in the worker script, or simply re-run the full bootstrap pipeline.
+
+### `synchronized is unsupported for CPS transformation`
+
+This was the original Jenkinsfile bug. Fixed: all `synchronized(timings)` blocks replaced with `@NonCPS`-annotated `recordTiming()` helper. Ensure you are using the latest Jenkinsfile.
+
+---
+
+## 15. Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Jenkins Server  (192.168.56.10 or wherever Jenkins runs)       │
+│                                                                 │
+│  Reads:  hybrid-cluster/Jenkinsfile  from GitHub                │
+│  Uses:   K8S_SSH_CREDS  (k8sadmin username + password)         │
+│                                                                 │
+│        ┌──────────────────────────────────────────────┐        │
+│        │  Stage: Provision Master Node                │        │
+│        │  SSH → 192.168.56.11 as k8sadmin             │        │
+│        │  → 01-linux-master-setup.sh                  │        │
+│        │    ├── containerd install                     │        │
+│        │    ├── kubeadm init                           │        │
+│        │    ├── CNI install (calico/flannel/weave)     │        │
+│        │    └── /tmp/k8s-join-command.sh  (written)   │        │
+│        └──────────────────────────────────────────────┘        │
+│                                                                 │
+│        ┌──────────────────────────────────────────────┐        │
+│        │  Stage: Extract Join Command                 │        │
+│        │  SSH → master → cat /tmp/k8s-join-command.sh │        │
+│        └──────────────────────────────────────────────┘        │
+│                                                                 │
+│        ┌──────────────────────────────────────────────┐        │
+│        │  Stage: Provision Worker Nodes (PARALLEL)    │        │
+│        │                                              │        │
+│        │  SSH → 192.168.56.12 ─┐                     │        │
+│        │  SSH → 192.168.56.13 ─┤ simultaneous        │        │
+│        │  SSH → 192.168.56.14 ─┘ (all workers)       │        │
+│        │  → 02-linux-worker-setup.sh                  │        │
+│        │    ├── containerd install                     │        │
+│        │    └── kubeadm join                           │        │
+│        └──────────────────────────────────────────────┘        │
+└─────────────────────────────────────────────────────────────────┘
+
+Resulting cluster:
+  k8s-master    192.168.56.11   control-plane   Ready
+  k8s-worker-1  192.168.56.12   worker          Ready
+  k8s-worker-2  192.168.56.13   worker          Ready
 ```
 
 ---
 
-### `kubectl version --short` deprecated warning during upgrade
+## 16. Node IP Planning
 
-This has been fixed in the current `04-linux-upgrade.sh`. The auto-detection now uses `kubectl version -o json` (available in K8s 1.20+) and falls back to `kubelet --version`.
+Plan static IPs before running anything. All IPs must be on the same subnet and reachable from Jenkins.
 
----
-
-## Bug Fixes Changelog
-
-The following issues from the original scripts have been fixed in this version:
-
-| # | File | Issue | Fix |
+| Role | Hostname | IP | Notes |
 |---|---|---|---|
-| 1 | `Jenkinsfile` | `SSH_USER` param was shadowed by `SSH_USER_VAR` from `withCredentials`. The credential's username was used as `remote.user` instead of the OS login user, causing SSH failures when the two differ. | Introduced `makeRemote()` helper that always uses `params.SSH_USER` for `remote.user`. `SSH_USER_VAR` is bound but intentionally unused. |
-| 2 | `Jenkinsfile` | `echo sshCommand(...)` in Verify stage can throw NPE when the command returns null/empty output. | Captured result to a variable first, then echoed with a null-safe `?.toString() ?: "(no output)"`. |
-| 3 | `Jenkinsfile` | `kubectl version --short` is deprecated since K8s 1.28 and removed in 1.29+. | Version auto-detection now uses `kubectl version -o json \| python3` with a `kubelet --version` fallback. |
-| 4 | `Jenkinsfile` | `SETUP_USER` was not passed to the upgrade script, so the kubeconfig path defaulted to `k8sadmin` even when a different user was specified. | `SETUP_USER` is now exported in all upgrade `sshCommand` calls. |
-| 5 | `04-linux-upgrade.sh` | `KUBECONFIG` was hardcoded to `/etc/kubernetes/admin.conf` for all node roles. Workers don't have this file — they need the kubeconfig from the `SETUP_USER`'s home directory. | `KUBECONFIG` is now set conditionally: master uses `/etc/kubernetes/admin.conf`; workers use `~SETUP_USER/.kube/config` with a `/root/.kube/config` fallback. |
-| 6 | `04-linux-upgrade.sh` | `NODE_NAME` detection used `awk -v ip="${HOSTNAME}"` trying to match a hostname variable against node names — logic always fell through to the hostname fallback, but the awk expression was semantically wrong. | Replaced with `kubectl get nodes \| grep -Fx "$(hostname)"` for exact hostname match. |
+| Jenkins server | `jenkins` | `192.168.56.10` | Can be DHCP — it only makes outbound SSH |
+| Control plane | `k8s-master` | `192.168.56.11` | Must be static — never changes |
+| Worker 1 | `k8s-worker-1` | `192.168.56.12` | Must be static |
+| Worker 2 | `k8s-worker-2` | `192.168.56.13` | Must be static |
+| Gateway | — | `192.168.56.1` | Your hypervisor NAT or physical router |
+| DNS | — | `8.8.8.8` | Or your internal DNS |
+
+**Port requirements between nodes** (if you re-enable the firewall later):
+
+| Port | Protocol | Direction | Purpose |
+|---|---|---|---|
+| 6443 | TCP | Workers → Master | Kubernetes API server |
+| 2379-2380 | TCP | Master internal | etcd |
+| 10250 | TCP | All → All | kubelet API |
+| 10256 | TCP | All → All | kube-proxy |
+| 179 | TCP | All → All | Calico BGP (if using calico) |
+| 4789 | UDP | All → All | VXLAN overlay (calico/flannel) |
+| 8285/8472 | UDP | All → All | Flannel overlay |
 
 ---
 
-## Architecture Overview
+## 17. Security Notes
 
-```
-Jenkins Agent (Windows/Linux)
-        │
-        │  SSH (password auth, params.SSH_USER)
-        │
-        ├──────────────────────► Master Node (192.168.56.11)
-        │                          1. kubeadm init
-        │                          2. CNI install (calico/flannel/weave)
-        │                          3. Write /tmp/k8s-join-command.sh
-        │
-        │  (reads join command from master)
-        │
-        ├──────────────────────► Worker-1 (192.168.56.12)   ─┐
-        │                          kubeadm join               │ parallel
-        └──────────────────────► Worker-2 (192.168.56.13)   ─┘
-                                   kubeadm join
-```
-
-Workers are always provisioned **in parallel** to minimize total bootstrap time. The master must complete and produce a join command before workers start — the `Extract Join Command` stage enforces this sequencing.
-
----
-
-## Security Notes
-
-- This setup is designed for **lab and development environments**. The firewall (`ufw`/`firewalld`) is disabled on all nodes for simplicity.
-- For production deployments: enable the firewall with explicit K8s port rules, restrict sudo scope, use SSH key authentication instead of passwords, and use a private CA for cluster certificates.
-- Join tokens expire after **24 hours**. Re-running `bootstrap` or `reset` generates a fresh token.
-- Credentials are never written to disk by Jenkins. They are passed via `withCredentials` and exist only as environment variables for the duration of the pipeline run.
-- The `NOPASSWD` sudoers entry is required by the bootstrap scripts. After provisioning, you may want to tighten this to specific commands only.
+- This setup is designed for **lab / dev / CI environments**. Firewalls are disabled on cluster nodes for simplicity.
+- For **production hardening**: restrict sudo to specific binaries, switch to SSH key authentication, enable firewall with only the ports listed in Section 16, and use a private CA for the Kubernetes API server.
+- The kubeadm join token expires after **24 hours**. Re-running bootstrap always generates a fresh token.
+- Credentials are never written to disk during a Jenkins run — they are injected via `withCredentials` and exist only in the remote shell environment for the duration of the SSH session.
+- The `k8sadmin` NOPASSWD sudo grant uses `ALL=(ALL)` for simplicity. In production, restrict it to: `kubeadm`, `kubelet`, `apt-get`/`dnf`, `systemctl`, `bash /tmp/0*.sh`.

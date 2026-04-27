@@ -108,20 +108,7 @@ ok "kubeadm upgraded to v${K8S_VERSION}"
 step "3" "Run kubeadm upgrade"
 # =============================================================================
 
-# FIX: set KUBECONFIG for all roles.
-# Master: use local admin.conf.
-# Worker: use kubeconfig from SETUP_USER's home (copied there during bootstrap);
-#         workers do NOT have /etc/kubernetes/admin.conf.
-if [[ "${NODE_ROLE}" == "master" ]]; then
-  export KUBECONFIG=/etc/kubernetes/admin.conf
-else
-  USER_HOME=$(eval echo "~${SETUP_USER}")
-  if [[ -f "${USER_HOME}/.kube/config" ]]; then
-    export KUBECONFIG="${USER_HOME}/.kube/config"
-  elif [[ -f /root/.kube/config ]]; then
-    export KUBECONFIG=/root/.kube/config
-  fi
-fi
+export KUBECONFIG=/etc/kubernetes/admin.conf
 
 if [[ "${NODE_ROLE}" == "master" ]]; then
   echo "  Verifying upgrade plan..."
@@ -142,13 +129,9 @@ fi
 step "4" "Drain node"
 # =============================================================================
 
-# FIX: NODE_NAME detection — match by hostname (registered name), not IP.
-# The awk expression in the original tried to match $HOSTNAME as if it were
-# an IP, which never works. Nodes register by their hostname, so just use that.
 NODE_NAME=$(kubectl get nodes --no-headers 2>/dev/null \
-  | awk '{print $1}' \
-  | grep -Fx "$(hostname)" || true)
-[[ -z "${NODE_NAME}" ]] && NODE_NAME=$(hostname -s)
+  | awk -v ip="${HOSTNAME}" '$1==ip || $1==ENVIRON["HOSTNAME"]{print $1}' | head -1)
+[[ -z "${NODE_NAME}" ]] && NODE_NAME=$(hostname)
 
 if [[ "${NODE_ROLE}" == "master" ]]; then
   kubectl drain "${NODE_NAME}" \

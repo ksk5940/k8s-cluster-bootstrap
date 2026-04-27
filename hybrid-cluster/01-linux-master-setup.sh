@@ -167,18 +167,8 @@ configure_containerd() {
   containerd config default >/etc/containerd/config.toml
   # Enable systemd cgroup driver
   sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-  systemctl enable containerd
-  # FIX: restart AFTER writing config — kubeadm init fails if containerd is
-  # still running with the old (no SystemdCgroup) config at CRI socket check.
-  systemctl restart containerd
-  # Wait until CRI socket is responsive before returning
-  local retries=0
-  until crictl --runtime-endpoint unix:///run/containerd/containerd.sock       version &>/dev/null; do
-    retries=$((retries+1))
-    [[ $retries -ge 15 ]] && { echo "containerd CRI not ready" >&2; exit 1; }
-    sleep 2
-  done
-  ok "containerd installed, configured (SystemdCgroup=true), CRI socket verified"
+  systemctl enable --now containerd
+  ok "containerd installed and configured (SystemdCgroup=true)"
 }
 
 configure_crio() {
