@@ -205,7 +205,7 @@ parse_arguments() {
 check_root() {
   if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}╔══════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}║  ⚠️  ROOT ACCESS REQUIRED                                        ║${NC}"
+    echo -e "${RED}║  X  ROOT ACCESS REQUIRED                                        ║${NC}"
     echo -e "${RED}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo -e "${YELLOW}Run as: ${WHITE}sudo ./k8s-cluster-bootstrap.sh $*${NC}"
     exit 1
