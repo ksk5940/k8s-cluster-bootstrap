@@ -302,9 +302,24 @@ step "6/9" "Installing CNI: ${CNI_PLUGIN}"
 
 install_calico() {
   # Tigera operator approach — production-grade
-  kubectl create -f \
-    https://raw.githubusercontent.com/projectcalico/calico/v3.29.0/manifests/tigera-operator.yaml \
-    --dry-run=client -o yaml | kubectl apply -f -
+  # IMPORTANT: Must use --server-side to avoid the 262144-byte annotation limit
+  # on the installations.operator.tigera.io CRD (kubectl apply client-side
+  # stores the full manifest in last-applied-configuration which exceeds 256KB).
+  kubectl apply --server-side --force-conflicts -f \
+    https://raw.githubusercontent.com/projectcalico/calico/v3.29.0/manifests/tigera-operator.yaml
+
+  # Wait for the tigera-operator pod to be Running before applying the Installation CR,
+  # otherwise the webhook may reject or ignore the CR.
+  echo "  Waiting for tigera-operator pod to be Running..."
+  local retries=0
+  until kubectl get pods -n tigera-operator --no-headers 2>/dev/null \
+        | grep -q "Running"; do
+    sleep 5
+    retries=$((retries+1))
+    [ $retries -ge 24 ] && die "tigera-operator pod not Running after 2 minutes"
+    echo -n "."
+  done
+  echo ""
 
   cat <<EOF | kubectl apply -f -
 apiVersion: operator.tigera.io/v1
