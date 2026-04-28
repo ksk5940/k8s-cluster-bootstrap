@@ -364,41 +364,118 @@ step "6/9" "Installing CNI: ${CNI_PLUGIN}"
 # =============================================================================
 
 install_calico() {
-  # Tigera operator approach — production-grade
-  # IMPORTANT: Must use --server-side to avoid the 262144-byte annotation limit
-  # on the installations.operator.tigera.io CRD (kubectl apply client-side
-  # stores the full manifest in last-applied-configuration which exceeds 256KB).
-  kubectl apply --server-side --force-conflicts -f \
-    https://raw.githubusercontent.com/projectcalico/calico/v3.29.0/manifests/tigera-operator.yaml
+  # Direct manifest approach — no Tigera operator, no CSI sidecar pods.
+  # Matches k8s-cluster-bootstrap.sh exactly:
+  #   calico_backend = vxlan  → pure VXLAN, BIRD/BGP never starts
+  #   IPIP = Never            → no tunl0 interface
+  #   VXLAN = Always          → UDP 4789 · vxlan.calico
+  #   liveness/readiness probes removed → probes check BIRD socket which is absent in vxlan mode
+  # Uses python3 to patch the manifest in-place (same as bootstrap script).
 
-  # Wait for the tigera-operator pod to be Running before applying the Installation CR,
-  # otherwise the webhook may reject or ignore the CR.
-  echo "  Waiting for tigera-operator pod to be Running..."
-  local retries=0
-  until kubectl get pods -n tigera-operator --no-headers 2>/dev/null \
-        | grep -q "Running"; do
-    sleep 5
-    retries=$((retries+1))
-    [ $retries -ge 24 ] && die "tigera-operator pod not Running after 2 minutes"
-    echo -n "."
-  done
-  echo ""
+  local CALICO_VERSION="v3.29.3"
+  local CALICO_MANIFEST="/tmp/calico.yaml"
 
-  cat <<EOF | kubectl apply -f -
-apiVersion: operator.tigera.io/v1
-kind: Installation
-metadata:
-  name: default
-spec:
-  calicoNetwork:
-    ipPools:
-    - blockSize: 26
-      cidr: ${POD_CIDR}
-      encapsulation: VXLANCrossSubnet
-      natOutgoing: Enabled
-      nodeSelector: all()
-EOF
-  ok "Calico CNI applied (VXLANCrossSubnet mode)"
+  # Detect host-only interface (the non-NAT NIC — typically the 192.168.x.x one)
+  local IFACE
+  IFACE=$(ip -4 route show | grep -v "^default" \
+    | awk '{print $3}' | grep -v "^lo" | head -1)
+  # Fallback: first non-loopback interface
+  [[ -z "$IFACE" ]] && IFACE=$(ip -o link show | awk -F': ' '$2 !~ /lo|docker|veth|br-|cali|flannel|weave/ {print $2}' | head -1)
+  [[ -z "$IFACE" ]] && IFACE="eth1"
+  info "Calico IP autodetection interface: ${IFACE}"
+
+  echo -e "  ${CY}Downloading Calico ${CALICO_VERSION} manifest...${NC}"
+  curl -fsSL \
+    "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml" \
+    -o "${CALICO_MANIFEST}" || die "Calico manifest download failed"
+
+  # Patch manifest: pure VXLAN, correct pod CIDR, remove BIRD probes
+  python3 - "${CALICO_MANIFEST}" "${POD_CIDR}" "${IFACE}" <<'PYEOF'
+import sys, re
+
+manifest_path = sys.argv[1]
+pod_cidr      = sys.argv[2]
+iface         = sys.argv[3]
+
+with open(manifest_path) as f:
+    content = f.read()
+
+# Set calico_backend: "vxlan" in ConfigMap
+content = re.sub(r'(calico_backend:\s*)"[^"]*"', r'\1"vxlan"', content)
+content = re.sub(r'(calico_backend:\s*)(?!")(\S+)', r'\1"vxlan"', content)
+
+def set_env_value(text, name, value):
+    lines = text.split('\n')
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if stripped == f'- name: {name}':
+            out.append(line)
+            i += 1
+            while i < len(lines):
+                next_line = lines[i]
+                next_stripped = next_line.lstrip()
+                next_indent = len(next_line) - len(next_stripped)
+                if next_stripped and next_indent <= indent and not next_stripped.startswith('#'):
+                    break
+                i += 1
+            out.append(' ' * (indent + 2) + f'value: "{value}"')
+        else:
+            out.append(line)
+            i += 1
+    return '\n'.join(out)
+
+content = set_env_value(content, "CALICO_IPV4POOL_VXLAN",     "Always")
+content = set_env_value(content, "CALICO_IPV4POOL_IPIP",      "Never")
+content = set_env_value(content, "CALICO_IPV4POOL_CIDR",      pod_cidr)
+content = set_env_value(content, "CALICO_NETWORKING_BACKEND", "vxlan")
+content = set_env_value(content, "IP_AUTODETECTION_METHOD",   f"interface={iface}")
+content = set_env_value(content, "FELIX_IPINIPENABLED",       "false")
+content = set_env_value(content, "FELIX_VXLANENABLED",        "true")
+content = set_env_value(content, "FELIX_BPFENABLED",          "false")
+
+def remove_probe_block(text, probe_name):
+    lines = text.split('\n')
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if stripped == f'{probe_name}:':
+            i += 1
+            while i < len(lines):
+                next_line = lines[i]
+                next_stripped = next_line.lstrip()
+                next_indent = len(next_line) - len(next_stripped)
+                if next_stripped and next_indent <= indent:
+                    break
+                i += 1
+        else:
+            out.append(line)
+            i += 1
+    return '\n'.join(out)
+
+content = remove_probe_block(content, "livenessProbe")
+content = remove_probe_block(content, "readinessProbe")
+content = remove_probe_block(content, "startupProbe")
+
+with open(manifest_path, 'w') as f:
+    f.write(content)
+PYEOF
+
+  echo -e "  ${CY}Applying Calico manifest (DaemonSet + RBAC + CRDs)...${NC}"
+  kubectl apply -f "${CALICO_MANIFEST}" || die "kubectl apply calico failed"
+
+  ok "Calico ${CALICO_VERSION} applied (pure VXLAN · no operator · no CSI pods)"
+  info "  Pod CIDR  : ${POD_CIDR}"
+  info "  Backend   : vxlan  (BIRD/BGP never starts)"
+  info "  IPIP      : Never  (no tunl0)"
+  info "  VXLAN     : Always (UDP 4789 · vxlan.calico)"
+  info "  Interface : ${IFACE}"
 }
 
 install_flannel() {
