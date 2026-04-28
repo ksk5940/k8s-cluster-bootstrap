@@ -164,10 +164,36 @@ EOF
 
 configure_containerd() {
   mkdir -p /etc/containerd
-  containerd config default >/etc/containerd/config.toml
-  # Enable systemd cgroup driver
+
+  # Stop first — containerd.io auto-starts on install with a bad default config
+  systemctl stop containerd 2>/dev/null || true
+
+  # Regenerate default config
+  containerd config default > /etc/containerd/config.toml
+
+  # Enable systemd cgroup driver (required for Kubernetes)
   sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-  systemctl enable --now containerd
+
+  # Verify the sed actually worked (containerd v2.x safety check)
+  if ! grep -q 'SystemdCgroup = true' /etc/containerd/config.toml; then
+    # Fallback: patch it directly in the runc options block
+    sed -i '/\[plugins.*runc.*options\]/,/\[/ s/SystemdCgroup = false/SystemdCgroup = true/' \
+      /etc/containerd/config.toml
+  fi
+
+  # Restart cleanly with the new config
+  systemctl enable containerd
+  systemctl restart containerd
+
+  # Wait for the socket to be ready before proceeding
+  local retries=0
+  until [ -S /run/containerd/containerd.sock ] && \
+        ctr version &>/dev/null; do
+    sleep 1
+    retries=$((retries+1))
+    [ $retries -ge 15 ] && die "containerd socket not ready after 15s"
+  done
+
   ok "containerd installed and configured (SystemdCgroup=true)"
 }
 
