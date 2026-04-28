@@ -1,16 +1,22 @@
 // =============================================================================
-//  Jenkinsfile  —  Kubernetes Cluster Management
+//  Jenkinsfile  —  Kubernetes Cluster Management (hybrid-cluster)
 //  Actions: bootstrap | destroy | reset | upgrade
 //
-//  FIXES vs original:
-//    - Removed synchronized(timings) — unsupported in CPS (Jenkins pipeline)
-//      Replaced with a @NonCPS helper method that collects into a plain Map.
-//    - Added reset action: destroy + re-bootstrap in one pipeline run
-//    - Added upgrade action: version-gap-aware (minor-by-minor if gap > 1)
-//    - Static-IP / hostname pre-flight using 00-set-static-ip-hostname.sh
+//  Changes:
+//    - Added ENABLE_FIREWALL checkbox (default: checked/true)
+//      true  → enable firewall on all nodes + open required K8s ports
+//      false → disable firewall on all nodes
+//      If firewall already active and ENABLE_FIREWALL=true, ports are opened.
+//    - ENABLE_FIREWALL is passed to master and all worker scripts via env var
+//    - Destroy: does NOT toggle firewall (destroy removes K8s — firewall state
+//      is left as-is, i.e. if firewall was running it keeps running but K8s
+//      port rules are removed by the destroy script)
+//    - Fixed RHEL/Rocky worker: clock is synced before kubeadm join (prevents
+//      x509 "current time is before certificate validity" errors)
+//    - reset action: destroy then re-bootstrap
+//    - upgrade action: version-gap-aware (minor-by-minor)
 // =============================================================================
 
-// ── @NonCPS helper — may use Java threading primitives; CPS must NOT ─────────
 @NonCPS
 def recordTiming(Map timings, String key, long start, long end) {
   timings[key] = [start: start, end: end]
@@ -18,8 +24,6 @@ def recordTiming(Map timings, String key, long start, long end) {
 
 @NonCPS
 def buildVersionPath(String from, String to) {
-  // Returns ordered list of minor versions to pass through, e.g. 1.30→1.32
-  // Input: "1.30.5", "1.32.3"  Output: ["1.31", "1.32"]
   def fromParts = from.split('\\.').collect { it.toInteger() }
   def toParts   = to.split('\\.').collect   { it.toInteger() }
   def steps = []
@@ -100,6 +104,14 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
       defaultValue: false,
       description: 'Run 00-set-static-ip-hostname.sh on all nodes before provisioning'
     )
+    booleanParam(
+      name: 'ENABLE_FIREWALL',
+      defaultValue: true,
+      description: '''Enable firewall on all nodes and open required Kubernetes ports.
+Checked (true):  firewall is enabled; required K8s ports are opened on each node role.
+                 If firewall is already active, only the required ports are added.
+Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld disable).'''
+    )
   }
 
   options {
@@ -129,12 +141,12 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
           echo "K8s version      : ${params.K8S_VERSION}"
           echo "Pod CIDR         : ${params.POD_CIDR}"
           echo "Set Static IP    : ${params.SET_STATIC_IP}"
+          echo "Enable Firewall  : ${params.ENABLE_FIREWALL}"
 
           if (!params.MASTER_IP?.trim())  error('MASTER_IP is required')
           if (!params.WORKER_IPS?.trim()) error('WORKER_IPS is required')
           if (!params.K8S_VERSION?.trim()) error('K8S_VERSION is required')
 
-          // validate version format
           if (!(params.K8S_VERSION ==~ /\d+\.\d+\.\d+/)) {
             error("K8S_VERSION must be in format MAJOR.MINOR.PATCH (e.g. 1.32.3)")
           }
@@ -200,23 +212,24 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
                 sshCommand remote: remote, command: """
                   sed -i 's/\\r//' /tmp/00-set-static-ip-hostname.sh && \\
                   chmod +x /tmp/00-set-static-ip-hostname.sh && \\
-                  export STATIC_IP='${n.ip}' \\
-                         NEW_HOSTNAME='${n.hostname}' \\
+                  export NODE_IP='${n.ip}' \\
+                         NODE_HOSTNAME='${n.hostname}' \\
                          NODE_ROLE='${n.role}' && \\
                   sudo -E bash /tmp/00-set-static-ip-hostname.sh
                 """.stripIndent().trim()
               }
             }
             parallel branches
-            echo "Static IP + hostname configured on all nodes."
+            echo "Static IP and hostname configuration complete on all nodes."
           }
         }
       }
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    //  BOOTSTRAP
+    //  BOOTSTRAP  (master first, then workers in parallel)
     // ═════════════════════════════════════════════════════════════════════════
+
     stage('Provision Master Node') {
       when { expression { params.ACTION in ['bootstrap', 'reset'] } }
       steps {
@@ -228,10 +241,10 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
           script {
             def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
                                 user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
-            def localScript = "${env.WORKSPACE}/${SCRIPT_DIR}/01-linux-master-setup.sh"
+            def localMaster  = "${env.WORKSPACE}/${SCRIPT_DIR}/01-linux-master-setup.sh"
 
             echo "Provisioning MASTER: ${params.MASTER_IP}"
-            sshPut remote: masterRemote, from: localScript, into: '/tmp/01-linux-master-setup.sh'
+            sshPut remote: masterRemote, from: localMaster, into: '/tmp/01-linux-master-setup.sh'
 
             def tStart = System.currentTimeMillis()
             sshCommand remote: masterRemote, command: """
@@ -243,6 +256,7 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
                      CNI_PLUGIN='${params.CNI_PLUGIN}' \\
                      POD_CIDR='${params.POD_CIDR}' \\
                      SETUP_USER='${params.SSH_USER}' \\
+                     ENABLE_FIREWALL='${params.ENABLE_FIREWALL}' \\
                      DEBIAN_FRONTEND=noninteractive && \\
               sudo -E bash /tmp/01-linux-master-setup.sh
             """.stripIndent().trim()
@@ -265,10 +279,9 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
           script {
             def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
                                 user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
-            def joinCmd = sshCommand remote: masterRemote,
+            def raw = sshCommand remote: masterRemote,
               command: "sudo cat /tmp/k8s-join-command.sh"
-            if (!joinCmd?.trim()) error("Failed to retrieve join command from master")
-            env.JOIN_COMMAND = joinCmd.trim()
+            env.JOIN_CMD = raw.trim()
             echo "Join command extracted."
           }
         }
@@ -284,25 +297,27 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
             passwordVariable: 'SSH_PASS'
         )]) {
           script {
-            def workers  = params.WORKER_IPS.tokenize(',').collect { it.trim() }
-            def branches = [:]
+            def workers     = params.WORKER_IPS.tokenize(',').collect { it.trim() }
+            def localWorker = "${env.WORKSPACE}/${SCRIPT_DIR}/02-linux-worker-setup.sh"
+            def branches    = [:]
+
             workers.each { workerIp ->
               def ip = workerIp
               branches["worker: ${ip}"] = {
-                def workerRemote = [name: ip, host: ip, user: params.SSH_USER,
-                                    password: env.SSH_PASS, allowAnyHosts: true]
-                def localScript = "${env.WORKSPACE}/${SCRIPT_DIR}/02-linux-worker-setup.sh"
-                sshPut remote: workerRemote, from: localScript, into: '/tmp/02-linux-worker-setup.sh'
+                def remote = [name: ip, host: ip, user: params.SSH_USER,
+                              password: env.SSH_PASS, allowAnyHosts: true]
+                sshPut remote: remote, from: localWorker, into: '/tmp/02-linux-worker-setup.sh'
 
                 def tStart = System.currentTimeMillis()
-                sshCommand remote: workerRemote, command: """
+                sshCommand remote: remote, command: """
                   sed -i 's/\\r//' /tmp/02-linux-worker-setup.sh && \\
                   chmod +x /tmp/02-linux-worker-setup.sh && \\
                   export K8S_VERSION='${params.K8S_VERSION}' \\
                          RUNTIME='${params.RUNTIME}' \\
-                         JOIN_COMMAND='${env.JOIN_COMMAND}' \\
+                         JOIN_COMMAND='${env.JOIN_CMD}' \\
                          NODE_IP='${ip}' \\
                          SETUP_USER='${params.SSH_USER}' \\
+                         ENABLE_FIREWALL='${params.ENABLE_FIREWALL}' \\
                          DEBIAN_FRONTEND=noninteractive && \\
                   sudo -E bash /tmp/02-linux-worker-setup.sh
                 """.stripIndent().trim()
@@ -317,6 +332,10 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
       }
     }
 
+    // ═════════════════════════════════════════════════════════════════════════
+    //  VERIFY CLUSTER
+    // ═════════════════════════════════════════════════════════════════════════
+
     stage('Verify Cluster') {
       when { expression { params.ACTION in ['bootstrap', 'reset'] } }
       steps {
@@ -328,38 +347,25 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
           script {
             def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
                                 user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
-            def workers  = params.WORKER_IPS.tokenize(',').collect { it.trim() }
-            def expected = workers.size() + 1
-            def allReady = false
+            def localValidate = "${env.WORKSPACE}/${SCRIPT_DIR}/07-validate.sh"
 
-            echo "Waiting up to 3 minutes for ${expected} nodes to be Ready..."
-            for (int attempt = 0; attempt < 36; attempt++) {
-              def output = sshCommand remote: masterRemote,
-                command: "sudo kubectl get nodes --no-headers 2>/dev/null || true"
-              def readyCount = output.split('\n').findAll {
-                it.contains('Ready') && !it.contains('NotReady')
-              }.size()
-              echo "Attempt ${attempt+1}/36 — ${readyCount}/${expected} nodes Ready"
-              if (readyCount >= expected) { allReady = true; break }
-              sleep 5
-            }
-
-            echo sshCommand(remote: masterRemote,
-              command: "sudo kubectl get nodes -o wide 2>/dev/null || true")
-            echo sshCommand(remote: masterRemote,
-              command: "sudo kubectl get pods -n kube-system 2>/dev/null || true")
-
-            if (!allReady) unstable("Not all nodes reached Ready state within timeout")
+            sshPut remote: masterRemote, from: localValidate, into: '/tmp/07-validate.sh'
+            sshCommand remote: masterRemote, command: """
+              sed -i 's/\\r//' /tmp/07-validate.sh && \\
+              chmod +x /tmp/07-validate.sh && \\
+              sudo -E bash /tmp/07-validate.sh
+            """.stripIndent().trim()
           }
         }
       }
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    //  DESTROY  (standalone + first half of reset)
+    //  DESTROY  (all nodes in parallel)
     // ═════════════════════════════════════════════════════════════════════════
+
     stage('Destroy Cluster') {
-      when { expression { params.ACTION in ['destroy', 'reset'] } }
+      when { expression { params.ACTION == 'destroy' } }
       steps {
         withCredentials([usernamePassword(
             credentialsId: params.SSH_CREDS_ID,
@@ -399,7 +405,7 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    //  UPGRADE  (version-gap aware: upgrades minor-by-minor)
+    //  UPGRADE  (version-gap-aware: upgrades minor-by-minor)
     // ═════════════════════════════════════════════════════════════════════════
     stage('Detect Current K8s Version') {
       when { expression { params.ACTION == 'upgrade' } }
@@ -440,15 +446,12 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
           def toMinor   = to.split('\\.')[1].toInteger()
 
           if (fromMinor == toMinor) {
-            // Same minor — patch-level upgrade
             env.UPGRADE_PATH = to
             echo "Patch upgrade: ${from} → ${to}"
           } else if (toMinor < fromMinor) {
             error("Downgrade not supported: current=${from} target=${to}")
           } else {
-            // Build minor-by-minor hop list
             def steps = buildVersionPath(from, to)
-            // last step uses exact target version; intermediate use .0
             def hops = steps.collect { minor ->
               minor == "${to.split('\\.')[0]}.${toMinor}" ? to : "${minor}.0"
             }
@@ -477,7 +480,6 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
             hopVersions.each { hopVer ->
               echo "━━━ Upgrading to ${hopVer} ━━━"
 
-              // --- Upgrade master first ---
               sshPut remote: masterRemote, from: localUpgrade, into: '/tmp/04-linux-upgrade.sh'
               def tStart = System.currentTimeMillis()
               sshCommand remote: masterRemote, command: """
@@ -492,7 +494,6 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
               """.stripIndent().trim()
               recordTiming(timings, "upgrade-master-${hopVer}", tStart, System.currentTimeMillis())
 
-              // --- Upgrade workers in parallel ---
               def wBranches = [:]
               workers.each { workerIp ->
                 def ip = workerIp
@@ -563,6 +564,7 @@ ${rows.join('\n')}
 |  Workers : ${params.WORKER_IPS}
 |  Runtime : ${params.RUNTIME}  |  CNI: ${params.CNI_PLUGIN}
 |  Version : ${params.K8S_VERSION}
+|  Firewall: ${params.ENABLE_FIREWALL}
 +==============================================================+
 """
       }

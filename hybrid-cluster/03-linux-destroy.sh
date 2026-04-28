@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  03-linux-destroy.sh  —  Kubernetes Node COMPLETE Teardown
-#  Removes every trace of: kubeadm · kubelet · kubectl · containerd · crio
-#                          CNI (calico · flannel · weave) · all temp files
-#                          repos · keyrings · systemd units · logs · sockets
+#
+#  Removes every trace of:
+#    kubeadm · kubelet · kubectl · containerd · crio
+#    CNI (calico · flannel · weave) · all temp files
+#    repos · keyrings · systemd units · logs · sockets
+#    iptables · ipvs · kernel modules · sysctl overrides
+#    /root/.kube · all user ~/.kube · etcd data · pki
+#    containerd data dir · crio data dir · run sockets
 #
 #  Supports: Ubuntu 22/24  |  Rocky / RHEL 8/9
-#  Called by Jenkins via:
+#  Called by Jenkins:
 #    export RUNTIME=containerd|crio  CNI_PLUGIN=calico|flannel|weave
 #    sudo -E bash /tmp/03-linux-destroy.sh
 # =============================================================================
-set -uo pipefail   # note: no -e so every step runs even if one fails
+set -uo pipefail   # no -e so every step runs even if one fails
 
 RUNTIME="${RUNTIME:-containerd}"
-CNI_PLUGIN="${CNI_PLUGIN:-}"     # blank = clean all three CNIs
+CNI_PLUGIN="${CNI_PLUGIN:-}"   # blank = clean all CNIs
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 CY='\033[0;36m'; GR='\033[0;32m'; RD='\033[0;31m'; YL='\033[1;33m'; NC='\033[0m'
@@ -80,7 +85,7 @@ echo -e "
 "
 
 # =============================================================================
-step "1/10" "kubeadm reset"
+step "1/11" "kubeadm reset"
 # =============================================================================
 
 case "${RUNTIME}" in
@@ -91,9 +96,9 @@ esac
 
 if command -v kubeadm &>/dev/null; then
   if [[ -n "${CRI_SOCKET}" ]]; then
-    kubeadm reset -f --cri-socket "${CRI_SOCKET}" 2>/dev/null || true
+    kubeadm reset -f --cri-socket "${CRI_SOCKET}" --ignore-preflight-errors=all 2>/dev/null || true
   else
-    kubeadm reset -f 2>/dev/null || true
+    kubeadm reset -f --ignore-preflight-errors=all 2>/dev/null || true
   fi
   ok "kubeadm reset complete"
 else
@@ -101,24 +106,37 @@ else
 fi
 
 # =============================================================================
-step "2/10" "Stop all K8s and runtime services"
+step "2/11" "Stop all K8s and runtime services"
 # =============================================================================
 
 for svc in kubelet kube-proxy containerd crio cri-o docker; do
   stop_service "${svc}"
 done
+
+# Force-kill any lingering control-plane processes (may survive service stop)
+for proc in kube-apiserver kube-controller-manager kube-scheduler etcd; do
+  if pgrep -x "$proc" &>/dev/null; then
+    info "Force-killing lingering process: $proc"
+    pkill -9 -x "$proc" 2>/dev/null || true
+  fi
+done
+
 ok "All services stopped and disabled"
 
 # =============================================================================
-step "3/10" "Remove Kubernetes packages (kubelet · kubeadm · kubectl · crictl)"
+step "3/11" "Remove Kubernetes packages (kubelet · kubeadm · kubectl · crictl)"
 # =============================================================================
 
 if [[ "${PKG_MGR}" == "apt" ]]; then
+  # Remove version pins first
+  apt-mark unhold kubelet kubeadm kubectl 2>/dev/null || true
   remove_pkg_apt kubelet kubeadm kubectl kubernetes-cni cri-tools
   DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y -q 2>/dev/null || true
   ok "K8s packages purged (apt)"
 else
-  remove_pkg_dnf kubelet kubeadm kubectl kubernetes-cni cri-tools
+  # Remove version locks first
+  dnf versionlock delete kubelet kubeadm kubectl cri-tools kubernetes-cni 2>/dev/null || true
+  remove_pkg_dnf kubelet kubeadm kubectl kubernetes-cni cri-tools conntrack-tools 2>/dev/null || true
   ok "K8s packages removed (dnf)"
 fi
 
@@ -128,10 +146,11 @@ purge_paths \
   /usr/bin/kubectl \
   /usr/local/bin/kubectl \
   /usr/bin/crictl \
-  /usr/local/bin/crictl
+  /usr/local/bin/crictl \
+  /usr/local/bin/calicoctl
 
 # =============================================================================
-step "4/10" "Remove containerd — packages · config · data · sockets · logs"
+step "4/11" "Remove containerd — packages · config · data · sockets · logs"
 # =============================================================================
 
 stop_service containerd
@@ -140,18 +159,14 @@ if [[ "${PKG_MGR}" == "apt" ]]; then
   remove_pkg_apt containerd.io containerd docker-ce docker-ce-cli docker-ce-rootless-extras
   DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y -q 2>/dev/null || true
 else
-  remove_pkg_dnf containerd.io containerd
+  remove_pkg_dnf containerd.io containerd container-selinux
 fi
 
 purge_paths \
   /etc/containerd \
-  /etc/containerd/config.toml \
   /var/lib/containerd \
   /run/containerd \
   /var/run/containerd \
-  /run/containerd/containerd.sock \
-  /run/containerd/containerd.sock.ttrpc \
-  /run/containerd/debug.sock \
   /etc/systemd/system/containerd.service \
   /etc/systemd/system/containerd.service.d \
   /usr/lib/systemd/system/containerd.service \
@@ -173,7 +188,7 @@ purge_paths \
 ok "containerd fully removed"
 
 # =============================================================================
-step "5/10" "Remove CRI-O — packages · config · data · sockets · logs"
+step "5/11" "Remove CRI-O — packages · config · data · sockets · logs"
 # =============================================================================
 
 stop_service crio
@@ -188,15 +203,11 @@ fi
 
 purge_paths \
   /etc/crio \
-  /etc/crio/crio.conf \
-  /etc/crio/crio.conf.d \
   /var/lib/crio \
   /var/lib/containers \
   /var/cache/crio \
   /var/run/crio \
   /run/crio \
-  /var/run/crio/crio.sock \
-  /run/crio/crio.sock \
   /etc/systemd/system/crio.service \
   /etc/systemd/system/crio.service.d \
   /usr/lib/systemd/system/crio.service \
@@ -211,7 +222,7 @@ purge_paths \
 ok "CRI-O fully removed"
 
 # =============================================================================
-step "6/10" "Remove package repos and keyrings (containerd · cri-o · kubernetes)"
+step "6/11" "Remove package repos and keyrings (containerd · cri-o · kubernetes)"
 # =============================================================================
 
 purge_paths \
@@ -227,6 +238,13 @@ purge_paths \
   /etc/yum.repos.d/cri-o.repo \
   /etc/yum.repos.d/kubernetes.repo
 
+# Clean dnf repo caches for removed repos
+if [[ "${PKG_MGR}" == "dnf" ]]; then
+  for cache in kubernetes docker-ce-stable cri-o epel; do
+    find /var/cache/dnf -maxdepth 2 -name "${cache}*" -exec rm -rf {} + 2>/dev/null || true
+  done
+fi
+
 if [[ "${PKG_MGR}" == "apt" ]]; then
   apt-get update -qq 2>/dev/null || true
 fi
@@ -234,8 +252,15 @@ fi
 ok "Package repos and keyrings removed"
 
 # =============================================================================
-step "7/10" "Remove Kubernetes state · config · data · logs · temp files"
+step "7/11" "Remove Kubernetes state · config · PKI · etcd · kubeconfig · logs"
 # =============================================================================
+
+# Unmount any kubelet bind-mounts first
+for mnt in $(mount 2>/dev/null | awk '{print $3}' \
+    | grep -E '^/var/lib/kubelet|^/run/containerd|^/run/crio|^/var/lib/containers' \
+    | sort -r); do
+  umount -l "${mnt}" 2>/dev/null || true
+done
 
 purge_paths \
   /etc/kubernetes \
@@ -245,29 +270,40 @@ purge_paths \
   /var/run/kubernetes \
   /run/kubernetes \
   /etc/default/kubelet \
+  /etc/sysconfig/kubelet \
   /etc/systemd/system/kubelet.service.d \
   /usr/lib/systemd/system/kubelet.service \
   /lib/systemd/system/kubelet.service \
   /var/log/pods \
   /var/log/containers \
   /root/.kube \
-  /tmp/kubeadm-init.log \
+  /root/kubeadm-config.yaml \
   /tmp/k8s-join-command.sh \
+  /tmp/calico.yaml \
+  /tmp/calico-felix.yaml \
+  /tmp/calico-ippool.yaml \
+  /tmp/kube-flannel.yaml \
   /tmp/01-linux-master-setup.sh \
-  /tmp/02-linux-worker-setup.sh
+  /tmp/02-linux-worker-setup.sh \
+  /tmp/03-linux-destroy.sh \
+  /tmp/04-linux-upgrade.sh \
+  /tmp/kubeadm-init.log \
+  /var/log/k8s-init.log \
+  /var/log/k8s-destroy.log \
+  /var/log/k8s-reset.log \
+  /var/log/k8s-upgrade.log
 
-# All user kubeconfigs
+# Remove all user kubeconfigs and kube directories
 for d in /home/*/; do
-  purge_paths "${d}.kube"
+  [[ -d "${d}.kube" ]] && purge_paths "${d}.kube"
 done
 
-ok "Kubernetes state and temp files fully removed"
+ok "Kubernetes state, PKI, etcd, logs and temp files fully removed"
 
 # =============================================================================
-step "8/10" "Remove CNI plugins · config · interfaces"
+step "8/11" "Remove CNI plugins · config · virtual interfaces"
 # =============================================================================
 
-# Common CNI dirs
 purge_paths \
   /opt/cni \
   /etc/cni \
@@ -278,6 +314,7 @@ purge_paths \
 if [[ -z "${CNI_PLUGIN}" || "${CNI_PLUGIN}" == "calico" ]]; then
   ip link delete vxlan.calico 2>/dev/null || true
   ip link delete tunl0        2>/dev/null || true
+  # Remove all calico-named interfaces
   ip link show 2>/dev/null \
     | grep -oP '(?<=\d: )\S+(?=@|:)' \
     | grep -E '^cali' \
@@ -286,7 +323,9 @@ if [[ -z "${CNI_PLUGIN}" || "${CNI_PLUGIN}" == "calico" ]]; then
     /var/lib/calico \
     /etc/calico \
     /var/run/calico \
-    /run/calico
+    /run/calico \
+    /run/nodeagent \
+    /run/netns
   info "Calico fully cleaned"
 fi
 
@@ -331,7 +370,7 @@ ip link show 2>/dev/null \
 ok "CNI plugins and interfaces fully removed"
 
 # =============================================================================
-step "9/10" "Flush iptables · ip6tables · ipvs · routing"
+step "9/11" "Flush iptables · ip6tables · ipvs · K8s routing"
 # =============================================================================
 
 for table in filter nat mangle raw; do
@@ -355,11 +394,14 @@ ip route show 2>/dev/null | grep -E '10\.(244|96|32)\.' | \
 ok "iptables, ip6tables, ipvs, and routing fully flushed"
 
 # =============================================================================
-step "10/10" "Remove kernel module config · sysctl overrides · reload systemd"
+step "10/11" "Remove kernel module config · sysctl overrides"
 # =============================================================================
 
-purge_paths /etc/modules-load.d/k8s.conf
-purge_paths /etc/sysctl.d/99-k8s.conf
+purge_paths \
+  /etc/modules-load.d/k8s.conf \
+  /etc/sysctl.d/99-k8s.conf \
+  /etc/sysctl.d/k8s.conf \
+  /etc/crictl.yaml
 
 for mod in br_netfilter overlay; do
   if lsmod 2>/dev/null | grep -q "^${mod}"; then
@@ -369,7 +411,11 @@ for mod in br_netfilter overlay; do
 done
 
 sysctl --system -q 2>/dev/null || true
-ok "sysctl config removed and system settings reloaded"
+ok "Kernel module config and sysctl overrides removed"
+
+# =============================================================================
+step "11/11" "Reload systemd · restore fstab"
+# =============================================================================
 
 systemctl daemon-reload 2>/dev/null || true
 systemctl reset-failed  2>/dev/null || true
@@ -378,11 +424,13 @@ ok "systemd reloaded — removed units no longer visible"
 # Restore swap if setup script backed up fstab
 if [[ -f /etc/fstab.bak ]]; then
   info "fstab.bak found — restoring swap entries"
-  grep -i swap /etc/fstab.bak | while read -r line; do
-    grep -qF "${line}" /etc/fstab || echo "${line}" >> /etc/fstab
-  done
+  while IFS= read -r line; do
+    echo "$line" | grep -qi swap && {
+      grep -qF "${line}" /etc/fstab || echo "${line}" >> /etc/fstab
+    }
+  done < /etc/fstab.bak
   swapon -a 2>/dev/null || true
-  ok "Swap restored"
+  ok "Swap restored from fstab.bak"
 else
   info "No fstab.bak — swap not restored"
 fi
@@ -392,20 +440,22 @@ echo -e "\n  ${GR}+=============================================================
 echo -e "  ${GR}|        COMPLETE TEARDOWN FINISHED                              |${NC}"
 echo -e "  ${GR}+================================================================+${NC}"
 echo -e "  Host    : $(hostname)"
+echo -e "  OS      : ${OS_ID} ${OS_VER}"
 echo -e "  Runtime : ${RUNTIME}  — fully removed"
 echo -e "  CNI     : ${CNI_PLUGIN:-all}  — fully removed"
 echo -e ""
 echo -e "  Removed:"
-echo -e "    kubeadm · kubelet · kubectl · crictl"
-echo -e "    containerd  (pkg · config · data · socket · units · logs)"
-echo -e "    CRI-O       (pkg · config · data · socket · units · logs)"
+echo -e "    kubeadm · kubelet · kubectl · crictl · calicoctl"
+echo -e "    containerd  (pkg · config · /var/lib/containerd · socket · units · logs)"
+echo -e "    CRI-O       (pkg · config · /var/lib/crio · socket · units · logs)"
 echo -e "    CNI plugins: calico + flannel + weave"
-echo -e "    Package repos and keyrings"
+echo -e "    /etc/kubernetes · /var/lib/etcd · /var/lib/kubelet · PKI certs"
+echo -e "    /root/.kube · all user ~/.kube · kubeadm-config.yaml"
+echo -e "    Package repos and keyrings (apt/dnf)"
 echo -e "    All temp files and join-command tokens"
-echo -e "    Kernel module config (/etc/modules-load.d/k8s.conf)"
-echo -e "    sysctl overrides (/etc/sysctl.d/99-k8s.conf)"
+echo -e "    Kernel module config · sysctl overrides"
 echo -e "    iptables · ip6tables · ipvs · CNI routes"
-echo -e "    systemd units reloaded — node is clean"
+echo -e "    systemd units reloaded — node is fully clean"
 echo -e ""
 echo -e "  The node is ready to re-provision."
 echo ""

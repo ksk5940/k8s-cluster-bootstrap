@@ -13,6 +13,9 @@ RUNTIME="${RUNTIME:-containerd}"          # containerd | crio
 CNI_PLUGIN="${CNI_PLUGIN:-calico}"        # calico | flannel | weave
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 SETUP_USER="${SETUP_USER:-k8sadmin}"
+# ENABLE_FIREWALL: true = enable + open required K8s master ports
+#                 false = disable firewall completely
+ENABLE_FIREWALL="${ENABLE_FIREWALL:-true}"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 CY='\033[0;36m'; GR='\033[0;32m'; RD='\033[0;31m'; YL='\033[1;33m'; NC='\033[0m'
@@ -47,6 +50,7 @@ echo -e "
 
   ${CY}[....${NC}  Master IP: ${MASTER_IP} | OS: ${OS_ID} ${OS_VER} | Runtime: ${RUNTIME} | CNI: ${CNI_PLUGIN}
         kubectl will be configured for user: ${SETUP_USER}
+        Firewall enabled: ${ENABLE_FIREWALL}
 "
 
 # =============================================================================
@@ -91,13 +95,72 @@ if [[ "$PKG_MGR" == "dnf" ]] && command -v setenforce &>/dev/null; then
   ok "SELinux set to permissive"
 fi
 
-# ── Firewall off (lab cluster) ────────────────────────────────────────────────
-if [[ "$PKG_MGR" == "apt" ]]; then
-  ufw disable 2>/dev/null || true
-else
-  systemctl disable --now firewalld 2>/dev/null || true
-fi
-ok "Firewall disabled"
+# ── Firewall management ───────────────────────────────────────────────────────
+# Master K8s ports:
+#   22/tcp        SSH
+#   6443/tcp      API server
+#   2379-2380/tcp etcd
+#   10250/tcp     Kubelet API
+#   10257/tcp     kube-controller-manager
+#   10259/tcp     kube-scheduler
+#   4789/udp      Calico VXLAN
+#   8472/udp      Flannel VXLAN
+#   30000-32767/tcp NodePort services
+
+configure_firewall_master() {
+  local enable; enable="${ENABLE_FIREWALL,,}"
+
+  # Detect firewall — firewalld wins on RHEL
+  local FWT="none"
+  command -v ufw          &>/dev/null && FWT="ufw"
+  command -v firewall-cmd &>/dev/null && FWT="firewalld"
+
+  local UFW_PORTS=(22/tcp 6443/tcp 2379:2380/tcp 10250/tcp 10257/tcp 10259/tcp
+                   4789/udp 8472/udp 30000:32767/tcp)
+  local FWD_PORTS=(22/tcp 6443/tcp 2379-2380/tcp 10250/tcp 10257/tcp 10259/tcp
+                   4789/udp 8472/udp 30000-32767/tcp)
+
+  if [[ "$enable" == "true" ]]; then
+    case "$FWT" in
+      ufw)
+        ufw --force enable 2>/dev/null || true
+        for p in "${UFW_PORTS[@]}"; do
+          ufw allow "$p" comment "K8s-master" 2>/dev/null || true
+        done
+        ufw reload 2>/dev/null || true
+        ok "ufw enabled — master K8s ports opened"
+        ;;
+      firewalld)
+        systemctl enable --now firewalld 2>/dev/null || true
+        for p in "${FWD_PORTS[@]}"; do
+          firewall-cmd --permanent --add-port="$p" 2>/dev/null || true
+        done
+        firewall-cmd --reload 2>/dev/null || true
+        ok "firewalld enabled — master K8s ports opened"
+        ;;
+      *)
+        warn "No ufw/firewalld found — skipping firewall config"
+        info "Ensure external firewall allows: 22/tcp 6443/tcp 2379-2380/tcp 10250/tcp 4789/udp 8472/udp"
+        ;;
+    esac
+  else
+    case "$FWT" in
+      ufw)
+        ufw disable 2>/dev/null || true
+        ok "ufw disabled"
+        ;;
+      firewalld)
+        systemctl disable --now firewalld 2>/dev/null || true
+        ok "firewalld disabled"
+        ;;
+      *)
+        ok "No active firewall found"
+        ;;
+    esac
+  fi
+}
+
+configure_firewall_master
 
 # =============================================================================
 step "2/9" "Installing container runtime: ${RUNTIME}"

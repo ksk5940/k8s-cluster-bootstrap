@@ -3,21 +3,32 @@
 #  02-linux-worker-setup.sh  —  Kubernetes Worker Node Bootstrap
 #  Supports: ContainerD | CRI-O
 #  k8s v1.32.x  |  Ubuntu 22/24 + Rocky/RHEL 8/9
+#
+#  FIXES:
+#    - RHEL/Rocky: sync chrony/NTP BEFORE kubeadm join to prevent x509 errors
+#    - Firewall: honour ENABLE_FIREWALL env var (default=true)
+#      true  → enable firewall + open required K8s worker ports
+#      false → disable firewall completely
+#    - Wait for runtime socket before joining
 # =============================================================================
 set -euo pipefail
 
 # ── Passed by Jenkins via env ─────────────────────────────────────────────────
 K8S_VERSION="${K8S_VERSION:-1.32.3}"
-RUNTIME="${RUNTIME:-containerd}"      # containerd | crio (CRI-O)
-JOIN_COMMAND="${JOIN_COMMAND:-}"      # full kubeadm join ... string
+RUNTIME="${RUNTIME:-containerd}"         # containerd | crio (CRI-O)
+JOIN_COMMAND="${JOIN_COMMAND:-}"         # full kubeadm join ... string
 SETUP_USER="${SETUP_USER:-k8sadmin}"
 NODE_IP="${NODE_IP:-$(hostname -I | awk '{print $1}')}"
+# ENABLE_FIREWALL: true = enable + open ports, false = disable firewall entirely
+ENABLE_FIREWALL="${ENABLE_FIREWALL:-true}"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
-CY='\033[0;36m'; GR='\033[0;32m'; RD='\033[0;31m'; NC='\033[0m'
+CY='\033[0;36m'; GR='\033[0;32m'; RD='\033[0;31m'; YL='\033[1;33m'; NC='\033[0m'
 step() { echo -e "\n  ${CY}[$1]${NC} $2\n  $(printf '%0.s-' {1..66})"; }
 ok()   { echo -e "  ${GR}[OK]${NC}   $*"; }
+warn() { echo -e "  ${YL}[WARN]${NC} $*"; }
 die()  { echo -e "  ${RD}[FAIL]${NC} $*" >&2; exit 1; }
+info() { echo -e "  ${CY}[....]${NC} $*"; }
 
 # ── APT non-interactive ───────────────────────────────────────────────────────
 export DEBIAN_FRONTEND=noninteractive
@@ -42,10 +53,11 @@ echo -e "
   ${CY}+================================================================+${NC}
 
   ${CY}[....${NC}  Node IP: ${NODE_IP} | OS: ${OS_ID} ${OS_VER} | Runtime: ${RUNTIME}
+  ${CY}[....${NC}  Firewall enabled: ${ENABLE_FIREWALL}
 "
 
 # =============================================================================
-step "1/6" "System prerequisites"
+step "1/7" "System prerequisites"
 # =============================================================================
 
 # ── Repair any interrupted dpkg state (common on reused VMs) ─────────────────
@@ -82,15 +94,69 @@ if [[ "$PKG_MGR" == "dnf" ]] && command -v setenforce &>/dev/null; then
   ok "SELinux set to permissive"
 fi
 
-if [[ "$PKG_MGR" == "apt" ]]; then
-  ufw disable 2>/dev/null || true
-else
-  systemctl disable --now firewalld 2>/dev/null || true
-fi
-ok "Firewall disabled"
+# ── Firewall management ───────────────────────────────────────────────────────
+# Worker K8s ports:
+#   22/tcp    SSH
+#   10250/tcp Kubelet API
+#   10256/tcp kube-proxy healthz
+#   4789/udp  Calico VXLAN
+#   8472/udp  Flannel VXLAN
+
+configure_firewall_worker() {
+  local enable; enable="${ENABLE_FIREWALL,,}"   # lowercase
+
+  # Detect firewall type — firewalld takes priority on RHEL
+  local FWT="none"
+  command -v ufw         &>/dev/null && FWT="ufw"
+  command -v firewall-cmd &>/dev/null && FWT="firewalld"
+
+  local UFW_PORTS=(22/tcp 10250/tcp 10256/tcp 4789/udp 8472/udp)
+  local FWD_PORTS=(22/tcp 10250/tcp 10256/tcp 4789/udp 8472/udp)
+
+  if [[ "$enable" == "true" ]]; then
+    case "$FWT" in
+      ufw)
+        ufw --force enable 2>/dev/null || true
+        for p in "${UFW_PORTS[@]}"; do
+          ufw allow "$p" comment "K8s-worker" 2>/dev/null || true
+        done
+        ufw reload 2>/dev/null || true
+        ok "ufw enabled — worker ports opened: ${UFW_PORTS[*]}"
+        ;;
+      firewalld)
+        systemctl enable --now firewalld 2>/dev/null || true
+        for p in "${FWD_PORTS[@]}"; do
+          firewall-cmd --permanent --add-port="$p" 2>/dev/null || true
+        done
+        firewall-cmd --reload 2>/dev/null || true
+        ok "firewalld enabled — worker ports opened: ${FWD_PORTS[*]}"
+        ;;
+      *)
+        warn "No ufw/firewalld found — skipping firewall config"
+        info "Ensure external firewall allows: 22/tcp 10250/tcp 10256/tcp 4789/udp 8472/udp"
+        ;;
+    esac
+  else
+    case "$FWT" in
+      ufw)
+        ufw disable 2>/dev/null || true
+        ok "ufw disabled"
+        ;;
+      firewalld)
+        systemctl disable --now firewalld 2>/dev/null || true
+        ok "firewalld disabled"
+        ;;
+      *)
+        ok "No active firewall found"
+        ;;
+    esac
+  fi
+}
+
+configure_firewall_worker
 
 # =============================================================================
-step "2/6" "Installing container runtime: ${RUNTIME}"
+step "2/7" "Installing container runtime: ${RUNTIME}"
 # =============================================================================
 
 install_containerd_apt() {
@@ -169,9 +235,9 @@ configure_containerd() {
   local retries=0
   until [ -S /run/containerd/containerd.sock ] && \
         ctr version &>/dev/null; do
-    sleep 1
+    sleep 2
     retries=$((retries+1))
-    [ $retries -ge 15 ] && die "containerd socket not ready after 15s"
+    [ $retries -ge 20 ] && die "containerd socket not ready after 40s"
   done
 
   ok "containerd installed (SystemdCgroup=true)"
@@ -193,7 +259,7 @@ case "${RUNTIME}" in
 esac
 
 # =============================================================================
-step "3/6" "Installing kubeadm / kubelet / kubectl  (v${K8S_VERSION})"
+step "3/7" "Installing kubeadm / kubelet / kubectl  (v${K8S_VERSION})"
 # =============================================================================
 
 K8S_MINOR="${K8S_VERSION%.*}"
@@ -231,7 +297,69 @@ systemctl enable --now kubelet
 ok "kubeadm / kubelet / kubectl installed"
 
 # =============================================================================
-step "4/6" "Joining cluster"
+step "4/7" "Syncing system clock (prevents x509 TLS errors on join)"
+# =============================================================================
+# CRITICAL: The "x509: current time is before certificate validity" error occurs
+# when this node's clock is behind the master by more than ~5 minutes.
+# RHEL/Rocky VMs are especially prone to this when started from snapshots or
+# when chrony has not stepped the clock since boot.
+# We force an immediate hard sync HERE, before kubeadm join.
+
+sync_clock() {
+  local synced=false
+  local now_before; now_before=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  info "Clock before sync: ${now_before}"
+
+  if [[ "$PKG_MGR" == "apt" ]]; then
+    # Ubuntu/Debian — use systemd-timesyncd
+    timedatectl set-ntp true 2>/dev/null || true
+    systemctl restart systemd-timesyncd 2>/dev/null || true
+    local w=0
+    while [[ $w -lt 30 ]]; do
+      timedatectl status 2>/dev/null | grep -q "synchronized: yes" && { synced=true; break; }
+      sleep 2; w=$((w+2))
+    done
+    # Fallback: ntpdate
+    if [[ "$synced" == "false" ]] && command -v ntpdate &>/dev/null; then
+      ntpdate -u pool.ntp.org 2>/dev/null && synced=true || true
+    fi
+
+  else
+    # RHEL/Rocky/AlmaLinux — use chrony
+    if ! command -v chronyd &>/dev/null; then
+      info "Installing chrony..."
+      dnf install -y -q chrony 2>/dev/null || true
+    fi
+    if command -v chronyd &>/dev/null; then
+      systemctl enable --now chronyd 2>/dev/null || true
+      sleep 2   # give chronyd a moment to start
+      # chronyc makestep: immediately step the clock rather than slew.
+      # This is the key fix — slewing can take hours; stepping is instant.
+      if chronyc makestep 2>/dev/null; then
+        synced=true
+      fi
+      info "Chrony tracking:"
+      chronyc tracking 2>/dev/null | grep -E 'System time|RMS offset|Last offset' || true
+    fi
+    # Fallback
+    if [[ "$synced" == "false" ]] && command -v ntpdate &>/dev/null; then
+      ntpdate -u pool.ntp.org 2>/dev/null && synced=true || true
+    fi
+  fi
+
+  local now_after; now_after=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  if [[ "$synced" == "true" ]]; then
+    ok "Clock synced — UTC: ${now_after}"
+  else
+    warn "Clock sync uncertain — UTC: ${now_after}"
+    warn "If kubeadm join fails with x509 certificate errors, run: chronyc makestep"
+  fi
+}
+
+sync_clock
+
+# =============================================================================
+step "5/7" "Joining cluster"
 # =============================================================================
 
 case "${RUNTIME}" in
@@ -243,6 +371,16 @@ if [[ -z "${JOIN_COMMAND}" ]]; then
   die "JOIN_COMMAND env var is empty — cannot join cluster"
 fi
 
+# Ensure runtime socket is ready
+RT_SOCK="${CRI_SOCKET#unix://}"
+info "Waiting for runtime socket: ${RT_SOCK}"
+rt_wait=0
+until [ -S "${RT_SOCK}" ]; do
+  sleep 2; rt_wait=$((rt_wait + 2))
+  [ $rt_wait -ge 30 ] && die "Runtime socket ${RT_SOCK} not ready after 30s — check containerd/crio logs"
+done
+ok "Runtime socket ready"
+
 kubeadm reset -f --cri-socket "${CRI_SOCKET}" 2>/dev/null || true
 rm -rf /etc/kubernetes /var/lib/etcd /var/lib/kubelet/config.yaml /etc/cni/net.d
 
@@ -251,7 +389,7 @@ eval "${JOIN_COMMAND} --cri-socket ${CRI_SOCKET}"
 ok "Node joined cluster"
 
 # =============================================================================
-step "5/6" "Configuring kubelet node IP"
+step "6/7" "Configuring kubelet node IP"
 # =============================================================================
 
 mkdir -p /etc/default
@@ -261,7 +399,7 @@ systemctl restart kubelet
 ok "kubelet node-ip set to ${NODE_IP}"
 
 # =============================================================================
-step "6/6" "Done"
+step "7/7" "Done"
 # =============================================================================
 
 echo -e "\n  ${GR}+================================================================+${NC}"
@@ -270,4 +408,5 @@ echo -e "  ${GR}+===============================================================
 echo -e "  Node IP  : ${NODE_IP}"
 echo -e "  Runtime  : ${RUNTIME}"
 echo -e "  K8s ver  : v${K8S_VERSION}"
+echo -e "  Firewall : ${ENABLE_FIREWALL}"
 echo ""
