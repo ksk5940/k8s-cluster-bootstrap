@@ -145,9 +145,35 @@ EOF
 
 configure_containerd() {
   mkdir -p /etc/containerd
-  containerd config default >/etc/containerd/config.toml
+
+  # Stop first — containerd auto-starts on install with a bad default config
+  systemctl stop containerd 2>/dev/null || true
+
+  # Regenerate default config
+  containerd config default > /etc/containerd/config.toml
+
+  # Enable systemd cgroup driver (required for Kubernetes)
   sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-  systemctl enable --now containerd
+
+  # Verify the sed actually worked (containerd v2.x safety check)
+  if ! grep -q 'SystemdCgroup = true' /etc/containerd/config.toml; then
+    sed -i '/\[plugins.*runc.*options\]/,/\[/ s/SystemdCgroup = false/SystemdCgroup = true/' \
+      /etc/containerd/config.toml
+  fi
+
+  # Restart cleanly with the new config
+  systemctl enable containerd
+  systemctl restart containerd
+
+  # Wait for the socket to be ready before kubelet tries to use it
+  local retries=0
+  until [ -S /run/containerd/containerd.sock ] && \
+        ctr version &>/dev/null; do
+    sleep 1
+    retries=$((retries+1))
+    [ $retries -ge 15 ] && die "containerd socket not ready after 15s"
+  done
+
   ok "containerd installed (SystemdCgroup=true)"
 }
 
@@ -218,6 +244,7 @@ if [[ -z "${JOIN_COMMAND}" ]]; then
 fi
 
 kubeadm reset -f --cri-socket "${CRI_SOCKET}" 2>/dev/null || true
+rm -rf /etc/kubernetes /var/lib/etcd /var/lib/kubelet/config.yaml /etc/cni/net.d
 
 # Execute join with explicit CRI socket appended
 eval "${JOIN_COMMAND} --cri-socket ${CRI_SOCKET}"
