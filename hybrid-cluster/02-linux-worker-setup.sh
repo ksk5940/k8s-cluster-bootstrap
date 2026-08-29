@@ -292,39 +292,132 @@ EOF
 configure_containerd() {
   mkdir -p /etc/containerd
 
-  # Stop first — containerd auto-starts on install with a bad default config
   systemctl stop containerd 2>/dev/null || true
 
-  # Regenerate default config
-  containerd config default > /etc/containerd/config.toml
+  # Always generate the configuration from the installed containerd version.
+  containerd config default > /etc/containerd/config.toml ||
+    die "Failed to generate containerd default configuration"
 
-  # Enable systemd cgroup driver (required for Kubernetes)
-  sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+  local CONTAINERD_VERSION CONTAINERD_MAJOR PAUSE_IMAGE
+  CONTAINERD_VERSION="$(containerd --version | awk '{print $3}' | sed 's/^v//')"
+  CONTAINERD_MAJOR="${CONTAINERD_VERSION%%.*}"
+  PAUSE_IMAGE="${PAUSE_IMAGE:-registry.k8s.io/pause:3.10}"
 
-  # Verify the sed actually worked (containerd v2.x safety check)
-  if ! grep -q 'SystemdCgroup = true' /etc/containerd/config.toml; then
-    sed -i '/\[plugins.*runc.*options\]/,/\[/ s/SystemdCgroup = false/SystemdCgroup = true/' \
+  [[ "${CONTAINERD_MAJOR}" =~ ^[0-9]+$ ]] ||
+    die "Unable to determine containerd major version: ${CONTAINERD_VERSION}"
+
+  info "Detected containerd version: ${CONTAINERD_VERSION} (major ${CONTAINERD_MAJOR})"
+  info "Configuring CRI sandbox image: ${PAUSE_IMAGE}"
+
+  case "${CONTAINERD_MAJOR}" in
+    1)
+      if grep -q '^\[plugins\."io\.containerd\.grpc\.v1\.cri"\]' /etc/containerd/config.toml; then
+        if grep -q '^[[:space:]]*sandbox_image[[:space:]]*=' /etc/containerd/config.toml; then
+          sed -i \
+            's|^[[:space:]]*sandbox_image[[:space:]]*=.*|    sandbox_image = "'"${PAUSE_IMAGE}"'"|' \
+            /etc/containerd/config.toml
+        else
+          sed -i \
+            '/^\[plugins\."io\.containerd\.grpc\.v1\.cri"\]/a\    sandbox_image = "'"${PAUSE_IMAGE}"'"' \
+            /etc/containerd/config.toml
+        fi
+      else
+        die "containerd ${CONTAINERD_VERSION} does not expose the expected v1 CRI plugin"
+      fi
+      grep -Fq 'sandbox_image = "'"${PAUSE_IMAGE}"'"' /etc/containerd/config.toml ||
+        die "Failed to configure containerd 1.x CRI sandbox image"
+      ;;
+
+    2)
+      # containerd 2.x uses the CRI v1 images plugin and pinned sandbox image.
+      if grep -q "^\[plugins\.'io\.containerd\.cri\.v1\.images'\.pinned_images\]" /etc/containerd/config.toml; then
+        if grep -q '^[[:space:]]*sandbox[[:space:]]*=' /etc/containerd/config.toml; then
+          sed -i \
+            "s|^[[:space:]]*sandbox[[:space:]]*=.*|    sandbox = \"${PAUSE_IMAGE}\"|" \
+            /etc/containerd/config.toml
+        else
+          sed -i \
+            "/^\[plugins\.'io\.containerd\.cri\.v1\.images'\.pinned_images\]/a\    sandbox = \"${PAUSE_IMAGE}\"" \
+            /etc/containerd/config.toml
+        fi
+      elif grep -q "^\[plugins\.'io\.containerd\.cri\.v1\.images'\]" /etc/containerd/config.toml; then
+        cat >> /etc/containerd/config.toml <<EOF
+
+[plugins.'io.containerd.cri.v1.images'.pinned_images]
+  sandbox = "${PAUSE_IMAGE}"
+EOF
+      elif grep -q '^\[plugins\."io\.containerd\.cri\.v1\.images"\]' /etc/containerd/config.toml; then
+        cat >> /etc/containerd/config.toml <<EOF
+
+[plugins."io.containerd.cri.v1.images".pinned_images]
+  sandbox = "${PAUSE_IMAGE}"
+EOF
+      else
+        die "containerd ${CONTAINERD_VERSION} does not expose the expected v1 images plugin"
+      fi
+
+      grep -Eq 'sandbox[[:space:]]*=[[:space:]]*"'"${PAUSE_IMAGE//./\.}"'"' \
+        /etc/containerd/config.toml ||
+        die "Failed to configure containerd 2.x CRI sandbox image"
+      ;;
+
+    *)
+      die "Unsupported containerd major version ${CONTAINERD_MAJOR}; supported: 1.x and 2.x"
+      ;;
+  esac
+
+  # Configure systemd cgroups in the installed version's runc options block.
+  if grep -q 'SystemdCgroup' /etc/containerd/config.toml; then
+    sed -i 's/SystemdCgroup[[:space:]]*=[[:space:]]*false/SystemdCgroup = true/g' \
       /etc/containerd/config.toml
+  else
+    if [[ "${CONTAINERD_MAJOR}" == "2" ]]; then
+      if grep -q "^\[plugins\.'io\.containerd\.cri\.v1\.runtime'\.containerd\.runtimes\.runc\.options\]" \
+          /etc/containerd/config.toml; then
+        sed -i \
+          "/^\[plugins\.'io\.containerd\.cri\.v1\.runtime'\.containerd\.runtimes\.runc\.options\]/a\    SystemdCgroup = true" \
+          /etc/containerd/config.toml
+      elif grep -q '^\[plugins\."io\.containerd\.cri\.v1\.runtime"\.containerd\.runtimes\.runc\.options\]' \
+          /etc/containerd/config.toml; then
+        sed -i \
+          '/^\[plugins\."io\.containerd\.cri\.v1\.runtime"\.containerd\.runtimes\.runc\.options\]/a\    SystemdCgroup = true' \
+          /etc/containerd/config.toml
+      else
+        die "Could not locate containerd 2.x runc options for SystemdCgroup"
+      fi
+    else
+      if grep -q '^\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]' \
+          /etc/containerd/config.toml; then
+        sed -i \
+          '/^\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]/a\    SystemdCgroup = true' \
+          /etc/containerd/config.toml
+      else
+        die "Could not locate containerd 1.x runc options for SystemdCgroup"
+      fi
+    fi
   fi
 
-  # Restart cleanly with the new config
+  grep -q 'SystemdCgroup = true' /etc/containerd/config.toml ||
+    die "Failed to configure SystemdCgroup=true"
+
+  # Validate TOML before restarting the daemon.
+  containerd config dump >/dev/null 2>&1 ||
+    die "Generated containerd configuration is invalid"
+
   systemctl enable containerd
   systemctl restart containerd
 
-  # Wait for the socket to be ready before kubelet tries to use it
   local retries=0
-
-  until [ -S /run/containerd/containerd.sock ] &&
-        ctr version &>/dev/null; do
-
-    sleep 2
+  until systemctl is-active --quiet containerd &&
+        [ -S /run/containerd/containerd.sock ] &&
+        ctr version >/dev/null 2>&1; do
+    sleep 1
     retries=$((retries+1))
-
-    [ $retries -ge 20 ] &&
-      die "containerd socket not ready after 40s"
+    [ "$retries" -ge 30 ] &&
+      die "containerd did not become ready after 30s. Check: journalctl -u containerd -n 100 --no-pager"
   done
 
-  ok "containerd installed (SystemdCgroup=true)"
+  ok "containerd ${CONTAINERD_VERSION} installed and configured (CRI + SystemdCgroup=true, sandbox=${PAUSE_IMAGE})"
 }
 
 configure_crio() {
@@ -635,7 +728,14 @@ rm -rf \
   /etc/cni/net.d
 
 # Execute join with explicit CRI socket appended
-eval "${JOIN_COMMAND} --cri-socket ${CRI_SOCKET}"
+# Add the selected CRI endpoint only when the supplied join command does not
+# already specify one. Avoid eval where possible; the join command is expected
+# to be generated by kubeadm and may contain quoted arguments.
+if [[ "${JOIN_COMMAND}" == *"--cri-socket"* ]]; then
+  bash -c "${JOIN_COMMAND}"
+else
+  bash -c "${JOIN_COMMAND} --cri-socket ${CRI_SOCKET}"
+fi
 rm -f -- "${JOIN_COMMAND_FILE}" 2>/dev/null || true
 
 ok "Node joined cluster"
@@ -743,6 +843,19 @@ if ! systemctl is-active --quiet kubelet; then
 fi
 
 ok "kubelet restarted successfully"
+
+# Final runtime/CRI validation after kubelet restart.
+[[ -S "${RT_SOCK}" ]] ||
+  die "Selected runtime socket disappeared after kubelet restart: ${RT_SOCK}"
+
+if command -v crictl >/dev/null 2>&1; then
+  crictl --runtime-endpoint="${CRI_SOCKET}" \
+         --image-endpoint="${CRI_SOCKET}" \
+         info >/dev/null 2>&1 ||
+    die "CRI endpoint is not responding after worker bootstrap: ${CRI_SOCKET}"
+fi
+
+ok "Runtime and CRI endpoint remain healthy after worker configuration"
 
 # Show final configuration for troubleshooting/Jenkins logs
 info "Final kubelet network configuration:"
