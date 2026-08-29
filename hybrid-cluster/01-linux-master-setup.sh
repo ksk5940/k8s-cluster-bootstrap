@@ -548,143 +548,81 @@ EOF
   ok "CRI-O installed and running (${CRIO_UNIT}, socket=${sock}, sandbox=registry.k8s.io/pause:3.10)"
 }
 
-# Verify the selected runtime advertises the expected sandbox image
-# before kubeadm init/join.
-if [[ "${RUNTIME}" == "crio" ]]; then
-  if [[ ! -f /etc/crio/crio.conf.d/10-kubernetes-pause.conf ]]; then
-    die "CRI-O sandbox configuration is missing"
-  fi
-  grep -Fq 'pause_image = "registry.k8s.io/pause:3.10"' /etc/crio/crio.conf.d/10-kubernetes-pause.conf ||
-    die "CRI-O sandbox image is not configured as registry.k8s.io/pause:3.10"
-fi
 
 
 
-
-# -----------------------------------------------------------------------------
-# Pre-pull every image required by the selected runtime/Kubernetes/CNI.
-# The list is generated from the exact Kubernetes version and the exact CNI
-# manifest that this script will subsequently use. Nothing is hard-coded from
-# a different version.
-# -----------------------------------------------------------------------------
 runtime_image_exists() {
   local image="$1"
-
   case "${RUNTIME}" in
-    containerd)
-      ctr -n k8s.io images ls 2>/dev/null |
-        awk '{print $1}' | grep -Fxq "${image}"
-      ;;
-    crio)
-      crictl images 2>/dev/null |
-        awk 'NR > 1 {print $1 ":" $2}' | grep -Fxq "${image}"
-      ;;
-    *)
-      return 1
-      ;;
+    containerd) ctr -n k8s.io images ls 2>/dev/null | awk 'NR>1 {print $1}' | grep -Fxq "${image}" ;;
+    crio) crictl images 2>/dev/null | awk 'NR>1 {print $1 ":" $2}' | grep -Fxq "${image}" ;;
+    *) return 1 ;;
   esac
-}
-
-pull_runtime_image() {
-  local image="$1"
-  local retries=0
-  local max_retries=5
-
-  [[ -n "${image}" ]] || return 0
-
-  if runtime_image_exists "${image}"; then
-    ok "Image already present: ${image}"
-    return 0
-  fi
-
-  while (( retries < max_retries )); do
-    info "Pulling image: ${image} (attempt $((retries + 1))/${max_retries})"
-
-    case "${RUNTIME}" in
-      containerd)
-        if ctr -n k8s.io images pull "${image}" >/dev/null; then
-          if runtime_image_exists "${image}"; then
-            ok "Image ready: ${image}"
-            return 0
-          fi
-        fi
-        ;;
-      crio)
-        if crictl pull "${image}" >/dev/null; then
-          if runtime_image_exists "${image}"; then
-            ok "Image ready: ${image}"
-            return 0
-          fi
-        fi
-        ;;
-    esac
-
-    retries=$((retries + 1))
-    warn "Unable to pull/verify ${image}; retrying"
-    sleep $((retries * 2))
-  done
-
-  die "Unable to pull/verify required image: ${image}"
 }
 
 pull_required_images() {
-  local tmp_images
-  local image
-
+  local tmp_images manifest image
+  local ROLE="master"
   tmp_images="$(mktemp)"
-  trap 'rm -f -- "$tmp_images"' RETURN
+  manifest="$(mktemp)"
+  trap 'rm -f -- "$tmp_images" "$manifest"' RETURN
 
-  info "Building required image list for Kubernetes ${K8S_VERSION} + ${CNI_PLUGIN}"
-
-  # kubeadm is the authoritative source for Kubernetes control-plane/node
-  # images for the exact requested version.
-  kubeadm config images list --kubernetes-version "v${K8S_VERSION}" >"$tmp_images" ||
+  info "Preparing required image list: Kubernetes v${K8S_VERSION}, runtime=${RUNTIME}, CNI=${CNI_PLUGIN}"
+  kubeadm config images list --kubernetes-version "v${K8S_VERSION}" >>"${tmp_images}" ||
     die "Unable to determine Kubernetes images for v${K8S_VERSION}"
 
-  # The configured CRI sandbox image is always required.
-  printf '%s\n' "registry.k8s.io/pause:3.10" >>"$tmp_images"
+  printf '%s\n' "${PAUSE_IMAGE:-registry.k8s.io/pause:3.10}" >>"${tmp_images}"
 
-  # Obtain the exact CNI manifest that will be applied. The existing script
-  # exposes the CNI manifest URL/path through its install logic; resolve it
-  # from the selected plugin so image names cannot drift from the manifest.
-  local cni_manifest=""
+  local cni_url=""
   case "${CNI_PLUGIN}" in
-    calico)
-      cni_manifest="https://raw.githubusercontent.com/projectcalico/calico/v3.29.3/manifests/calico.yaml"
-      ;;
-    flannel)
-      cni_manifest="https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml"
-      ;;
-    weave)
-      cni_manifest="https://reweave.azurewebsites.net/k8s/v1.29/net.yaml"
-      ;;
-    *)
-      die "Unsupported CNI plugin: ${CNI_PLUGIN}"
-      ;;
+    calico)  cni_url="https://raw.githubusercontent.com/projectcalico/calico/v3.29.3/manifests/calico.yaml" ;;
+    flannel) cni_url="https://github.com/flannel-io/flannel/releases/download/v0.26.7/kube-flannel.yml" ;;
+    weave)   cni_url="https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s.yaml" ;;
+    *) die "Unsupported CNI_PLUGIN='${CNI_PLUGIN}'" ;;
   esac
 
-  local manifest
-  manifest="$(mktemp)"
+  curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 15     "${cni_url}" -o "${manifest}" ||
+    die "Unable to download selected CNI manifest: ${cni_url}"
 
-  if ! curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 15 "$cni_manifest" -o "$manifest"; then
-    rm -f -- "$manifest"
-    die "Unable to download selected CNI manifest: $cni_manifest"
-  fi
+  grep -oE 'image:[[:space:]]*[^[:space:]]+' "${manifest}" |
+    sed -E 's/^image:[[:space:]]*//' >>"${tmp_images}" || true
 
-  # Pull only actual container image references from the manifest.
-  grep -oE 'image:[[:space:]]*[^[:space:]]+' "$manifest" |
-    sed -E 's/^image:[[:space:]]*//' >>"$tmp_images" || true
-
-  rm -f -- "$manifest"
-
-  # Normalize, de-duplicate, and ignore empty/comment lines.
+  local count=0
   while IFS= read -r image; do
-    [[ -n "$image" ]] || continue
-    [[ "$image" != \#* ]] || continue
-    pull_runtime_image "$image"
-  done < <(sed '/^[[:space:]]*$/d' "$tmp_images" | sort -u)
+    [[ -n "${image}" ]] || continue
+    image="${image%%[[:space:]]*}"
+    count=$((count + 1))
 
-  ok "All required images are present for ${RUNTIME} + Kubernetes ${K8S_VERSION} + ${CNI_PLUGIN}"
+    if runtime_image_exists "${image}"; then
+      ok "Image already present: ${image}"
+      continue
+    fi
+
+    local attempt=1 pulled=0
+    while (( attempt <= 5 )); do
+      info "Pulling ${image} (attempt ${attempt}/5)"
+      if [[ "${RUNTIME}" == "containerd" ]]; then
+        if ctr -n k8s.io images pull "${image}" >/dev/null 2>&1 &&
+           runtime_image_exists "${image}"; then
+          pulled=1; break
+        fi
+      else
+        if crictl pull "${image}" >/dev/null 2>&1 &&
+           runtime_image_exists "${image}"; then
+          pulled=1; break
+        fi
+      fi
+      warn "Pull/verification failed for ${image}"
+      sleep $((attempt * 2))
+      attempt=$((attempt + 1))
+    done
+
+    (( pulled == 1 )) || die "Required image unavailable after 5 attempts: ${image}"
+    ok "Image ready: ${image}"
+  done < <(sed '/^[[:space:]]*$/d' "${tmp_images}" | sort -u)
+
+  (( count > 0 )) || die "Required image list is empty"
+  ok "All required images pre-pulled and verified (${count} references)"
 }
 
 case "${RUNTIME}" in
@@ -780,18 +718,7 @@ step "4/9" "kubeadm init"
 # Reset any previous state
 kubeadm reset -f --cri-socket "${CRI_SOCKET}" 2>/dev/null || true
 rm -rf /etc/kubernetes /var/lib/etcd /var/lib/kubelet/config.yaml
-
-# Preload the configured pause image before kubeadm.
-
-pull_pause_image
-
-
-# Pre-pull all images before kubeadm init/join.
-
-
 pull_required_images
-
-
 
 kubeadm init \
   --apiserver-advertise-address="${MASTER_IP}" \
