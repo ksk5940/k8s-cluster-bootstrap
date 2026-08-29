@@ -409,16 +409,38 @@ ok "Test pod cleanup completed"
 # =============================================================================
 # Final gate
 # =============================================================================
+#
+# The final gate is authoritative. Earlier readiness checks may observe
+# transient convergence failures. If the cluster has recovered by this point,
+# Jenkins must receive exit code 0. A genuine final failure returns 1.
+FINAL_GATE_FAILED=0
+
 if wait_for_all_pods_running 600; then
     kubectl get nodes -o wide
     kubectl get pods -A -o wide
-    ok "FINAL GATE PASSED: all cluster pods are Running and Ready"
+
+    FINAL_NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l)
+    FINAL_NOT_READY=$(kubectl get nodes --no-headers 2>/dev/null |
+        awk '$2 != "Ready" {c++} END {print c+0}')
+
+    if (( FINAL_NODE_COUNT > 0 && FINAL_NOT_READY == 0 )); then
+        ok "FINAL GATE PASSED: all nodes are Ready and all cluster pods are Running and Ready"
+    else
+        fail "FINAL GATE FAILED: ${FINAL_NOT_READY} node(s) are still NotReady"
+        FINAL_GATE_FAILED=1
+    fi
 else
     fail "FINAL GATE FAILED: cluster still has non-ready pods"
+    FINAL_GATE_FAILED=1
 fi
 
-if (( FAILURES > 0 )); then
+echo ""
+
+if (( FINAL_GATE_FAILED == 0 )); then
+    ok "VALIDATION SUCCESS: cluster is healthy"
+    exit 0
+else
+    fail "VALIDATION FAILED: final cluster gate did not pass"
     exit 1
 fi
 
-exit 0
