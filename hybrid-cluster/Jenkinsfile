@@ -279,10 +279,11 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
           script {
             def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
                                 user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
-            def raw = sshCommand remote: masterRemote,
-              command: "sudo cat /tmp/k8s-join-command.sh"
-            env.JOIN_CMD = raw.trim()
-            echo "Join command extracted."
+            def joinFile = "${env.WORKSPACE}/.k8s-join-command.sh"
+            sshGet remote: masterRemote, from: '/tmp/k8s-join-command.sh', into: joinFile, override: true
+            sh "chmod 600 '${joinFile}'"
+            env.JOIN_CMD_FILE = joinFile
+            echo "Join command extracted securely."
           }
         }
       }
@@ -307,18 +308,19 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                 def remote = [name: ip, host: ip, user: params.SSH_USER,
                               password: env.SSH_PASS, allowAnyHosts: true]
                 sshPut remote: remote, from: localWorker, into: '/tmp/02-linux-worker-setup.sh'
+                sshPut remote: remote, from: env.JOIN_CMD_FILE, into: '/tmp/k8s-join-command.sh'
 
                 def tStart = System.currentTimeMillis()
                 sshCommand remote: remote, command: """
-                  sed -i 's/\\r//' /tmp/02-linux-worker-setup.sh && \\
-                  chmod +x /tmp/02-linux-worker-setup.sh && \\
-                  export K8S_VERSION='${params.K8S_VERSION}' \\
-                         RUNTIME='${params.RUNTIME}' \\
-                         JOIN_COMMAND='${env.JOIN_CMD}' \\
-                         NODE_IP='${ip}' \\
-                         SETUP_USER='${params.SSH_USER}' \\
-                         ENABLE_FIREWALL='${params.ENABLE_FIREWALL}' \\
-                         DEBIAN_FRONTEND=noninteractive && \\
+                  sed -i 's/\\r//' /tmp/02-linux-worker-setup.sh && \
+                  chmod +x /tmp/02-linux-worker-setup.sh /tmp/k8s-join-command.sh && \
+                  export K8S_VERSION='${params.K8S_VERSION}' \
+                         RUNTIME='${params.RUNTIME}' \
+                         JOIN_COMMAND_FILE='/tmp/k8s-join-command.sh' \
+                         NODE_IP='${ip}' \
+                         SETUP_USER='${params.SSH_USER}' \
+                         ENABLE_FIREWALL='${params.ENABLE_FIREWALL}' \
+                         DEBIAN_FRONTEND=noninteractive && \
                   sudo -E bash /tmp/02-linux-worker-setup.sh
                 """.stripIndent().trim()
 
@@ -529,6 +531,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
   post {
     always {
       script {
+        sh("rm -f -- '${env.WORKSPACE}/.k8s-join-command.sh' 2>/dev/null || true")
         def pipeEnd   = System.currentTimeMillis()
         def totalMs   = pipeEnd - pipeStart
 

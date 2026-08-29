@@ -10,6 +10,7 @@ set -euo pipefail
 K8S_VERSION="${K8S_VERSION:-1.32.3}"
 RUNTIME="${RUNTIME:-containerd}"         # containerd | crio (CRI-O)
 JOIN_COMMAND="${JOIN_COMMAND:-}"         # full kubeadm join ... string
+JOIN_COMMAND_FILE="${JOIN_COMMAND_FILE:-/tmp/k8s-join-command.sh}"
 SETUP_USER="${SETUP_USER:-k8sadmin}"
 
 # Kubernetes/host-only subnet.
@@ -524,8 +525,11 @@ case "${RUNTIME}" in
     ;;
 esac
 
+if [[ -z "${JOIN_COMMAND}" && -f "${JOIN_COMMAND_FILE}" ]]; then
+  JOIN_COMMAND=$(cat "${JOIN_COMMAND_FILE}")
+fi
 if [[ -z "${JOIN_COMMAND}" ]]; then
-  die "JOIN_COMMAND env var is empty — cannot join cluster"
+  die "No kubeadm join command supplied — cannot join cluster"
 fi
 
 # Ensure runtime socket is ready
@@ -555,8 +559,17 @@ rm -rf \
 
 # Execute join with explicit CRI socket appended
 eval "${JOIN_COMMAND} --cri-socket ${CRI_SOCKET}"
+rm -f -- "${JOIN_COMMAND_FILE}" 2>/dev/null || true
 
 ok "Node joined cluster"
+
+# Ensure the node's own hostname resolves locally even when external DNS has no
+# record for it (common on lab/host-only networks and isolated enterprise DNS).
+NODE_HOSTNAME=$(hostname -s)
+if ! getent hosts "${NODE_HOSTNAME}" >/dev/null 2>&1; then
+  printf '%s %s\n' "${NODE_IP}" "${NODE_HOSTNAME}" >> /etc/hosts
+  ok "Added local hostname mapping: ${NODE_IP} ${NODE_HOSTNAME}"
+fi
 
 # =============================================================================
 step "6/7" "Configuring kubelet node IP and DNS"

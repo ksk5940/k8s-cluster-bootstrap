@@ -503,32 +503,59 @@ case "${CNI_PLUGIN}" in
 esac
 
 # =============================================================================
-step "7/9" "Waiting for control-plane to be Ready"
+step "7/9" "Waiting for complete control-plane readiness"
 # =============================================================================
 
-echo -n "  Waiting for master node Ready"
-for i in $(seq 1 60); do
-  STATUS=$(kubectl get nodes --no-headers 2>/dev/null | awk '{print $2}' | head -1)
-  if [[ "$STATUS" == "Ready" ]]; then
-    echo -e "\n  ${GR}[OK]${NC}   Master node is Ready"
-    break
-  fi
-  echo -n "."
-  sleep 5
-done
-[[ "$STATUS" != "Ready" ]] && echo -e "\n  ${YL}[WARN]${NC} Master not Ready yet — workers may still join"
+wait_for_node_ready() {
+  local timeout=300 elapsed=0 status=""
+  info "Waiting for master node Ready..."
+  while (( elapsed < timeout )); do
+    status=$(kubectl get node --no-headers 2>/dev/null | awk 'NR==1 {print $2}')
+    [[ "$status" == "Ready" ]] && { ok "Master node is Ready"; return 0; }
+    sleep 5; elapsed=$((elapsed + 5))
+  done
+  kubectl get nodes -o wide 2>/dev/null || true
+  die "Master node did not become Ready within ${timeout}s"
+}
+
+wait_for_cni() {
+  local timeout=300
+  case "${CNI_PLUGIN}" in
+    calico)
+      kubectl -n kube-system rollout status daemonset/calico-node --timeout="${timeout}s" || die "Calico node DaemonSet did not become ready"
+      kubectl -n kube-system rollout status deployment/calico-kube-controllers --timeout="${timeout}s" || die "Calico controllers did not become ready"
+      ;;
+    flannel)
+      kubectl -n kube-flannel rollout status daemonset/kube-flannel-ds --timeout="${timeout}s" || die "Flannel DaemonSet did not become ready"
+      ;;
+    weave)
+      kubectl -n kube-system rollout status daemonset/weave-net --timeout="${timeout}s" || die "Weave DaemonSet did not become ready"
+      ;;
+    *) die "Unknown CNI: ${CNI_PLUGIN}" ;;
+  esac
+  ok "${CNI_PLUGIN} networking is ready"
+}
+
+wait_for_system_pods() {
+  local timeout=300
+  kubectl -n kube-system rollout status deployment/coredns --timeout="${timeout}s" || die "CoreDNS did not become ready"
+  kubectl -n kube-system rollout status daemonset/kube-proxy --timeout="${timeout}s" || die "kube-proxy did not become ready"
+  ok "CoreDNS and kube-proxy are ready"
+}
+
+wait_for_node_ready
+wait_for_cni
+wait_for_system_pods
 
 # =============================================================================
-step "8/9" "Extracting join command"
+step "8/9" "Generating secure join command"
 # =============================================================================
 
 JOIN_CMD=$(kubeadm token create --print-join-command 2>/dev/null)
-echo "${JOIN_CMD}" >/tmp/k8s-join-command.sh
-chmod 644 /tmp/k8s-join-command.sh
-ok "Join command saved to /tmp/k8s-join-command.sh"
-echo ""
-echo "  JOIN COMMAND:"
-echo "  ${JOIN_CMD}"
+[[ -n "${JOIN_CMD}" ]] || die "Failed to generate kubeadm join command"
+printf '%s\n' "${JOIN_CMD}" >/tmp/k8s-join-command.sh
+chmod 600 /tmp/k8s-join-command.sh
+ok "Join command generated and stored securely"
 
 # =============================================================================
 step "9/9" "Final cluster state"
