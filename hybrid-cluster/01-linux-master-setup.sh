@@ -728,12 +728,23 @@ install_calico() {
 
   # Detect host-only interface (the non-NAT NIC — typically the 192.168.x.x one)
   local IFACE
-  IFACE=$(ip -4 route show | awk '$1 !~ /^(default|local|broadcast|unreachable|prohibit|blackhole|throw)$/ && $0 ~ / dev / {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
-  # Fallback: first non-loopback interface
-  [[ -z "$IFACE" ]] && IFACE=$(ip -o link show | awk -F': ' '$2 !~ /lo|docker|veth|br-|cali|flannel|weave/ {print $2}' | head -1)
-  [[ -z "$IFACE" ]] && IFACE="eth1"
+
+  # Prefer the interface that actually owns MASTER_IP. This avoids selecting
+  # the NAT interface on multi-NIC VMs.
+  IFACE="$(ip -o -4 addr show 2>/dev/null |
+    awk -v ip="${MASTER_IP}" '$4 ~ ("^" ip "/") {print $2; exit}')"
+
+  # Fallback without awk|head: with `set -o pipefail`, awk can receive
+  # SIGPIPE from head and make the entire bootstrap exit with status 141.
+  if [[ -z "${IFACE}" ]]; then
+    IFACE="$(ip -o -4 addr show 2>/dev/null |
+      awk '$2 !~ /^(lo|docker|cni|flannel|weave|cali|veth|br-)/ && $4 !~ /^127\./ {print $2; exit}')"
+  fi
+
+  [[ -n "${IFACE}" ]] || die "Unable to determine a usable IPv4 interface for Calico"
   info "Calico IP autodetection interface: ${IFACE}"
 
+  info "Calico interface selected: ${IFACE} (MASTER_IP=${MASTER_IP})"
   echo -e "  ${CY}Downloading Calico ${CALICO_VERSION} manifest...${NC}"
   curl -fsSL \
     "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml" \

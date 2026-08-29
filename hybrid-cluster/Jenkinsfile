@@ -312,7 +312,16 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                      SETUP_USER='${params.SSH_USER}' \\
                      ENABLE_FIREWALL='${params.ENABLE_FIREWALL}' \\
                      DEBIAN_FRONTEND=noninteractive && \\
+              set +e
               sudo -E bash /tmp/01-linux-master-setup.sh
+              rc=$?
+              if [ "$rc" -eq 141 ]; then
+                echo "Bootstrap returned 141 (SIGPIPE); retrying once..."
+                sleep 2
+                sudo -E bash /tmp/01-linux-master-setup.sh
+                rc=$?
+              fi
+              exit "$rc" 
             """.stripIndent().trim()
 
             recordTiming(timings, 'master', tStart, System.currentTimeMillis())
@@ -403,7 +412,16 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                          SETUP_USER='${params.SSH_USER}' \
                          ENABLE_FIREWALL='${params.ENABLE_FIREWALL}' \
                          DEBIAN_FRONTEND=noninteractive && \
+                  set +e
                   sudo -E bash /tmp/02-linux-worker-setup.sh
+                  rc=$?
+                  if [ "$rc" -eq 141 ]; then
+                    echo "Worker bootstrap returned 141 (SIGPIPE); retrying once..."
+                    sleep 2
+                    sudo -E bash /tmp/02-linux-worker-setup.sh
+                    rc=$?
+                  fi
+                  exit "$rc" 
                 """.stripIndent().trim()
 
                 recordTiming(timings, "worker-${ip}", tStart, System.currentTimeMillis())
