@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  01-linux-master-setup.sh  —  Kubernetes Master Node Bootstrap
-#  Supports: ContainerD | CRI-O  x  Calico | Flannel CNI
+#  Supports: ContainerD | CRI-O  x  Calico | Flannel | Weave CNI
 #  k8s v1.32.x  |  Ubuntu 22/24 + Rocky/RHEL 8/9
 # =============================================================================
 set -euo pipefail
@@ -22,6 +22,7 @@ CY='\033[0;36m'; GR='\033[0;32m'; RD='\033[0;31m'; YL='\033[1;33m'; NC='\033[0m'
 step() { echo -e "\n  ${CY}[$1]${NC} $2\n  $(printf '%0.s-' {1..66})"; }
 ok()   { echo -e "  ${GR}[OK]${NC}   $*"; }
 info() { echo -e "  ${CY}[....${NC}  $*"; }
+warn() { echo -e "  ${YL}[WARN]${NC} $*"; }
 die()  { echo -e "  ${RD}[FAIL]${NC} $*" >&2; exit 1; }
 
 # ── APT non-interactive — fixes debconf dialog errors ────────────────────────
@@ -235,6 +236,17 @@ configure_containerd() {
 
   # Regenerate default config
   containerd config default > /etc/containerd/config.toml
+
+  # Kubernetes kubeadm expects an explicit CRI sandbox/pause image.
+  # Keep this pinned so kubeadm does not report an inconsistent/empty image.
+  if grep -q '^sandbox_image[[:space:]]*=' /etc/containerd/config.toml; then
+    sed -i 's|^[[:space:]]*sandbox_image[[:space:]]*=.*|    sandbox_image = "registry.k8s.io/pause:3.10"|' /etc/containerd/config.toml
+  elif grep -q '^\[plugins\."io.containerd.grpc.v1.cri"\]' /etc/containerd/config.toml; then
+    sed -i '/^\[plugins\."io.containerd.grpc.v1.cri"\]/a\    sandbox_image = "registry.k8s.io/pause:3.10"' /etc/containerd/config.toml
+  fi
+
+  grep -q 'sandbox_image = "registry.k8s.io/pause:3.10"' /etc/containerd/config.toml || \
+    die "Failed to configure containerd CRI sandbox image"
 
   # Enable systemd cgroup driver (required for Kubernetes)
   sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
