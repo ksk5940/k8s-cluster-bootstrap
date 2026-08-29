@@ -509,12 +509,14 @@ Monolithic bootstrap script:
 
 urlk8s-cluster-bootstrap.shhttps://github.com/ksk5940/k8s-cluster-bootstrap/blob/main/k8s-cluster-bootstrap.sh
 
-## License
-
-Add the repository's chosen license here if/when one is formally defined for the project.
 
 ## Disclaimer
 
 This script performs system-level changes including package installation, runtime configuration, kernel/sysctl configuration, networking, Kubernetes initialization, reset, upgrade, and destruction.
 
 Test changes on disposable/lab nodes before using them on production systems.
+
+## Script Credits
+
+**Sreekanth K**  
+**Lead DevSecOps and Site Reliability Engineer**
