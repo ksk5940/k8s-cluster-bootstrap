@@ -490,15 +490,7 @@ PYEOF
       die "containerd did not become ready after 30s. Check: journalctl -u containerd -n 100 --no-pager"
   done
 
-  # Confirm the CRI service is actually registered.
-  if containerd plugins 2>/dev/null |
-      grep -Eq 'io\.containerd\.(cri\.v1\.runtime|grpc\.v1\.cri|cri\.v1\.images)'; then
-    :
-  else
-    die "containerd is running but no CRI plugin is registered"
-  fi
-
-  ok "containerd ${CONTAINERD_VERSION} installed and configured (CRI + SystemdCgroup=true, sandbox=${PAUSE_IMAGE})"
+  ok "containerd ${CONTAINERD_VERSION} installed and configured (SystemdCgroup=true, sandbox=${PAUSE_IMAGE})"
 }
 configure_crio() {
   systemctl daemon-reload 2>/dev/null || true
@@ -614,24 +606,13 @@ RT_SOCK="${CRI_SOCKET#unix://}"
 
 ok "Selected CRI endpoint is ready: ${CRI_SOCKET}"
 
-# Final runtime/CRI validation immediately before any kubeadm join work.
-if [[ "${RUNTIME}" == "containerd" ]]; then
-  systemctl is-active --quiet containerd ||
-    die "containerd is not active before kubeadm join"
-  [[ -S /run/containerd/containerd.sock ]] ||
-    die "containerd socket is missing before kubeadm join"
-  containerd plugins 2>/dev/null |
-    grep -Eq 'io\.containerd\.(cri\.v1\.runtime|grpc\.v1\.cri|cri\.v1\.images)' ||
-    die "containerd is running but no CRI plugin is registered before kubeadm join"
-  ok "containerd CRI is ready before kubeadm join"
-elif [[ "${RUNTIME}" == "crio" ]]; then
-  systemctl is-active --quiet crio 2>/dev/null || systemctl is-active --quiet cri-o ||
-    die "CRI-O is not active before kubeadm join"
-  ok "CRI-O is ready before kubeadm join"
-fi
+# Runtime socket is checked here; actual CRI API validation happens after
+# cri-tools is installed below. This avoids containerd-version-specific plugin
+# list parsing.
+[[ -S "${RT_SOCK}" ]] || die "Selected runtime socket is unavailable: ${RT_SOCK}"
 
 # =============================================================================
-step "3/7" "Installing kubeadm / kubelet / kubectl  (v${K8S_VERSION})"
+step "3/7" "Installing kubeadm / kubelet / kubectl / cri-tools  (v${K8S_VERSION})"
 # =============================================================================
 
 K8S_MINOR="${K8S_VERSION%.*}"
@@ -654,7 +635,8 @@ install_k8s_apt() {
   apt-get install ${APT_OPTS} \
     kubelet="${K8S_VERSION}-*" \
     kubeadm="${K8S_VERSION}-*" \
-    kubectl="${K8S_VERSION}-*"
+    kubectl="${K8S_VERSION}-*" \
+    cri-tools
 
   apt-mark hold kubelet kubeadm kubectl
 }
@@ -672,7 +654,8 @@ EOF
   dnf install -y --disableexcludes=kubernetes \
     "kubelet-${K8S_VERSION}" \
     "kubeadm-${K8S_VERSION}" \
-    "kubectl-${K8S_VERSION}"
+    "kubectl-${K8S_VERSION}" \
+    cri-tools
 }
 
 if [[ "$PKG_MGR" == "apt" ]]; then
@@ -683,7 +666,27 @@ fi
 
 systemctl enable --now kubelet
 
-ok "kubeadm / kubelet / kubectl installed"
+ok "kubeadm / kubelet / kubectl / cri-tools installed"
+
+cat >/etc/crictl.yaml <<EOF
+runtime-endpoint: ${CRI_SOCKET}
+image-endpoint: ${CRI_SOCKET}
+timeout: 30
+debug: false
+EOF
+
+crictl --runtime-endpoint="${CRI_SOCKET}" \
+       --image-endpoint="${CRI_SOCKET}" \
+       info >/dev/null 2>&1 || {
+  echo "CRI validation failed. Runtime endpoint: ${CRI_SOCKET}" >&2
+  if [[ "${RUNTIME}" == "containerd" ]]; then
+    journalctl -u containerd -n 100 --no-pager >&2 || true
+  else
+    journalctl -u crio -n 100 --no-pager >&2 || journalctl -u cri-o -n 100 --no-pager >&2 || true
+  fi
+  die "CRI endpoint is not responding: ${CRI_SOCKET}"
+}
+ok "CRI endpoint verified with crictl: ${CRI_SOCKET}"
 
 # =============================================================================
 step "4/7" "Syncing system clock (prevents x509 TLS errors on join)"
@@ -944,12 +947,13 @@ ok "kubelet restarted successfully"
 [[ -S "${RT_SOCK}" ]] ||
   die "Selected runtime socket disappeared after kubelet restart: ${RT_SOCK}"
 
-if command -v crictl >/dev/null 2>&1; then
-  crictl --runtime-endpoint="${CRI_SOCKET}" \
-         --image-endpoint="${CRI_SOCKET}" \
-         info >/dev/null 2>&1 ||
-    die "CRI endpoint is not responding after worker bootstrap: ${CRI_SOCKET}"
-fi
+command -v crictl >/dev/null 2>&1 ||
+  die "crictl is not installed; cannot validate CRI after worker bootstrap"
+
+crictl --runtime-endpoint="${CRI_SOCKET}" \
+       --image-endpoint="${CRI_SOCKET}" \
+       info >/dev/null 2>&1 ||
+  die "CRI endpoint is not responding after worker bootstrap: ${CRI_SOCKET}"
 
 ok "Runtime and CRI endpoint remain healthy after worker configuration"
 

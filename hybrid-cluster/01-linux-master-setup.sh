@@ -428,15 +428,7 @@ PYEOF
       die "containerd did not become ready after 30s. Check: journalctl -u containerd -n 100 --no-pager"
   done
 
-  # Confirm the CRI service is actually registered.
-  if containerd plugins 2>/dev/null |
-      grep -Eq 'io\.containerd\.(cri\.v1\.runtime|grpc\.v1\.cri|cri\.v1\.images)'; then
-    :
-  else
-    die "containerd is running but no CRI plugin is registered"
-  fi
-
-  ok "containerd ${CONTAINERD_VERSION} installed and configured (CRI + SystemdCgroup=true, sandbox=${PAUSE_IMAGE})"
+  ok "containerd ${CONTAINERD_VERSION} installed and configured (SystemdCgroup=true, sandbox=${PAUSE_IMAGE})"
 }
 configure_crio() {
   # CRI-O normally installs crio.service. Some package builds expose the
@@ -563,7 +555,8 @@ install_k8s_apt() {
   apt-get install ${APT_OPTS} \
     kubelet="${K8S_VERSION}-*" \
     kubeadm="${K8S_VERSION}-*" \
-    kubectl="${K8S_VERSION}-*"
+    kubectl="${K8S_VERSION}-*" \
+    cri-tools
   apt-mark hold kubelet kubeadm kubectl
 }
 
@@ -577,13 +570,35 @@ gpgkey=https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/rpm/repodata/repomd.xml.k
 exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
 EOF
   dnf install -y --disableexcludes=kubernetes \
-    "kubelet-${K8S_VERSION}" "kubeadm-${K8S_VERSION}" "kubectl-${K8S_VERSION}"
+    "kubelet-${K8S_VERSION}" "kubeadm-${K8S_VERSION}" "kubectl-${K8S_VERSION}" cri-tools
   dnf versionlock add kubelet kubeadm kubectl 2>/dev/null || true
 }
 
 if [[ "$PKG_MGR" == "apt" ]]; then install_k8s_apt; else install_k8s_dnf; fi
 systemctl enable --now kubelet
-ok "kubeadm / kubelet / kubectl installed and pinned"
+ok "kubeadm / kubelet / kubectl / cri-tools installed and pinned"
+
+# Validate the CRI by making a real CRI request. Do not infer CRI health
+# from containerd's plugin-list formatting, which differs across containerd 1.x/2.x.
+cat >/etc/crictl.yaml <<EOF
+runtime-endpoint: ${CRI_SOCKET}
+image-endpoint: ${CRI_SOCKET}
+timeout: 30
+debug: false
+EOF
+
+crictl --runtime-endpoint="${CRI_SOCKET}" \
+       --image-endpoint="${CRI_SOCKET}" \
+       info >/dev/null 2>&1 || {
+  echo "CRI validation failed. Runtime endpoint: ${CRI_SOCKET}" >&2
+  if [[ "${RUNTIME}" == "containerd" ]]; then
+    journalctl -u containerd -n 100 --no-pager >&2 || true
+  else
+    journalctl -u crio -n 100 --no-pager >&2 || journalctl -u cri-o -n 100 --no-pager >&2 || true
+  fi
+  die "CRI endpoint is not responding: ${CRI_SOCKET}"
+}
+ok "CRI endpoint verified with crictl: ${CRI_SOCKET}"
 
 # =============================================================================
 step "4/9" "kubeadm init"
