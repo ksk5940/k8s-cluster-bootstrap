@@ -389,14 +389,65 @@ eval "${JOIN_COMMAND} --cri-socket ${CRI_SOCKET}"
 ok "Node joined cluster"
 
 # =============================================================================
-step "6/7" "Configuring kubelet node IP"
+step "6/7" "Configuring kubelet node IP and DNS"
 # =============================================================================
 
-mkdir -p /etc/default
-echo "KUBELET_EXTRA_ARGS=--node-ip=${NODE_IP}" >/etc/default/kubelet
+# kubelet drop-in location differs by distro:
+#   Debian/Ubuntu → /etc/default/kubelet
+#   RHEL/Rocky   → /etc/sysconfig/kubelet
+
+case "${PKG_MGR}" in
+    apt)
+        KUBELET_ENV_FILE="/etc/default/kubelet"
+        ;;
+    dnf)
+        KUBELET_ENV_FILE="/etc/sysconfig/kubelet"
+        ;;
+    *)
+        die "Unsupported package manager for kubelet configuration: ${PKG_MGR}"
+        ;;
+esac
+
+mkdir -p "$(dirname "${KUBELET_ENV_FILE}")"
+
+cat > "${KUBELET_ENV_FILE}" <<EOF
+KUBELET_EXTRA_ARGS=--node-ip=${NODE_IP}
+EOF
+
+ok "kubelet node-ip configured: ${NODE_IP}"
+ok "kubelet environment file: ${KUBELET_ENV_FILE}"
+
+# kubeadm may inherit a resolver path from the control-plane OS.
+# Make the resolver path valid for this worker's OS.
+if [[ -f /run/systemd/resolve/resolv.conf ]]; then
+    KUBELET_RESOLV_CONF="/run/systemd/resolve/resolv.conf"
+elif [[ -f /etc/resolv.conf ]]; then
+    KUBELET_RESOLV_CONF="/etc/resolv.conf"
+else
+    die "No usable DNS resolver configuration found"
+fi
+
+if [[ -f /var/lib/kubelet/config.yaml ]]; then
+    if grep -qE '^[[:space:]]*resolvConf:' /var/lib/kubelet/config.yaml; then
+        sed -i \
+            "s|^[[:space:]]*resolvConf:.*|resolvConf: ${KUBELET_RESOLV_CONF}|" \
+            /var/lib/kubelet/config.yaml
+    else
+        cat >> /var/lib/kubelet/config.yaml <<EOF
+
+resolvConf: ${KUBELET_RESOLV_CONF}
+EOF
+    fi
+else
+    die "Kubelet config not found: /var/lib/kubelet/config.yaml"
+fi
+
+ok "kubelet DNS resolver configured: ${KUBELET_RESOLV_CONF}"
+
 systemctl daemon-reload
 systemctl restart kubelet
-ok "kubelet node-ip set to ${NODE_IP}"
+
+ok "kubelet restarted successfully"
 
 # =============================================================================
 step "7/7" "Done"
