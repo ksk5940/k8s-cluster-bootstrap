@@ -3078,6 +3078,26 @@ _del_tunnel() {
 # anonymous bind-mounts under /var/run/netns/ that containerd creates.
 # Once released the kernel drops its reference to the veth peer, making
 # the host-side cali* interface deletable.
+# Unmount Calico's cgroup tree before removing its directory.  cgroup files
+# are virtual kernel-managed entries and cannot be deleted with rm -rf.
+_unmount_mount_tree() {
+  local _root="$1" _mnt
+  [[ -e "$_root" ]] || return 0
+  if command -v findmnt &>/dev/null; then
+    while IFS= read -r _mnt; do
+      [[ -n "$_mnt" ]] || continue
+      umount "$_mnt" 2>/dev/null || umount -l "$_mnt" 2>/dev/null || true
+    done < <(findmnt -Rno TARGET -- "$_root" 2>/dev/null | awk 'NF' | sort -r)
+  else
+    umount "$_root" 2>/dev/null || umount -l "$_root" 2>/dev/null || true
+  fi
+}
+
+_unmount_calico_cgroup() {
+  _unmount_mount_tree /var/run/calico/cgroup
+  _unmount_mount_tree /run/calico/cgroup
+}
+
 _cleanup_namespaces() {
   local _f _ns
 
@@ -3256,8 +3276,8 @@ run_reset() {
     fi
   fi
 
+  _unmount_calico_cgroup
   rm -rf /etc/kubernetes /var/lib/kubelet /var/run/kubernetes
-  umount -l /run/calico/cgroup 2>/dev/null || true
   for _mnt in $(mount 2>/dev/null       | awk '{print $3}'       | grep -E '^/run/containerd/io\.containerd\.runtime|^/run/crio/[a-f0-9]|^/var/lib/kubelet/pods'       | sort -r); do
     umount -l "$_mnt" 2>/dev/null || true
   done
@@ -3283,7 +3303,8 @@ run_reset() {
   _cleanup_namespaces
   _cleanup_cni_interfaces
   _cleanup_iptables_kube
-  rm -rf /etc/cni/net.d /var/lib/cni /var/lib/calico          /run/flannel /run/calico /run/nodeagent /run/netns
+  _unmount_calico_cgroup
+  rm -rf /etc/cni/net.d /var/lib/cni /var/lib/calico /run/flannel /run/calico /run/nodeagent
   rm -rf /run/crio 2>/dev/null || true
   echo -e "${GREEN}  ✓ CNI network state cleaned${NC}"
 
@@ -3687,12 +3708,12 @@ run_destroy() {
   fi
 
   echo -e "${CYAN}    Unmounting runtime mounts (shm/rootfs/cgroup)...${NC}"
-  umount -l /run/calico/cgroup 2>/dev/null || true
+  _unmount_calico_cgroup
   for _mnt in $(mount 2>/dev/null       | awk '{print $3}'       | grep -E '^/run/containerd|^/run/crio|^/run/calico/cgroup|^/var/lib/kubelet/pods|^/var/lib/containers'       | sort -r); do
     umount -l "$_mnt" 2>/dev/null || true
   done
 
-  rm -rf     /etc/kubernetes    /var/lib/kubelet    /var/run/kubernetes     /etc/containerd    /var/lib/containerd /run/containerd         /etc/crio          /var/lib/crio       /var/lib/containers /run/crio     /var/cache/containers     /etc/cni           /opt/cni            /var/lib/cni        /run/flannel     /run/calico        /run/nodeagent      /run/netns
+  rm -rf     /etc/kubernetes    /var/lib/kubelet    /var/run/kubernetes     /etc/containerd    /var/lib/containerd /run/containerd         /etc/crio          /var/lib/crio       /var/lib/containers /run/crio     /var/cache/containers     /etc/cni           /opt/cni            /var/lib/cni        /run/flannel     /run/calico        /run/nodeagent
 
   if [[ "$PKG_MANAGER" == "dnf" ]]; then
     local _DOCKER_GPGKEY
