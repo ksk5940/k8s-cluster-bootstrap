@@ -83,9 +83,48 @@ run_bounded() {
 
 remove_path() {
     local p="$1"
+
+    if [[ ! -e "$p" && ! -L "$p" ]]; then
+        return 0
+    fi
+
+    # Calico can leave a cgroup filesystem mounted below /var/run/calico.
+    # rm --one-file-system intentionally refuses to cross such a mount and
+    # returns status 1. Discover mounts only under the path being removed and
+    # lazy-unmount them deepest-first before deleting the directory.
+    if have_cmd findmnt && have_cmd umount; then
+        local mounts
+        mounts="$(findmnt -R -n -o TARGET -- "$p" 2>/dev/null || true)"
+
+        if [[ -n "$mounts" ]]; then
+            while IFS= read -r mountpoint; do
+                [[ -n "$mountpoint" ]] || continue
+                info "Unmounting nested filesystem: $mountpoint"
+                umount -l -- "$mountpoint" >/dev/null 2>&1 ||                     warn "Could not unmount $mountpoint; continuing cleanup"
+            done < <(
+                printf '%s\n' "$mounts" |
+                    awk '{print length, $0}' |
+                    sort -rn |
+                    cut -d' ' -f2-
+            )
+        fi
+    fi
+
+    # Handle the race where the target itself is still mounted.
+    if have_cmd mountpoint && mountpoint -q -- "$p" 2>/dev/null; then
+        info "Unmounting filesystem mounted at: $p"
+        umount -l -- "$p" >/dev/null 2>&1 ||             warn "Could not unmount $p; continuing cleanup"
+    fi
+
     if [[ -e "$p" || -L "$p" ]]; then
-        rm -rf --one-file-system "$p"
-        del "$p"
+        if rm -rf --one-file-system "$p"; then
+            del "$p"
+        else
+            if have_cmd findmnt && findmnt -R -n -- "$p" >/dev/null 2>&1; then
+                die "Unable to remove mounted path: $p"
+            fi
+            die "Failed to remove path: $p"
+        fi
     fi
 }
 
