@@ -464,6 +464,14 @@ case "$CNI_PLUGIN" in
         ;;
     calico)
         remove_path /var/lib/cni/calico
+        # Calico commonly leaves this cgroup filesystem mounted.
+        # Unmount only this known Calico path; never perform a blanket unmount.
+        if have_cmd mountpoint && mountpoint -q /var/run/calico/cgroup 2>/dev/null; then
+            info "Unmounting Calico cgroup filesystem: /var/run/calico/cgroup"
+            umount -l /var/run/calico/cgroup >/dev/null 2>&1 || \
+                warn "Calico cgroup unmount returned non-zero; continuing"
+        fi
+
         remove_path /var/run/calico
         remove_path /var/lib/calico
         ;;
