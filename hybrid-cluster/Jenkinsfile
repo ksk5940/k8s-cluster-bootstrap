@@ -145,10 +145,14 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
 
           if (!params.MASTER_IP?.trim())  error('MASTER_IP is required')
           if (!params.WORKER_IPS?.trim()) error('WORKER_IPS is required')
-          if (!params.K8S_VERSION?.trim()) error('K8S_VERSION is required')
 
-          if (!(params.K8S_VERSION ==~ /\d+\.\d+\.\d+/)) {
-            error("K8S_VERSION must be in format MAJOR.MINOR.PATCH (e.g. 1.32.3)")
+          if (params.ACTION in ['bootstrap', 'reset', 'upgrade']) {
+            if (!params.K8S_VERSION?.trim()) {
+              error('K8S_VERSION is required for bootstrap/reset/upgrade')
+            }
+            if (!(params.K8S_VERSION ==~ /\d+\.\d+\.\d+/)) {
+              error("K8S_VERSION must be in format MAJOR.MINOR.PATCH (e.g. 1.32.3)")
+            }
           }
         }
       }
@@ -185,7 +189,11 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
 
     // ── 1b. Optional: Set Static IP + Hostname ────────────────────────────────
     stage('Set Static IP and Hostname') {
-      when { expression { params.SET_STATIC_IP } }
+      when {
+        expression {
+          params.SET_STATIC_IP && params.ACTION in ['bootstrap', 'reset']
+        }
+      }
       steps {
         withCredentials([usernamePassword(
             credentialsId: params.SSH_CREDS_ID,
@@ -296,6 +304,9 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
             if (!joinCommand.startsWith("kubeadm join ")) {
               error("Invalid kubeadm join command received from master")
             }
+            if (joinCommand.contains("\n") || joinCommand.contains("\r")) {
+              error("Join command contains unexpected newline characters")
+            }
 
             def joinFile = "${env.WORKSPACE}/.k8s-join-command.sh"
 
@@ -375,6 +386,10 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                                 user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
             def localValidate = "${env.WORKSPACE}/${SCRIPT_DIR}/07-validate.sh"
 
+            if (!fileExists(localValidate)) {
+              error("Validation script not found: ${localValidate}")
+            }
+
             sshPut remote: masterRemote, from: localValidate, into: '/tmp/07-validate.sh'
             sshCommand remote: masterRemote, command: """
               sed -i 's/\\r//' /tmp/07-validate.sh && \\
@@ -449,7 +464,19 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
               def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
                                   user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
               def raw = sshCommand remote: masterRemote,
-                command: "sudo kubectl version --short 2>/dev/null | grep 'Server Version' | grep -oP '\\d+\\.\\d+\\.\\d+' || kubelet --version 2>/dev/null | grep -oP '\\d+\\.\\d+\\.\\d+' | head -1"
+                command: '''
+                  set -o pipefail
+                  v=$(sudo kubectl version -o json 2>/dev/null |
+                      grep -oP '"gitVersion"\\s*:\\s*"v\\K\\d+\\.\\d+\\.\\d+"' |
+                      head -1) || true
+                  if [ -n "$v" ]; then
+                    printf '%s\\n' "$v"
+                  else
+                    kubelet --version 2>/dev/null |
+                      grep -oP '\\d+\\.\\d+\\.\\d+' |
+                      head -1
+                  fi
+                '''.stripIndent().trim()
               env.CURRENT_K8S_VERSION = raw.trim()
               echo "Auto-detected current version: ${env.CURRENT_K8S_VERSION}"
             }
@@ -483,6 +510,10 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
             }
             env.UPGRADE_PATH = hops.join(',')
             echo "Multi-step upgrade path: ${from} → ${hops.join(' → ')}"
+          }
+
+          if (!env.UPGRADE_PATH?.trim()) {
+            error("Upgrade path is empty; refusing to run upgrade")
           }
         }
       }
@@ -557,7 +588,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
       script {
         sh("rm -f -- '${env.WORKSPACE}/.k8s-join-command.sh' 2>/dev/null || true")
         def pipeEnd   = System.currentTimeMillis()
-        def totalMs   = pipeEnd - pipeStart
+        def totalMs   = (pipeStart > 0L) ? (pipeEnd - pipeStart) : 0L
 
         def fmtDur = { long ms ->
           if (ms <= 0) return 'N/A'
