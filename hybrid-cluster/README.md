@@ -465,6 +465,150 @@ BOOTSTRAP TIMING SUMMARY
 
 ---
 
+## Jenkins Job: Parameters to Pass
+
+After creating the Jenkins Pipeline job, use **Build with Parameters**.
+
+### Bootstrap — required values
+
+For a normal 3-node cluster, use:
+
+| Parameter | Value |
+|---|---|
+| `ACTION` | `bootstrap` |
+| `MASTER_IP` | `192.168.56.11` |
+| `WORKER_IPS` | `192.168.56.12,192.168.56.13` |
+| `SSH_USER` | `k8sadmin` |
+| `SSH_CREDS_ID` | `K8S_SSH_CREDS` |
+| `RUNTIME` | `containerd` |
+| `CNI_PLUGIN` | `calico` |
+| `K8S_VERSION` | `1.32.3` |
+| `K8S_CURRENT_VERSION` | leave blank |
+| `POD_CIDR` | `10.244.0.0/16` |
+| `SET_STATIC_IP` | `false` |
+
+If the nodes already have the correct static IP addresses and hostnames, keep `SET_STATIC_IP=false`.
+
+If Jenkins should configure the node IP/hostname before bootstrap, set:
+
+```text
+SET_STATIC_IP=true
+```
+
+and make sure the Jenkinsfile contains the corresponding static-IP configuration for every node.
+
+### Destroy
+
+For a complete teardown:
+
+| Parameter | Value |
+|---|---|
+| `ACTION` | `destroy` |
+| `MASTER_IP` | `192.168.56.11` |
+| `WORKER_IPS` | `192.168.56.12,192.168.56.13` |
+| `SSH_USER` | `k8sadmin` |
+| `SSH_CREDS_ID` | `K8S_SSH_CREDS` |
+| `RUNTIME` | **the runtime actually installed on the cluster** |
+| `CNI_PLUGIN` | **the CNI actually installed** |
+| `K8S_VERSION` | can remain at the job default |
+| `K8S_CURRENT_VERSION` | leave blank |
+| `POD_CIDR` | can remain at the job default |
+| `SET_STATIC_IP` | `false` |
+
+**Important:** `RUNTIME` is significant for destroy. If the cluster uses `containerd`, select `containerd`; if it uses CRI-O, select `crio`.
+
+The updated destroy script is runtime-aware: it removes only the selected runtime and does not blindly delete the other runtime's data. In particular, a `containerd` destroy does not remove `/var/lib/containers`, which can be shared by Podman/Buildah/CRI-O.
+
+### Reset
+
+For a clean rebuild:
+
+| Parameter | Value |
+|---|---|
+| `ACTION` | `reset` |
+| `MASTER_IP` | `192.168.56.11` |
+| `WORKER_IPS` | `192.168.56.12,192.168.56.13` |
+| `SSH_USER` | `k8sadmin` |
+| `SSH_CREDS_ID` | `K8S_SSH_CREDS` |
+| `RUNTIME` | `containerd` |
+| `CNI_PLUGIN` | `calico` |
+| `K8S_VERSION` | `1.32.3` |
+| `K8S_CURRENT_VERSION` | leave blank |
+| `POD_CIDR` | `10.244.0.0/16` |
+| `SET_STATIC_IP` | `false` |
+
+Reset performs the teardown/rebuild workflow, so verify the target IPs before starting it.
+
+### Upgrade
+
+For an upgrade:
+
+| Parameter | Value |
+|---|---|
+| `ACTION` | `upgrade` |
+| `MASTER_IP` | `192.168.56.11` |
+| `WORKER_IPS` | `192.168.56.12,192.168.56.13` |
+| `SSH_USER` | `k8sadmin` |
+| `SSH_CREDS_ID` | `K8S_SSH_CREDS` |
+| `RUNTIME` | current runtime |
+| `CNI_PLUGIN` | current CNI |
+| `K8S_VERSION` | target version, e.g. `1.32.3` |
+| `K8S_CURRENT_VERSION` | current version, or leave blank for auto-detection |
+| `POD_CIDR` | existing pod CIDR |
+| `SET_STATIC_IP` | `false` |
+
+Example:
+
+```text
+Current cluster: 1.30.5
+Target:          1.32.3
+
+K8S_CURRENT_VERSION=1.30.5
+K8S_VERSION=1.32.3
+```
+
+The pipeline should perform the upgrade one minor version at a time rather than attempting to skip directly across unsupported minor-version gaps.
+
+### Minimum parameters you normally change
+
+For your normal lab cluster, you generally only need to verify/change:
+
+```text
+ACTION
+MASTER_IP
+WORKER_IPS
+RUNTIME
+CNI_PLUGIN
+K8S_VERSION
+```
+
+Keep these unchanged unless your environment requires otherwise:
+
+```text
+SSH_USER=k8sadmin
+SSH_CREDS_ID=K8S_SSH_CREDS
+POD_CIDR=10.244.0.0/16
+SET_STATIC_IP=false
+```
+
+### Before clicking Build
+
+Confirm:
+
+```text
+[ ] Master IP is correct
+[ ] Every worker IP is correct
+[ ] All nodes are reachable from Jenkins
+[ ] k8sadmin exists on every node
+[ ] k8sadmin has passwordless sudo
+[ ] K8S_SSH_CREDS exists in Jenkins
+[ ] RUNTIME matches the cluster
+[ ] CNI_PLUGIN matches the cluster
+[ ] K8S_VERSION is the intended target
+```
+
+For `bootstrap`, workers are provisioned in parallel according to the pipeline design. For `destroy`, nodes are also processed in parallel; each node runs its own runtime-aware teardown.
+
 ## 12. Pipeline Actions Explained
 
 ### `bootstrap`
@@ -485,7 +629,7 @@ Provisions a complete Kubernetes cluster from scratch:
 Completely wipes Kubernetes from every node (all nodes in parallel):
 
 - `kubeadm reset -f` with CRI socket
-- Remove: kubelet, kubeadm, kubectl, containerd/crio packages
+- Remove: kubelet, kubeadm, kubectl, and the selected container runtime
 - Remove: all CNI network interfaces and iptables rules
 - Remove: all repos, keyrings, systemd units, data directories, logs, temp files
 - Remove: kubeconfig files for all users
@@ -783,3 +927,250 @@ Plan static IPs before running anything. All IPs must be on the same subnet and 
 - The kubeadm join token expires after **24 hours**. Re-running bootstrap always generates a fresh token.
 - Credentials are never written to disk during a Jenkins run — they are injected via `withCredentials` and exist only in the remote shell environment for the duration of the SSH session.
 - The `k8sadmin` NOPASSWD sudo grant uses `ALL=(ALL)` for simplicity. In production, restrict it to: `kubeadm`, `kubelet`, `apt-get`/`dnf`, `systemctl`, `bash /tmp/0*.sh`.
+
+
+## 15. Architecture Design
+
+### High-Level Architecture
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           JENKINS SERVER                                     │
+│                                                                              │
+│  Jenkinsfile  ────────►  Pipeline Engine  ◄────────  K8S_SSH_CREDS         │
+│       │                         │                              │              │
+│       └────────────── GitHub Repository ──────────────────────┘              │
+└──────────────────────────────────┬───────────────────────────────────────────┘
+                                   │
+                                   │ 1. Pre-flight
+                                   │    Validate inputs / SSH / sudo / OS
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         CONTROL PLANE / MASTER                              │
+│                              192.168.56.11                                   │
+│                                                                              │
+│   OS Preparation → Runtime → kubeadm init → CNI → Readiness Validation      │
+│                                          │                                   │
+│                                          ▼                                   │
+│                              Secure Join Command                             │
+└──────────────────────────────────┬───────────────────────────────────────────┘
+                                   │
+                                   │ 2. Master Ready
+                                   │    Join command available
+                                   │
+                 ┌─────────────────┴─────────────────┐
+                 │                                   │
+                 │       3. WORKER PROVISIONING     │
+                 │            PARALLEL               │
+                 │                                   │
+        ┌────────▼─────────┐               ┌────────▼─────────┐
+        │     WORKER 1     │               │     WORKER 2     │
+        │   192.168.56.12  │               │   192.168.56.13  │
+        │                  │               │                  │
+        │ Runtime          │               │ Runtime          │
+        │ Kubernetes       │               │ Kubernetes       │
+        │ kubelet          │               │ kubelet          │
+        │ kube-proxy       │               │ kube-proxy       │
+        │ CNI              │               │ CNI              │
+        │ kubeadm join     │               │ kubeadm join     │
+        │       │          │               │       │          │
+        │       ▼          │               │       ▼          │
+        │  Node Ready      │               │  Node Ready      │
+        └────────┬─────────┘               └────────┬─────────┘
+                 │                                   │
+                 └─────────────────┬─────────────────┘
+                                   │
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     4. FINAL READINESS GATE                                  │
+│                                                                              │
+│  ✓ Every expected node is Ready                                             │
+│  ✓ CNI pods are Running / Ready                                             │
+│  ✓ CoreDNS is Running / Ready                                               │
+│  ✓ kube-proxy is Running / Ready                                            │
+│  ✓ Required system pods are Running / Ready                                │
+│  ✓ Pod/network connectivity checks pass                                    │
+│  ✓ DNS resolution checks pass                                               │
+└──────────────────────────────────┬───────────────────────────────────────────┘
+                                   │
+                                   ▼
+                         ┌─────────────────────┐
+                         │  CLUSTER SUCCESS    │
+                         │                     │
+                         │  Healthy + Ready    │
+                         └─────────────────────┘
+```
+
+### Jenkins Pipeline Flow
+
+```text
+                         ┌──────────────────────┐
+                         │   Build with Params  │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │   Pre-flight Checks  │
+                         │                      │
+                         │ Inputs / SSH / Sudo  │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │  Provision Master    │
+                         │                      │
+                         │ Runtime + kubeadm    │
+                         │ CNI + Control Plane  │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │  Master Ready Gate   │
+                         │                      │
+                         │ CNI + CoreDNS +      │
+                         │ kube-proxy healthy   │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │ Extract Join Command │
+                         └──────────┬───────────┘
+                                    │
+                     ┌──────────────┼──────────────┐
+                     │              │              │
+                     ▼              ▼              ▼
+                ┌─────────┐    ┌─────────┐    ┌─────────┐
+                │Worker 1 │    │Worker 2 │    │Worker N │
+                │ PARALLEL│    │ PARALLEL│    │ PARALLEL│
+                └────┬────┘    └────┬────┘    └────┬────┘
+                     │              │              │
+                     └──────────────┼──────────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │  Worker Ready Gate   │
+                         │                      │
+                         │ Every expected node  │
+                         │ must become Ready    │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │  Pod Readiness Gate  │
+                         │                      │
+                         │ All required pods   │
+                         │ Running + Ready     │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │ Final Validation     │
+                         │                      │
+                         │ DNS / Network / API  │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │       SUCCESS        │
+                         └──────────────────────┘
+```
+
+### Lifecycle Actions
+
+```text
+┌──────────────┐
+│   bootstrap  │
+└──────┬───────┘
+       │
+       ▼
+  Create Cluster
+       │
+       ├──────────────► Master first
+       │
+       └──────────────► Workers in PARALLEL
+                              │
+                              ▼
+                       Final Readiness Gate
+
+
+┌──────────────┐
+│    destroy   │
+└──────┬───────┘
+       │
+       ▼
+  Teardown Cluster
+       │
+       ├──────────────► Master
+       │
+       └──────────────► Workers in PARALLEL
+
+
+┌──────────────┐
+│     reset    │
+└──────┬───────┘
+       │
+       ▼
+    Destroy
+       │
+       ▼
+    Bootstrap
+
+
+┌──────────────┐
+│    upgrade   │
+└──────┬───────┘
+       │
+       ▼
+ Upgrade Master
+       │
+       ▼
+ Upgrade Workers
+     PARALLEL
+       │
+       ▼
+ Final Validation
+```
+
+### Component Responsibilities
+
+| Component | Responsibility |
+|---|---|
+| **Jenkins** | Orchestrates the Kubernetes lifecycle |
+| **GitHub** | Stores the Jenkinsfile and automation scripts |
+| **Jenkins Credentials** | Provides protected SSH credentials |
+| **Master / Control Plane** | Runs Kubernetes control-plane components |
+| **Worker Nodes** | Run Kubernetes workloads |
+| **kubeadm** | Initializes the control plane and joins workers |
+| **containerd / CRI-O** | Provides the container runtime |
+| **Calico / Flannel / Weave** | Provides CNI networking |
+| **kubelet** | Manages pods on each node |
+| **kube-proxy** | Provides Kubernetes service networking |
+| **CoreDNS** | Provides cluster DNS |
+| **etcd** | Stores Kubernetes cluster state |
+
+### Success Criteria
+
+Jenkins should report **SUCCESS only after the final readiness checks pass**:
+
+```text
+✓ Master / control plane healthy
+✓ All expected worker nodes joined
+✓ All expected nodes Ready
+✓ CNI healthy
+✓ CoreDNS healthy
+✓ kube-proxy healthy
+✓ Required system pods Running and Ready
+✓ Network connectivity checks passed
+✓ DNS checks passed
+✓ Final cluster validation passed
+```
+
+> **Jenkins SUCCESS means the cluster passed the health gates. It does not merely mean that the installation commands exited successfully.**
+
+---
+
+## Script Credits
+
+**Sreekanth K**  
+**Lead DevSecOps and Site Reliability Engineer**
+
