@@ -14,6 +14,7 @@
 #   - Removes the SELECTED CNI state.
 #   - Preserves the alternate runtime and its data.
 #   - Does NOT perform blanket orphan/dependency cleanup.
+#   - Does NOT remove conntrack/conntrack-tools as an orphan dependency.
 #   - Preserves host dependencies such as conntrack unless explicitly part
 #     of the selected Kubernetes/runtime installation.
 #
@@ -208,11 +209,70 @@ echo ""
 echo -e "  ${CYAN}[3/11]${NC} Remove Kubernetes packages"
 echo "------------------------------------------------------------------"
 
-# These are explicit Kubernetes packages. No autoremove.
-remove_packages \
-    kubeadm kubelet kubectl cri-tools kubernetes-cni
+if [[ "$PM" == "apt" ]]; then
+    # IMPORTANT:
+    # kubeadm -> cri-tools
+    # kubelet -> kubernetes-cni
+    #
+    # Removing cri-tools/kubernetes-cni first causes apt's dependency resolver
+    # to reject the transaction while kubeadm/kubelet are still installed.
+    #
+    # Remove the Kubernetes package set in ONE transaction. This allows apt
+    # to resolve the dependency graph correctly while avoiding a blanket
+    # autoremove of unrelated host software.
+    apt-get update -qq >/dev/null 2>&1 || true
 
-ok "Kubernetes packages cleaned"
+    # Kubernetes packages may have been held by the bootstrap.
+    apt-mark unhold kubeadm kubelet kubectl cri-tools kubernetes-cni \
+        >/dev/null 2>&1 || true
+
+    APT_K8S_PKGS=()
+    for p in kubeadm kubelet kubectl cri-tools kubernetes-cni; do
+        if dpkg-query -W -f='${Status}' "$p" 2>/dev/null |
+            grep -q 'install ok installed'; then
+            APT_K8S_PKGS+=("$p")
+        fi
+    done
+
+    if ((${#APT_K8S_PKGS[@]})); then
+        info "Removing Kubernetes package set: ${APT_K8S_PKGS[*]}"
+
+        # Explicitly remove only Kubernetes packages.
+        # --allow-change-held-packages is harmless after apt-mark unhold and
+        # protects against package-state leftovers from older bootstrap runs.
+        DEBIAN_FRONTEND=noninteractive \
+            apt-get -y \
+            --allow-change-held-packages \
+            remove "${APT_K8S_PKGS[@]}"
+    else
+        info "No installed Kubernetes packages found"
+    fi
+
+    # Only now are Kubernetes dependencies eligible to be orphaned.
+    # Do NOT use autoremove: it can remove unrelated host packages such as
+    # conntrack. If a package is required by something else it remains.
+    ok "Kubernetes packages cleaned; host dependencies preserved"
+
+else
+    # RPM-based systems: remove the Kubernetes package set explicitly.
+    # Do not use a blanket autoremove/clean-dependencies operation.
+    RPM_K8S_PKGS=()
+    for p in kubeadm kubelet kubectl cri-tools kubernetes-cni; do
+        if rpm -q "$p" >/dev/null 2>&1; then
+            RPM_K8S_PKGS+=("$p")
+        fi
+    done
+
+    if ((${#RPM_K8S_PKGS[@]})); then
+        info "Removing Kubernetes package set: ${RPM_K8S_PKGS[*]}"
+        dnf -y --noautoremove remove "${RPM_K8S_PKGS[@]}" 2>/dev/null ||
+            dnf -y remove "${RPM_K8S_PKGS[@]}"
+    else
+        info "No installed Kubernetes packages found"
+    fi
+
+    ok "Kubernetes packages cleaned; host dependencies preserved"
+fi
 
 # -----------------------------------------------------------------------------
 # [4/11] Remove SELECTED runtime only
@@ -472,6 +532,30 @@ fi
 # Ensure Kubernetes state is gone.
 [[ ! -d /etc/kubernetes ]] || die "/etc/kubernetes still exists"
 [[ ! -d /var/lib/kubelet ]] || die "/var/lib/kubelet still exists"
+
+# Final package verification. Do not treat unrelated packages as failures.
+if [[ "$PM" == "apt" ]]; then
+    remaining_k8s=()
+    for p in kubeadm kubelet kubectl cri-tools kubernetes-cni; do
+        if dpkg-query -W -f='${Status}' "$p" 2>/dev/null |
+            grep -q 'install ok installed'; then
+            remaining_k8s+=("$p")
+        fi
+    done
+    if ((${#remaining_k8s[@]})); then
+        die "Kubernetes packages still installed: ${remaining_k8s[*]}"
+    fi
+else
+    remaining_k8s=()
+    for p in kubeadm kubelet kubectl cri-tools kubernetes-cni; do
+        if rpm -q "$p" >/dev/null 2>&1; then
+            remaining_k8s+=("$p")
+        fi
+    done
+    if ((${#remaining_k8s[@]})); then
+        die "Kubernetes packages still installed: ${remaining_k8s[*]}"
+    fi
+fi
 
 echo ""
 echo -e "  ${GREEN}+================================================================+${NC}"
