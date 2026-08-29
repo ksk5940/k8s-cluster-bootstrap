@@ -67,6 +67,20 @@ esac
 # -----------------------------------------------------------------------------
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+run_bounded() {
+    local seconds="$1"
+    shift
+
+    if have_cmd timeout; then
+        timeout "${seconds}s" "$@" || return $?
+    else
+        # Coreutils timeout is expected on supported Ubuntu/Rocky hosts.
+        # If unavailable, run the command normally rather than aborting the
+        # entire destroy because of the helper itself.
+        "$@"
+    fi
+}
+
 remove_path() {
     local p="$1"
     if [[ -e "$p" || -L "$p" ]]; then
@@ -448,40 +462,108 @@ echo ""
 echo -e "  ${CYAN}[9/11]${NC} Remove Kubernetes/CNI firewall state · IPVS · pod routes"
 echo "------------------------------------------------------------------"
 
-# Remove only Kubernetes/CNI chains where possible.
+# IMPORTANT:
+# Never use an unbounded while-loop around iptables output here.
+# On some iptables/nft combinations, a rule can remain visible after a delete
+# attempt and cause an endless loop. Jenkins must never hang in destroy.
+#
+# This cleanup is intentionally:
+#   1. bounded
+#   2. best-effort
+#   3. limited to Kubernetes chains/rules
+#   4. never a full firewall flush
+
+iptables_delete_rule() {
+    local table="$1"
+    local rule="$2"
+
+    run_bounded 5 iptables -w 3 -t "$table" $rule >/dev/null 2>&1 || true
+}
+
+iptables_cleanup_table() {
+    local table="$1"
+    local rules
+    local rule
+
+    # Take ONE snapshot. Do not continuously re-query the table.
+    rules="$(run_bounded 5 iptables -w 3 -t "$table" -S 2>/dev/null |
+        grep -E '^-A .*KUBE-' || true)"
+
+    if [[ -n "$rules" ]]; then
+        while IFS= read -r rule; do
+            [[ -z "$rule" ]] && continue
+
+            # Convert:
+            #   -A CHAIN ...
+            # to:
+            #   -D CHAIN ...
+            rule="${rule/#-A /-D }"
+
+            iptables_delete_rule "$table" "$rule"
+        done <<< "$rules"
+    fi
+
+    # Flush/delete only well-known Kubernetes chains.
+    local chain
+    for chain in \
+        KUBE-SERVICES \
+        KUBE-NODEPORTS \
+        KUBE-POSTROUTING \
+        KUBE-FORWARD \
+        KUBE-PROXY-FIREWALL \
+        KUBE-FIREWALL \
+        KUBE-MARK-MASQ \
+        KUBE-MARK-DROP \
+        KUBE-IPVS-STATICES \
+        KUBE-IPVS-FILTER \
+        KUBE-KUBELET-CANARY \
+        KUBE-EXTERNAL-SERVICES \
+        KUBE-LOAD-BALANCER-SOURCE-CIDR \
+        KUBE-LOAD-BALANCER-FW \
+        KUBE-LOAD-BALANCER; do
+
+        run_bounded 5 iptables -w 3 -t "$table" -F "$chain" \
+            >/dev/null 2>&1 || true
+
+        run_bounded 5 iptables -w 3 -t "$table" -X "$chain" \
+            >/dev/null 2>&1 || true
+    done
+}
+
 if have_cmd iptables; then
-    # Kubernetes chains commonly created by kube-proxy.
+    # A maximum of ~15 seconds per table, with each individual iptables
+    # operation bounded to 5 seconds.
     for table in filter nat mangle; do
-        for chain in KUBE-SERVICES KUBE-NODEPORTS KUBE-POSTROUTING \
-                     KUBE-FORWARD KUBE-PROXY-FIREWALL KUBE-FIREWALL \
-                     KUBE-MARK-MASQ KUBE-MARK-DROP; do
-            iptables -t "$table" -F "$chain" 2>/dev/null || true
-            iptables -t "$table" -X "$chain" 2>/dev/null || true
-        done
+        iptables_cleanup_table "$table"
     done
 
-    # Delete jump rules that reference KUBE chains.
-    for table in filter nat mangle; do
-        while iptables -t "$table" -S 2>/dev/null |
-              grep -E '^-A .*KUBE-' | sed 's/^-A /-D /' |
-              while read -r rule; do
-                  [[ -n "$rule" ]] && iptables -t "$table" $rule 2>/dev/null || true
-              done
-        do :; done
-    done
+    ok "Kubernetes iptables chains/rules cleaned"
+else
+    info "iptables not installed; firewall cleanup skipped"
 fi
 
+# IPVS cleanup is independently bounded.
 if have_cmd ipvsadm; then
-    ipvsadm --clear 2>/dev/null || true
+    if run_bounded 10 ipvsadm --clear >/dev/null 2>&1; then
+        ok "IPVS tables cleared"
+    else
+        warn "IPVS cleanup returned non-zero or timed out; continuing"
+    fi
+else
+    info "ipvsadm not installed; IPVS cleanup skipped"
 fi
 
-# Remove routes for the default kubeadm pod CIDR only if explicitly supplied.
-# Never flush the host's complete routing table.
+# Remove ONLY an explicitly supplied Kubernetes pod CIDR.
+# Never flush the host routing table.
 if [[ -n "${POD_CIDR:-}" ]]; then
-    ip route del "$POD_CIDR" 2>/dev/null || true
+    if run_bounded 5 ip route del "$POD_CIDR" >/dev/null 2>&1; then
+        ok "Pod CIDR route removed: ${POD_CIDR}"
+    else
+        info "Pod CIDR route already absent: ${POD_CIDR}"
+    fi
 fi
 
-ok "Kubernetes/CNI firewall state, IPVS and known pod routes cleaned"
+ok "Kubernetes/CNI firewall state, IPVS and known pod routes cleanup complete"
 
 # -----------------------------------------------------------------------------
 # [10/11] Kernel module/sysctl cleanup
