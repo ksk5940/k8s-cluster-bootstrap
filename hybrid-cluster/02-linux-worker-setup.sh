@@ -10,22 +10,6 @@ set -euo pipefail
 K8S_VERSION="${K8S_VERSION:-1.32.3}"
 RUNTIME="${RUNTIME:-containerd}"         # containerd | crio (CRI-O)
 
-# WORKER_RUNTIME_CRi_FINAL_CHECK
-if [[ "${RUNTIME}" == "containerd" ]]; then
-  systemctl is-active --quiet containerd ||
-    die "containerd is not active before kubeadm join"
-  [[ -S /run/containerd/containerd.sock ]] ||
-    die "containerd socket is missing before kubeadm join"
-  containerd plugins 2>/dev/null |
-    grep -Eq 'io\.containerd\.(cri\.v1\.runtime|grpc\.v1\.cri|cri\.v1\.images)' ||
-    die "containerd is running but no CRI plugin is registered before kubeadm join"
-  ok "containerd CRI is ready before kubeadm join"
-elif [[ "${RUNTIME}" == "crio" ]]; then
-  systemctl is-active --quiet crio ||
-    die "CRI-O is not active before kubeadm join"
-  ok "CRI-O is ready before kubeadm join"
-fi
-
 JOIN_COMMAND="${JOIN_COMMAND:-}"         # full kubeadm join ... string
 JOIN_COMMAND_FILE="${JOIN_COMMAND_FILE:-/tmp/k8s-join-command.sh}"
 SETUP_USER="${SETUP_USER:-k8sadmin}"
@@ -311,6 +295,8 @@ configure_containerd() {
 
   systemctl stop containerd 2>/dev/null || true
 
+  # Generate the vendor-supported configuration. Do not reconstruct the
+  # containerd 2.x CRI hierarchy manually unless a required table is absent.
   containerd config default > /etc/containerd/config.toml ||
     die "Failed to generate containerd default configuration"
 
@@ -326,156 +312,170 @@ configure_containerd() {
   info "Configuring CRI sandbox image: ${PAUSE_IMAGE}"
 
   if [[ "${CONTAINERD_MAJOR}" == "1" ]]; then
-    # containerd 1.x: CRI is io.containerd.grpc.v1.cri
-    if ! grep -q '^\[plugins\."io\.containerd\.grpc\.v1\.cri"\]' /etc/containerd/config.toml; then
-      cat >> /etc/containerd/config.toml <<EOF
+    # containerd 1.x uses the legacy CRI plugin namespace.
+    python3 - "${PAUSE_IMAGE}" <<'PYEOF'
+import sys
+from pathlib import Path
 
-[plugins."io.containerd.grpc.v1.cri"]
-  sandbox_image = "${PAUSE_IMAGE}"
-EOF
-    elif grep -q '^[[:space:]]*sandbox_image[[:space:]]*=' /etc/containerd/config.toml; then
-      sed -i \
-        's|^[[:space:]]*sandbox_image[[:space:]]*=.*|    sandbox_image = "'"${PAUSE_IMAGE}"'"|' \
-        /etc/containerd/config.toml
-    else
-      sed -i \
-        '/^\[plugins\."io\.containerd\.grpc\.v1\.cri"\]/a\    sandbox_image = "'"${PAUSE_IMAGE}"'"' \
-        /etc/containerd/config.toml
-    fi
+path = Path("/etc/containerd/config.toml")
+pause = sys.argv[1]
+lines = path.read_text().splitlines()
 
-    grep -Fq 'sandbox_image = "'"${PAUSE_IMAGE}"'"' /etc/containerd/config.toml ||
-      die "Failed to configure containerd 1.x CRI sandbox image"
+def section_bounds(headers):
+    for i, line in enumerate(headers):
+        if line.startswith("["):
+            yield i, line
 
-    # containerd 1.x runc options.
-    if grep -q '^\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]' \
-        /etc/containerd/config.toml; then
-      sed -i \
-        '/^\[plugins\."io\.containerd\.grpc\.v1\.cri"\.containerd\.runtimes\.runc\.options\]/a\    SystemdCgroup = true' \
-        /etc/containerd/config.toml
-    elif grep -q 'SystemdCgroup[[:space:]]*=' /etc/containerd/config.toml; then
-      sed -i 's/SystemdCgroup[[:space:]]*=[[:space:]]*false/SystemdCgroup = true/g' \
-        /etc/containerd/config.toml
-    else
-      cat >> /etc/containerd/config.toml <<'EOF'
+def find_section(target):
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == target:
+            start = i
+            break
+    if start is None:
+        return None, None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("["):
+            end = j
+            break
+    return start, end
 
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-  SystemdCgroup = true
-EOF
-    fi
+target = '[plugins."io.containerd.grpc.v1.cri"]'
+start, end = find_section(target)
+if start is None:
+    lines += ["", target, f'  sandbox_image = "{pause}"']
+else:
+    found = False
+    for i in range(start + 1, end):
+        if lines[i].strip().startswith("sandbox_image"):
+            indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())] or "  "
+            lines[i] = f'{indent}sandbox_image = "{pause}"'
+            found = True
+            break
+    if not found:
+        lines.insert(start + 1, f'  sandbox_image = "{pause}"')
+
+target = '[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]'
+start, end = find_section(target)
+if start is None:
+    lines += ["", target, "  SystemdCgroup = true"]
+else:
+    found = False
+    for i in range(start + 1, end):
+        if lines[i].strip().startswith("SystemdCgroup"):
+            indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())] or "  "
+            lines[i] = f"{indent}SystemdCgroup = true"
+            found = True
+            break
+    if not found:
+        lines.insert(start + 1, "  SystemdCgroup = true")
+
+path.write_text("\n".join(lines) + "\n")
+PYEOF
 
   elif [[ "${CONTAINERD_MAJOR}" == "2" ]]; then
-    # containerd 2.x:
-    #   images -> pinned_images.sandbox
-    #   runtime -> containerd.runtimes.runc.options.SystemdCgroup
-    #
-    # Do not assume the vendor-generated default config contains every CRI
-    # table. Different 2.x package builds can emit different default sections.
+    # containerd 2.x uses config version 3 and the split CRI v1 images/runtime
+    # plugin namespaces. Modify only the exact sections; never perform a
+    # global replacement of sandbox/SystemdCgroup values.
+    python3 - "${PAUSE_IMAGE}" <<'PYEOF'
+import sys
+from pathlib import Path
 
-    local CRI_IMAGES_TABLE=""
-    if grep -q "^\[plugins\.'io\.containerd\.cri\.v1\.images'\]" /etc/containerd/config.toml; then
-      CRI_IMAGES_TABLE="single"
-    elif grep -q '^\[plugins\."io\.containerd\.cri\.v1\.images"\]' /etc/containerd/config.toml; then
-      CRI_IMAGES_TABLE="double"
-    fi
+path = Path("/etc/containerd/config.toml")
+pause = sys.argv[1]
+lines = path.read_text().splitlines()
 
-    if grep -q "^\[plugins\.'io\.containerd\.cri\.v1\.images'\.pinned_images\]" \
-        /etc/containerd/config.toml; then
-      if grep -q '^[[:space:]]*sandbox[[:space:]]*=' /etc/containerd/config.toml; then
-        sed -i \
-          "s|^[[:space:]]*sandbox[[:space:]]*=.*|  sandbox = \"${PAUSE_IMAGE}\"|" \
-          /etc/containerd/config.toml
-      else
-        sed -i \
-          "/^\[plugins\.'io\.containerd\.cri\.v1\.images'\.pinned_images\]/a\  sandbox = \"${PAUSE_IMAGE}\"" \
-          /etc/containerd/config.toml
-      fi
-    elif grep -q '^\[plugins\."io\.containerd\.cri\.v1\.images"\.pinned_images\]' \
-        /etc/containerd/config.toml; then
-      if grep -q '^[[:space:]]*sandbox[[:space:]]*=' /etc/containerd/config.toml; then
-        sed -i \
-          "s|^[[:space:]]*sandbox[[:space:]]*=.*|  sandbox = \"${PAUSE_IMAGE}\"|" \
-          /etc/containerd/config.toml
-      else
-        sed -i \
-          '/^\[plugins\."io\.containerd\.cri\.v1\.images"\.pinned_images\]/a\  sandbox = "'"${PAUSE_IMAGE}"'"' \
-          /etc/containerd/config.toml
-      fi
-    elif [[ -n "${CRI_IMAGES_TABLE}" ]]; then
-      # Parent exists but pinned_images does not.
-      if [[ "${CRI_IMAGES_TABLE}" == "single" ]]; then
-        cat >> /etc/containerd/config.toml <<EOF
+def bounds(targets):
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() in targets:
+            start = i
+            break
+    if start is None:
+        return None, None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("["):
+            end = j
+            break
+    return start, end
 
-[plugins.'io.containerd.cri.v1.images'.pinned_images]
-  sandbox = "${PAUSE_IMAGE}"
-EOF
-      else
-        cat >> /etc/containerd/config.toml <<EOF
+# containerd 2.x requires config version 3.
+version_idx = None
+for i, line in enumerate(lines):
+    if line.strip().startswith("version"):
+        version_idx = i
+        break
+if version_idx is None:
+    lines.insert(0, "version = 3")
+elif lines[version_idx].strip() != "version = 3":
+    lines[version_idx] = "version = 3"
 
-[plugins."io.containerd.cri.v1.images".pinned_images]
-  sandbox = "${PAUSE_IMAGE}"
-EOF
-      fi
-    else
-      # Some containerd 2.x package defaults omit the CRI images table.
-      # Add the complete required table explicitly.
-      cat >> /etc/containerd/config.toml <<EOF
+# CRI sandbox image.
+targets = {
+    '[plugins."io.containerd.cri.v1.images".pinned_images]',
+    "[plugins.'io.containerd.cri.v1.images'.pinned_images]",
+}
+start, end = bounds(targets)
+if start is None:
+    # Parent table is not needed when using the fully-qualified child table.
+    lines += ["", '[plugins."io.containerd.cri.v1.images".pinned_images]',
+              f'  sandbox = "{pause}"']
+else:
+    found = False
+    for i in range(start + 1, end):
+        if lines[i].strip().startswith("sandbox"):
+            indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())] or "  "
+            lines[i] = f'{indent}sandbox = "{pause}"'
+            found = True
+            break
+    if not found:
+        lines.insert(start + 1, f'  sandbox = "{pause}"')
 
-[plugins.'io.containerd.cri.v1.images']
+# runc SystemdCgroup. The official containerd 2.x path is:
+# io.containerd.cri.v1.runtime.containerd.runtimes.runc.options
+targets = {
+    '[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]',
+    "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]",
+}
+start, end = bounds(targets)
+if start is None:
+    lines += [
+        "",
+        '[plugins."io.containerd.cri.v1.runtime".containerd]',
+        '  default_runtime_name = "runc"',
+        "",
+        '[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]',
+        '  runtime_type = "io.containerd.runc.v2"',
+        "",
+        '[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]',
+        "  SystemdCgroup = true",
+    ]
+else:
+    found = False
+    for i in range(start + 1, end):
+        if lines[i].strip().startswith("SystemdCgroup"):
+            indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())] or "  "
+            lines[i] = f"{indent}SystemdCgroup = true"
+            found = True
+            break
+    if not found:
+        lines.insert(start + 1, "  SystemdCgroup = true")
 
-[plugins.'io.containerd.cri.v1.images'.pinned_images]
-  sandbox = "${PAUSE_IMAGE}"
-EOF
-    fi
-
-    grep -Fq 'sandbox = "'"${PAUSE_IMAGE}"'"' /etc/containerd/config.toml ||
-      die "Failed to configure containerd 2.x CRI sandbox image" 
-
-    # runc options. If the generated config has the normal table, modify it;
-    # otherwise append the complete runtime hierarchy.
-    if grep -q "^\[plugins\.'io\.containerd\.cri\.v1\.runtime'\.containerd\.runtimes\.runc\.options\]" \
-        /etc/containerd/config.toml; then
-      if grep -q 'SystemdCgroup[[:space:]]*=' /etc/containerd/config.toml; then
-        sed -i 's/SystemdCgroup[[:space:]]*=[[:space:]]*false/SystemdCgroup = true/g' \
-          /etc/containerd/config.toml
-      else
-        sed -i \
-          "/^\[plugins\.'io\.containerd\.cri\.v1\.runtime'\.containerd\.runtimes\.runc\.options\]/a\  SystemdCgroup = true" \
-          /etc/containerd/config.toml
-      fi
-    elif grep -q '^\[plugins\."io\.containerd\.cri\.v1\.runtime"\.containerd\.runtimes\.runc\.options\]' \
-        /etc/containerd/config.toml; then
-      if grep -q 'SystemdCgroup[[:space:]]*=' /etc/containerd/config.toml; then
-        sed -i 's/SystemdCgroup[[:space:]]*=[[:space:]]*false/SystemdCgroup = true/g' \
-          /etc/containerd/config.toml
-      else
-        sed -i \
-          '/^\[plugins\."io\.containerd\.cri\.v1\.runtime"\.containerd\.runtimes\.runc\.options\]/a\  SystemdCgroup = true' \
-          /etc/containerd/config.toml
-      fi
-    else
-      cat >> /etc/containerd/config.toml <<'EOF'
-
-[plugins.'io.containerd.cri.v1.runtime'.containerd]
-  default_runtime_name = "runc"
-
-[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
-  runtime_type = "io.containerd.runc.v2"
-
-[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]
-  SystemdCgroup = true
-EOF
-    fi
+path.write_text("\n".join(lines) + "\n")
+PYEOF
 
   else
     die "Unsupported containerd major version ${CONTAINERD_MAJOR}; supported: 1.x and 2.x"
   fi
 
-  grep -q 'SystemdCgroup[[:space:]]*=[[:space:]]*true' /etc/containerd/config.toml ||
-    die "Failed to configure SystemdCgroup=true"
-
-  # Validate the complete configuration before restarting containerd.
+  # Validate the actual file before touching the running service.
   containerd config dump >/dev/null 2>&1 ||
     die "Generated containerd configuration is invalid"
+
+  grep -q 'SystemdCgroup[[:space:]]*=[[:space:]]*true' /etc/containerd/config.toml ||
+    die "SystemdCgroup=true was not configured"
 
   systemctl enable containerd
   systemctl restart containerd
@@ -490,8 +490,7 @@ EOF
       die "containerd did not become ready after 30s. Check: journalctl -u containerd -n 100 --no-pager"
   done
 
-  # Confirm the CRI service is actually registered. crictl may not be installed
-  # yet, so use containerd's loaded plugin list first.
+  # Confirm the CRI service is actually registered.
   if containerd plugins 2>/dev/null |
       grep -Eq 'io\.containerd\.(cri\.v1\.runtime|grpc\.v1\.cri|cri\.v1\.images)'; then
     :
@@ -501,7 +500,6 @@ EOF
 
   ok "containerd ${CONTAINERD_VERSION} installed and configured (CRI + SystemdCgroup=true, sandbox=${PAUSE_IMAGE})"
 }
-
 configure_crio() {
   systemctl daemon-reload 2>/dev/null || true
 
@@ -615,6 +613,22 @@ RT_SOCK="${CRI_SOCKET#unix://}"
   die "Selected runtime ${RUNTIME} socket is unavailable: ${RT_SOCK}"
 
 ok "Selected CRI endpoint is ready: ${CRI_SOCKET}"
+
+# Final runtime/CRI validation immediately before any kubeadm join work.
+if [[ "${RUNTIME}" == "containerd" ]]; then
+  systemctl is-active --quiet containerd ||
+    die "containerd is not active before kubeadm join"
+  [[ -S /run/containerd/containerd.sock ]] ||
+    die "containerd socket is missing before kubeadm join"
+  containerd plugins 2>/dev/null |
+    grep -Eq 'io\.containerd\.(cri\.v1\.runtime|grpc\.v1\.cri|cri\.v1\.images)' ||
+    die "containerd is running but no CRI plugin is registered before kubeadm join"
+  ok "containerd CRI is ready before kubeadm join"
+elif [[ "${RUNTIME}" == "crio" ]]; then
+  systemctl is-active --quiet crio 2>/dev/null || systemctl is-active --quiet cri-o ||
+    die "CRI-O is not active before kubeadm join"
+  ok "CRI-O is ready before kubeadm join"
+fi
 
 # =============================================================================
 step "3/7" "Installing kubeadm / kubelet / kubectl  (v${K8S_VERSION})"
