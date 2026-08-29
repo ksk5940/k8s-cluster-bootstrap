@@ -1,3 +1,4 @@
+sed -i '/# K8S_BOOTSTRAP_REGISTRY_IPV4/d' /etc/hosts 2>/dev/null || true
 #!/usr/bin/env bash
 # =============================================================================
 # 03-linux-destroy.sh

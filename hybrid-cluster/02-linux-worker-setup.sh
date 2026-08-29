@@ -649,6 +649,31 @@ ok "Selected CRI endpoint is ready: ${CRI_SOCKET}"
 [[ -S "${RT_SOCK}" ]] || die "Selected runtime socket is unavailable: ${RT_SOCK}"
 
 # =============================================================================
+
+# -----------------------------------------------------------------------------
+# Registry connectivity / IPv4 preference
+# -----------------------------------------------------------------------------
+# Some dual-stack lab hosts have IPv6 DNS but no IPv6 route. Go-based CRI
+# clients can then select the unreachable AAAA address and wait for TCP timeout.
+# Resolve registry.k8s.io to IPv4 once and add a temporary hosts entry for the
+# bootstrap. The entry is refreshed on every bootstrap and removed by destroy.
+configure_registry_ipv4() {
+  local ip
+  ip="$(getent ahostsv4 registry.k8s.io 2>/dev/null | awk 'NR==1{print $1}')"
+  [[ -n "$ip" ]] || die "Cannot resolve registry.k8s.io over IPv4"
+
+  if ! timeout 10 bash -c "cat </dev/null >/dev/tcp/${ip}/443" 2>/dev/null; then
+    die "registry.k8s.io:443 is unreachable over IPv4 (${ip}). Fix outbound registry/proxy/firewall connectivity."
+  fi
+
+  # Remove only our own managed entry, never touch unrelated hosts entries.
+  sed -i '/# K8S_BOOTSTRAP_REGISTRY_IPV4/d' /etc/hosts
+  printf '%s registry.k8s.io # K8S_BOOTSTRAP_REGISTRY_IPV4\n' "$ip" >> /etc/hosts
+  ok "registry.k8s.io pinned to reachable IPv4 ${ip} for this bootstrap"
+}
+
+configure_registry_ipv4
+
 step "3/7" "Installing kubeadm / kubelet / kubectl / cri-tools  (v${K8S_VERSION})"
 # =============================================================================
 

@@ -127,6 +127,28 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
   stages {
 
     // ── 0. Validate ───────────────────────────────────────────────────────────
+    stage('Validate Repository') {
+      steps {
+        script {
+          def required = [
+            '00-set-static-ip-hostname.sh',
+            '01-linux-master-setup.sh',
+            '02-linux-worker-setup.sh',
+            '03-linux-destroy.sh',
+            '04-linux-upgrade.sh',
+            '07-validate.sh'
+          ]
+          def missing = required.findAll { f ->
+            !fileExists("${env.WORKSPACE}/${SCRIPT_DIR}/${f}")
+          }
+          if (!missing.isEmpty()) {
+            error("Required cluster script(s) missing from ${SCRIPT_DIR}: ${missing.join(', ')}")
+          }
+          echo "Repository preflight passed: ${required.size()} required scripts present."
+        }
+      }
+    }
+
     stage('Validate Inputs') {
       steps {
         script {
@@ -237,6 +259,30 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
     // ═════════════════════════════════════════════════════════════════════════
     //  BOOTSTRAP  (master first, then workers in parallel)
     // ═════════════════════════════════════════════════════════════════════════
+
+    stage('Registry Network Preflight') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: params.SSH_CREDS_ID, usernameVariable: 'SSH_USER', passwordVariable: 'SSH_PASS')]) {
+          script {
+            def nodes = ([params.MASTER_IP] + params.WORKER_IPS.tokenize(',').collect { it.trim() }).unique()
+            def branches = [:]
+            nodes.each { ip ->
+              branches["registry-check: ${ip}"] = {
+                def host = [name: ip, host: ip, user: env.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
+                sshCommand(remote: host, command: '''
+                  set -eu
+                  V4="$(getent ahostsv4 registry.k8s.io 2>/dev/null | awk 'NR==1{print $1}')"
+                  test -n "$V4"
+                  timeout 10 bash -c "cat </dev/null >/dev/tcp/$V4/443"
+                  echo "registry.k8s.io IPv4 connectivity OK: $V4:443"
+                ''')
+              }
+            }
+            parallel branches
+          }
+        }
+      }
+    }
 
     stage('Provision Master Node') {
       when { expression { params.ACTION in ['bootstrap', 'reset'] } }
@@ -351,6 +397,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                   chmod +x /tmp/02-linux-worker-setup.sh /tmp/k8s-join-command.sh && \
                   export K8S_VERSION='${params.K8S_VERSION}' \
                          RUNTIME='${params.RUNTIME}' \
+                         CNI_PLUGIN='${params.CNI_PLUGIN}' \
                          JOIN_COMMAND_FILE='/tmp/k8s-join-command.sh' \
                          NODE_IP='${ip}' \
                          SETUP_USER='${params.SSH_USER}' \
