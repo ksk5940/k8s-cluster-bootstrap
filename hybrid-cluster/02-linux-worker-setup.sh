@@ -144,6 +144,8 @@ fi
 #   10256/tcp kube-proxy healthz
 #   4789/udp  Calico VXLAN
 #   8472/udp  Flannel VXLAN
+#   6783/tcp  Weave control/peer
+#   6783-6784/udp Weave peer/data
 
 configure_firewall_worker() {
   local enable
@@ -155,8 +157,8 @@ configure_firewall_worker() {
   command -v ufw &>/dev/null && FWT="ufw"
   command -v firewall-cmd &>/dev/null && FWT="firewalld"
 
-  local UFW_PORTS=(22/tcp 10250/tcp 10256/tcp 4789/udp 8472/udp)
-  local FWD_PORTS=(22/tcp 10250/tcp 10256/tcp 4789/udp 8472/udp)
+  local UFW_PORTS=(22/tcp 10250/tcp 10256/tcp 4789/udp 8472/udp 6783/tcp 6783/udp 6784/udp)
+  local FWD_PORTS=(22/tcp 10250/tcp 10256/tcp 4789/udp 8472/udp 6783/tcp 6783/udp 6784/udp)
 
   if [[ "$enable" == "true" ]]; then
     case "$FWT" in
@@ -326,8 +328,83 @@ configure_containerd() {
 }
 
 configure_crio() {
-  systemctl enable --now crio
-  ok "CRI-O installed"
+  systemctl daemon-reload 2>/dev/null || true
+
+  local CRIO_UNIT=""
+  local candidate
+  for candidate in crio.service cri-o.service; do
+    if systemctl cat "${candidate}" &>/dev/null; then
+      CRIO_UNIT="${candidate}"
+      break
+    fi
+  done
+
+  if [[ -z "${CRIO_UNIT}" ]]; then
+    for candidate in \
+      /usr/lib/systemd/system/crio.service \
+      /lib/systemd/system/crio.service \
+      /usr/lib/systemd/system/cri-o.service \
+      /lib/systemd/system/cri-o.service; do
+      if [[ -f "${candidate}" ]]; then
+        CRIO_UNIT="$(basename "${candidate}")"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "${CRIO_UNIT}" ]]; then
+    local CRIO_BIN=""
+    CRIO_BIN="$(command -v crio 2>/dev/null || true)"
+
+    if [[ -n "${CRIO_BIN}" ]]; then
+      info "CRI-O binary found at ${CRIO_BIN}, but no systemd unit was registered."
+      info "Creating a minimal managed systemd unit for this package layout."
+
+      cat >/etc/systemd/system/crio.service <<EOF
+[Unit]
+Description=CRI-O Container Runtime
+Wants=network-online.target
+After=network-online.target
+Before=kubelet.service
+
+[Service]
+Type=notify
+EnvironmentFile=-/etc/sysconfig/crio
+ExecStart=${CRIO_BIN}
+Restart=on-failure
+RestartSec=10
+TasksMax=infinity
+LimitNPROC=1048576
+LimitCORE=infinity
+OOMScoreAdjust=-999
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+      systemctl daemon-reload
+      CRIO_UNIT="crio.service"
+    fi
+  fi
+
+  [[ -n "${CRIO_UNIT}" ]] ||
+    die "CRI-O package is installed but no usable crio systemd unit/binary was found"
+
+  systemctl enable --now "${CRIO_UNIT}" ||
+    die "Failed to start ${CRIO_UNIT}. Check: journalctl -u ${CRIO_UNIT} -n 100 --no-pager"
+
+  local sock="/var/run/crio/crio.sock"
+  local retries=0
+  while [[ ! -S "${sock}" && ${retries} -lt 30 ]]; do
+    sleep 1
+    retries=$((retries + 1))
+  done
+
+  [[ -S "${sock}" ]] ||
+    die "CRI-O service is active but CRI socket ${sock} was not created"
+
+  ok "CRI-O installed and running (${CRIO_UNIT}, socket=${sock})"
 }
 
 case "${RUNTIME}" in
@@ -339,6 +416,7 @@ case "${RUNTIME}" in
     fi
 
     configure_containerd
+    CRI_SOCKET="unix:///run/containerd/containerd.sock"
     ;;
 
   crio)
@@ -349,12 +427,19 @@ case "${RUNTIME}" in
     fi
 
     configure_crio
+    CRI_SOCKET="unix:///var/run/crio/crio.sock"
     ;;
 
   *)
-    die "Unknown runtime: ${RUNTIME}"
+    die "Unknown runtime: ${RUNTIME}. Choose containerd or crio"
     ;;
 esac
+
+RT_SOCK="${CRI_SOCKET#unix://}"
+[[ -S "${RT_SOCK}" ]] ||
+  die "Selected runtime ${RUNTIME} socket is unavailable: ${RT_SOCK}"
+
+ok "Selected CRI endpoint is ready: ${CRI_SOCKET}"
 
 # =============================================================================
 step "3/7" "Installing kubeadm / kubelet / kubectl  (v${K8S_VERSION})"
@@ -515,15 +600,7 @@ sync_clock
 step "5/7" "Joining cluster"
 # =============================================================================
 
-case "${RUNTIME}" in
-  containerd)
-    CRI_SOCKET="unix:///run/containerd/containerd.sock"
-    ;;
-
-  crio)
-    CRI_SOCKET="unix:///var/run/crio/crio.sock"
-    ;;
-esac
+# CRI_SOCKET was selected and validated during runtime installation.
 
 if [[ -z "${JOIN_COMMAND}" && -f "${JOIN_COMMAND_FILE}" ]]; then
   JOIN_COMMAND=$(cat "${JOIN_COMMAND_FILE}")

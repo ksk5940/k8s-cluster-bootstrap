@@ -105,6 +105,8 @@ fi
 #   10259/tcp     kube-scheduler
 #   4789/udp      Calico VXLAN
 #   8472/udp      Flannel VXLAN
+#   6783/tcp      Weave control/peer
+#   6783-6784/udp Weave peer/data
 #   30000-32767/tcp NodePort services
 
 configure_firewall_master() {
@@ -116,9 +118,9 @@ configure_firewall_master() {
   command -v firewall-cmd &>/dev/null && FWT="firewalld"
 
   local UFW_PORTS=(22/tcp 6443/tcp 2379:2380/tcp 10250/tcp 10257/tcp 10259/tcp
-                   4789/udp 8472/udp 30000:32767/tcp)
+                   4789/udp 8472/udp 6783/tcp 6783/udp 6784/udp 30000:32767/tcp)
   local FWD_PORTS=(22/tcp 6443/tcp 2379-2380/tcp 10250/tcp 10257/tcp 10259/tcp
-                   4789/udp 8472/udp 30000-32767/tcp)
+                   4789/udp 8472/udp 6783/tcp 6783/udp 6784/udp 30000-32767/tcp)
 
   if [[ "$enable" == "true" ]]; then
     case "$FWT" in
@@ -261,24 +263,112 @@ configure_containerd() {
 }
 
 configure_crio() {
-  # cri-o uses systemd cgroup by default
-  systemctl enable --now crio
-  ok "CRI-O installed and configured"
+  # CRI-O normally installs crio.service. Some package builds expose the
+  # unit under a different alias or fail to register the unit with systemd.
+  # Discover the installed unit instead of hard-coding one service name.
+  systemctl daemon-reload 2>/dev/null || true
+
+  local CRIO_UNIT=""
+  local candidate
+  for candidate in crio.service cri-o.service; do
+    if systemctl cat "${candidate}" &>/dev/null; then
+      CRIO_UNIT="${candidate}"
+      break
+    fi
+  done
+
+  # Also inspect common systemd unit locations.
+  if [[ -z "${CRIO_UNIT}" ]]; then
+    for candidate in \
+      /usr/lib/systemd/system/crio.service \
+      /lib/systemd/system/crio.service \
+      /usr/lib/systemd/system/cri-o.service \
+      /lib/systemd/system/cri-o.service; do
+      if [[ -f "${candidate}" ]]; then
+        CRIO_UNIT="$(basename "${candidate}")"
+        break
+      fi
+    done
+  fi
+
+  # Last-resort recovery for a package that contains the CRI-O binary but
+  # failed to install/register its systemd unit.
+  if [[ -z "${CRIO_UNIT}" ]]; then
+    local CRIO_BIN=""
+    CRIO_BIN="$(command -v crio 2>/dev/null || true)"
+
+    if [[ -n "${CRIO_BIN}" ]]; then
+      info "CRI-O binary found at ${CRIO_BIN}, but no systemd unit was registered."
+      info "Creating a minimal managed systemd unit for this package layout."
+
+      cat >/etc/systemd/system/crio.service <<EOF
+[Unit]
+Description=CRI-O Container Runtime
+Wants=network-online.target
+After=network-online.target
+Before=kubelet.service
+
+[Service]
+Type=notify
+EnvironmentFile=-/etc/sysconfig/crio
+ExecStart=${CRIO_BIN}
+Restart=on-failure
+RestartSec=10
+TasksMax=infinity
+LimitNPROC=1048576
+LimitCORE=infinity
+OOMScoreAdjust=-999
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+      systemctl daemon-reload
+      CRIO_UNIT="crio.service"
+    fi
+  fi
+
+  [[ -n "${CRIO_UNIT}" ]] ||
+    die "CRI-O package is installed but no usable crio systemd unit/binary was found"
+
+  systemctl enable --now "${CRIO_UNIT}" ||
+    die "Failed to start ${CRIO_UNIT}. Check: journalctl -u ${CRIO_UNIT} -n 100 --no-pager"
+
+  local sock="/var/run/crio/crio.sock"
+  local retries=0
+  while [[ ! -S "${sock}" && ${retries} -lt 30 ]]; do
+    sleep 1
+    retries=$((retries + 1))
+  done
+
+  [[ -S "${sock}" ]] ||
+    die "CRI-O service is active but CRI socket ${sock} was not created"
+
+  ok "CRI-O installed and running (${CRIO_UNIT}, socket=${sock})"
 }
 
 case "${RUNTIME}" in
   containerd)
     if [[ "$PKG_MGR" == "apt" ]]; then install_containerd_apt; else install_containerd_dnf; fi
     configure_containerd
-    CRICTL_SOCK="unix:///run/containerd/containerd.sock"
+    CRI_SOCKET="unix:///run/containerd/containerd.sock"
+    CRICTL_SOCK="${CRI_SOCKET}"
     ;;
   crio)
     if [[ "$PKG_MGR" == "apt" ]]; then install_crio_apt; else install_crio_dnf; fi
     configure_crio
-    CRICTL_SOCK="unix:///var/run/crio/crio.sock"
+    CRI_SOCKET="unix:///var/run/crio/crio.sock"
+    CRICTL_SOCK="${CRI_SOCKET}"
     ;;
   *) die "Unknown runtime: ${RUNTIME}. Choose containerd or crio" ;;
 esac
+
+# Runtime-independent sanity check. kubeadm must never proceed with a
+# selected runtime whose CRI endpoint is unavailable.
+RT_SOCK="${CRI_SOCKET#unix://}"
+[[ -S "${RT_SOCK}" ]] || die "Selected runtime ${RUNTIME} socket is unavailable: ${RT_SOCK}"
+ok "Selected CRI endpoint is ready: ${CRI_SOCKET}"
 
 # =============================================================================
 step "3/9" "Installing kubeadm / kubelet / kubectl  (v${K8S_VERSION})"
@@ -323,11 +413,7 @@ ok "kubeadm / kubelet / kubectl installed and pinned"
 step "4/9" "kubeadm init"
 # =============================================================================
 
-# Determine CRI socket
-case "${RUNTIME}" in
-  containerd) CRI_SOCKET="unix:///run/containerd/containerd.sock" ;;
-  crio)       CRI_SOCKET="unix:///var/run/crio/crio.sock" ;;
-esac
+# CRI_SOCKET was selected and validated during runtime installation above.
 
 # Reset any previous state
 kubeadm reset -f --cri-socket "${CRI_SOCKET}" 2>/dev/null || true
@@ -478,21 +564,64 @@ PYEOF
 }
 
 install_flannel() {
-  # Flannel requires pod CIDR set — already done via kubeadm
-  kubectl apply -f \
-    https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
-  ok "Flannel CNI applied"
+  # Pin the manifest so a future upstream change cannot silently break Jenkins.
+  local FLANNEL_VERSION="v0.26.7"
+  local FLANNEL_MANIFEST="/tmp/kube-flannel-${FLANNEL_VERSION}.yml"
+
+  curl -fsSL \
+    "https://github.com/flannel-io/flannel/releases/download/${FLANNEL_VERSION}/kube-flannel.yml" \
+    -o "${FLANNEL_MANIFEST}" ||
+    die "Flannel ${FLANNEL_VERSION} manifest download failed"
+
+  # Align Flannel's network with kubeadm --pod-network-cidr.
+  python3 - "${FLANNEL_MANIFEST}" "${POD_CIDR}" <<'PYEOF'
+import sys, re
+path, cidr = sys.argv[1], sys.argv[2]
+s = open(path).read()
+s = re.sub(r'("Network"\s*:\s*)"[^"]+"', rf'\1"{cidr}"', s)
+open(path, 'w').write(s)
+PYEOF
+
+  kubectl apply -f "${FLANNEL_MANIFEST}" ||
+    die "kubectl apply flannel failed"
+
+  ok "Flannel ${FLANNEL_VERSION} applied"
+  info "  Pod CIDR  : ${POD_CIDR}"
 }
 
 install_weave() {
-  # Weave Net — peer-to-peer overlay, no external dependency
-  local WEAVE_VER
-  WEAVE_VER=$(curl -sSL https://api.github.com/repos/weaveworks/weave/releases/latest \
-    | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
-  WEAVE_VER="${WEAVE_VER:-2.8.1}"
-  kubectl apply -f \
-    "https://github.com/weaveworks/weave/releases/download/v${WEAVE_VER}/weave-daemonset-k8s.yaml"
-  ok "Weave Net CNI applied (v${WEAVE_VER})"
+  # Weave Net is archived upstream. Keep it available for legacy/lab use,
+  # but recommend Calico or Flannel for new clusters.
+  local WEAVE_VER="2.8.1"
+  local WEAVE_MANIFEST="/tmp/weave-${WEAVE_VER}.yaml"
+
+  warn "Weave Net is archived upstream; use Calico or Flannel for new clusters."
+
+  curl -fsSL \
+    "https://github.com/weaveworks/weave/releases/download/v${WEAVE_VER}/weave-daemonset-k8s.yaml" \
+    -o "${WEAVE_MANIFEST}" ||
+    die "Weave Net ${WEAVE_VER} manifest download failed"
+
+  # Align Weave's default IPALLOC_RANGE with kubeadm's pod CIDR.
+  python3 - "${WEAVE_MANIFEST}" "${POD_CIDR}" <<'PYEOF'
+import sys
+path, cidr = sys.argv[1], sys.argv[2]
+lines = open(path).read().splitlines()
+for i, line in enumerate(lines):
+    if 'name: IPALLOC_RANGE' in line:
+        for j in range(i + 1, min(i + 5, len(lines))):
+            if 'value:' in lines[j]:
+                indent = lines[j][:len(lines[j]) - len(lines[j].lstrip())]
+                lines[j] = f'{indent}value: "{cidr}"'
+                break
+open(path, 'w').write('\n'.join(lines) + '\n')
+PYEOF
+
+  kubectl apply -f "${WEAVE_MANIFEST}" ||
+    die "kubectl apply weave failed"
+
+  ok "Weave Net ${WEAVE_VER} applied"
+  info "  Pod CIDR  : ${POD_CIDR}"
 }
 
 case "${CNI_PLUGIN}" in
@@ -500,6 +629,13 @@ case "${CNI_PLUGIN}" in
   flannel) install_flannel ;;
   weave)   install_weave   ;;
   *)       die "Unknown CNI: ${CNI_PLUGIN}. Choose calico, flannel, or weave" ;;
+esac
+
+# Verify that the selected CNI created its expected DaemonSet before waiting.
+case "${CNI_PLUGIN}" in
+  calico)  kubectl -n kube-system get daemonset/calico-node >/dev/null 2>&1 || die "Calico DaemonSet was not created" ;;
+  flannel) kubectl -n kube-flannel get daemonset/kube-flannel-ds >/dev/null 2>&1 || die "Flannel DaemonSet was not created" ;;
+  weave)   kubectl -n kube-system get daemonset/weave-net >/dev/null 2>&1 || die "Weave DaemonSet was not created" ;;
 esac
 
 # =============================================================================
