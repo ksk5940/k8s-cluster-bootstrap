@@ -27,12 +27,12 @@
 set -euo pipefail
 
 # ── Parameters ────────────────────────────────────────────────────────────────
-STATIC_IP="${STATIC_IP:-}"
+STATIC_IP="${STATIC_IP:-${NODE_IP:-}}"
 GATEWAY="${GATEWAY:-}"
 DNS_SERVERS="${DNS_SERVERS:-8.8.8.8 1.1.1.1}"
 PREFIX_LENGTH="${PREFIX_LENGTH:-24}"
 NETWORK_IFACE="${NETWORK_IFACE:-}"
-NEW_HOSTNAME="${NEW_HOSTNAME:-}"
+NEW_HOSTNAME="${NEW_HOSTNAME:-${NODE_HOSTNAME:-}}"
 NODE_ROLE="${NODE_ROLE:-}"
 
 # ── Colours ───────────────────────────────────────────────────────────────────

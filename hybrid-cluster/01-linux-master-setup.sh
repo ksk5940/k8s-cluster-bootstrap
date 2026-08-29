@@ -377,8 +377,7 @@ install_calico() {
 
   # Detect host-only interface (the non-NAT NIC — typically the 192.168.x.x one)
   local IFACE
-  IFACE=$(ip -4 route show | grep -v "^default" \
-    | awk '{print $3}' | grep -v "^lo" | head -1)
+  IFACE=$(ip -4 route show | awk '$1 !~ /^(default|local|broadcast|unreachable|prohibit|blackhole|throw)$/ && $0 ~ / dev / {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
   # Fallback: first non-loopback interface
   [[ -z "$IFACE" ]] && IFACE=$(ip -o link show | awk -F': ' '$2 !~ /lo|docker|veth|br-|cali|flannel|weave/ {print $2}' | head -1)
   [[ -z "$IFACE" ]] && IFACE="eth1"

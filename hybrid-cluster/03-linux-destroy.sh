@@ -58,6 +58,30 @@ remove_pkg_dnf() {
   dnf remove -y "$@" 2>/dev/null || true
 }
 
+# Calico can mount a cgroup filesystem below /var/run/calico/cgroup.  Those
+# entries are kernel-managed virtual files, not ordinary files.  Never run
+# rm -rf against the mounted tree: unmount every nested mount first.
+unmount_tree() {
+  local root="$1" mnt
+  [[ -e "$root" ]] || return 0
+
+  if command -v findmnt >/dev/null 2>&1; then
+    while IFS= read -r mnt; do
+      [[ -n "$mnt" ]] || continue
+      umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true
+    done < <(findmnt -Rno TARGET -- "$root" 2>/dev/null | awk 'NF' | sort -r)
+  else
+    umount "$root" 2>/dev/null || umount -l "$root" 2>/dev/null || true
+  fi
+}
+
+unmount_calico_cgroup() {
+  local root
+  for root in /var/run/calico/cgroup /run/calico/cgroup; do
+    unmount_tree "$root"
+  done
+}
+
 # ── Detect OS ─────────────────────────────────────────────────────────────────
 if [[ -f /etc/os-release ]]; then
   source /etc/os-release
@@ -304,6 +328,9 @@ ok "Kubernetes state, PKI, etcd, logs and temp files fully removed"
 step "8/11" "Remove CNI plugins · config · virtual interfaces"
 # =============================================================================
 
+# Release Calico's cgroup mount before deleting its state directory.
+unmount_calico_cgroup
+
 purge_paths \
   /opt/cni \
   /etc/cni \
@@ -324,8 +351,7 @@ if [[ -z "${CNI_PLUGIN}" || "${CNI_PLUGIN}" == "calico" ]]; then
     /etc/calico \
     /var/run/calico \
     /run/calico \
-    /run/nodeagent \
-    /run/netns
+    /run/nodeagent
   info "Calico fully cleaned"
 fi
 
@@ -370,28 +396,38 @@ ip link show 2>/dev/null \
 ok "CNI plugins and interfaces fully removed"
 
 # =============================================================================
-step "9/11" "Flush iptables · ip6tables · ipvs · K8s routing"
+step "9/11" "Remove Kubernetes/CNI firewall state · IPVS · pod routes"
 # =============================================================================
 
-for table in filter nat mangle raw; do
-  iptables  -t "${table}" -F 2>/dev/null || true
-  iptables  -t "${table}" -X 2>/dev/null || true
-  iptables  -t "${table}" -Z 2>/dev/null || true
-  ip6tables -t "${table}" -F 2>/dev/null || true
-  ip6tables -t "${table}" -X 2>/dev/null || true
-  ip6tables -t "${table}" -Z 2>/dev/null || true
-done
+# Never flush the complete host firewall during a Kubernetes teardown.  That
+# can remove unrelated security rules and can also disconnect SSH.  Remove
+# only Kubernetes/CNI chains and their jump rules.
+cleanup_iptables() {
+  local family_cmd="$1" table chain
+  for table in nat filter mangle raw; do
+    while read -r chain; do
+      [[ -n "$chain" ]] || continue
+      "$family_cmd" -t "$table" -F "$chain" 2>/dev/null || true
+      "$family_cmd" -t "$table" -X "$chain" 2>/dev/null || true
+    done < <("$family_cmd" -t "$table" -S 2>/dev/null | awk '/^-N (KUBE|CALI|cali|CALICO|FLANNEL|WEAVE)/ {print $2}' | sort -u)
+  done
+}
+
+command -v iptables >/dev/null 2>&1 && cleanup_iptables iptables
+command -v ip6tables >/dev/null 2>&1 && cleanup_iptables ip6tables
 
 if command -v ipvsadm &>/dev/null; then
   ipvsadm --clear 2>/dev/null || true
   info "IPVS table cleared"
 fi
 
-# Remove pod/service routes left by kube-proxy or CNI
-ip route show 2>/dev/null | grep -E '10\.(244|96|32)\.' | \
-  while read -r route; do ip route del ${route} 2>/dev/null || true; done
+# Remove only known Kubernetes/CNI pod/service routes.
+ip route show 2>/dev/null | awk '$1 ~ /^(10\.244\.|10\.96\.|10\.32\.)/ {print}' | \
+  while IFS= read -r route; do
+    [[ -n "$route" ]] && ip route del $route 2>/dev/null || true
+  done
 
-ok "iptables, ip6tables, ipvs, and routing fully flushed"
+ok "Kubernetes/CNI firewall state, IPVS, and pod routes cleaned"
 
 # =============================================================================
 step "10/11" "Remove kernel module config · sysctl overrides"
