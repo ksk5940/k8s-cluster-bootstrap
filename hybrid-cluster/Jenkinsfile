@@ -301,6 +301,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
             sshPut remote: masterRemote, from: localMaster, into: '/tmp/01-linux-master-setup.sh'
 
             def tStart = System.currentTimeMillis()
+            def firewallValue = params.ENABLE_FIREWALL.toString()
             sshCommand remote: masterRemote, command: """
               sed -i 's/\\r//' /tmp/01-linux-master-setup.sh && \\
               chmod +x /tmp/01-linux-master-setup.sh && \\
@@ -310,7 +311,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                      CNI_PLUGIN='${params.CNI_PLUGIN}' \\
                      POD_CIDR='${params.POD_CIDR}' \\
                      SETUP_USER='${params.SSH_USER}' \\
-                     ENABLE_FIREWALL='${params.ENABLE_FIREWALL}' \\
+                     ENABLE_FIREWALL='${firewallValue}' \\
                      DEBIAN_FRONTEND=noninteractive && \\
               set +e
               sudo -E bash /tmp/01-linux-master-setup.sh
@@ -390,6 +391,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
           script {
             def workers     = params.WORKER_IPS.tokenize(',').collect { it.trim() }
             def localWorker = "${env.WORKSPACE}/${SCRIPT_DIR}/02-linux-worker-setup.sh"
+            def firewallValue = params.ENABLE_FIREWALL.toString()
             def branches    = [:]
 
             workers.each { workerIp ->
@@ -410,7 +412,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                          JOIN_COMMAND_FILE='/tmp/k8s-join-command.sh' \
                          NODE_IP='${ip}' \
                          SETUP_USER='${params.SSH_USER}' \
-                         ENABLE_FIREWALL='${params.ENABLE_FIREWALL}' \
+                         ENABLE_FIREWALL='${firewallValue}' \
                          DEBIAN_FRONTEND=noninteractive && \
                   set +e
                   sudo -E bash /tmp/02-linux-worker-setup.sh
