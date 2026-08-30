@@ -615,13 +615,15 @@ configure_crio() {
     if [[ "${PKG_MGR}" == "apt" ]] && dpkg-query -W -f='${Status}' cri-o 2>/dev/null | grep -q "install ok installed"; then
       UNIT_PATH="$(
         dpkg -L cri-o 2>/dev/null |
-          awk '/\/(crio|cri-o)\.service$/ {print; exit}'
+          awk '/\/(crio|cri-o)\.service$/ {print}'
       )"
+      UNIT_PATH="${UNIT_PATH%%$'\n'*}"
     elif [[ "${PKG_MGR}" == "dnf" ]] && rpm -q cri-o &>/dev/null; then
       UNIT_PATH="$(
         rpm -ql cri-o 2>/dev/null |
-          awk '/\/(crio|cri-o)\.service$/ {print; exit}'
+          awk '/\/(crio|cri-o)\.service$/ {print}'
       )"
+      UNIT_PATH="${UNIT_PATH%%$'\n'*}"
     fi
 
     if [[ -n "${UNIT_PATH}" && -f "${UNIT_PATH}" ]]; then
@@ -662,23 +664,34 @@ configure_crio() {
     systemctl daemon-reload 2>/dev/null || true
 
     if [[ "${PKG_MGR}" == "apt" ]]; then
-      CRIO_BIN="$(
-        dpkg -L cri-o 2>/dev/null |
-          awk '/\/crio$/ && -f $0 && -x $0 {print; exit}'
-      )"
+      # NOTE: awk has no -f/-x file-test operators — see the equivalent
+      # comment in 01-linux-master-setup.sh. Verify candidates with a real
+      # bash file test instead, matching the primary discovery path above.
+      CRIO_BIN=""
+      while IFS= read -r candidate; do
+        if [[ -f "${candidate}" && -x "${candidate}" ]]; then
+          CRIO_BIN="${candidate}"
+          break
+        fi
+      done < <(dpkg -L cri-o 2>/dev/null | grep -E '/crio$' || true)
       UNIT_PATH="$(
         dpkg -L cri-o 2>/dev/null |
-          awk '/\/(crio|cri-o)\.service$/ {print; exit}'
+          awk '/\/(crio|cri-o)\.service$/ {print}'
       )"
+      UNIT_PATH="${UNIT_PATH%%$'\n'*}"
     else
-      CRIO_BIN="$(
-        rpm -ql cri-o 2>/dev/null |
-          awk '/\/crio$/ && -f $0 && -x $0 {print; exit}'
-      )"
+      CRIO_BIN=""
+      while IFS= read -r candidate; do
+        if [[ -f "${candidate}" && -x "${candidate}" ]]; then
+          CRIO_BIN="${candidate}"
+          break
+        fi
+      done < <(rpm -ql cri-o 2>/dev/null | grep -E '/crio$' || true)
       UNIT_PATH="$(
         rpm -ql cri-o 2>/dev/null |
-          awk '/\/(crio|cri-o)\.service$/ {print; exit}'
+          awk '/\/(crio|cri-o)\.service$/ {print}'
       )"
+      UNIT_PATH="${UNIT_PATH%%$'\n'*}"
     fi
 
     if [[ -z "${CRIO_BIN}" ]]; then

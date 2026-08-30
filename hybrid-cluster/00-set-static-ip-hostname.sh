@@ -45,15 +45,27 @@ die()  { echo -e "  ${RD}[FAIL]${NC} $*" >&2; exit 1; }
 [[ -z "${STATIC_IP}" ]] && die "STATIC_IP is required. Export it before calling this script."
 
 # ── Auto-detect gateway ───────────────────────────────────────────────────────
+# NOTE: do not use `awk '{...; exit}'` on the read side of a pipe under
+# `set -o pipefail`. If the upstream command (here `ip`) still has more
+# output queued when awk exits early, awk closing its end of the pipe can
+# deliver SIGPIPE to `ip`, and pipefail then reports the whole pipeline as
+# exit status 141 even though a match was found. Let awk consume the full
+# input (no `exit`) and take the first line in bash instead — this lets the
+# upstream command finish and exit normally, so there is no pipe to break.
 if [[ -z "${GATEWAY}" ]]; then
-  GATEWAY=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+  GATEWAY=$(ip route show default 2>/dev/null | awk '/default/ {print $3}')
+  GATEWAY="${GATEWAY%%$'\n'*}"
   [[ -z "${GATEWAY}" ]] && GATEWAY="$(echo "${STATIC_IP}" | cut -d. -f1-3).1"
 fi
 
 # ── Auto-detect primary NIC ───────────────────────────────────────────────────
 if [[ -z "${NETWORK_IFACE}" ]]; then
-  NETWORK_IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
-  [[ -z "${NETWORK_IFACE}" ]] && NETWORK_IFACE=$(ip -o link show | awk -F': ' '!/lo/{print $2; exit}')
+  NETWORK_IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5}')
+  NETWORK_IFACE="${NETWORK_IFACE%%$'\n'*}"
+  if [[ -z "${NETWORK_IFACE}" ]]; then
+    NETWORK_IFACE=$(ip -o link show | awk -F': ' '!/lo/{print $2}')
+    NETWORK_IFACE="${NETWORK_IFACE%%$'\n'*}"
+  fi
   [[ -z "${NETWORK_IFACE}" ]] && die "Cannot auto-detect network interface. Set NETWORK_IFACE."
 fi
 

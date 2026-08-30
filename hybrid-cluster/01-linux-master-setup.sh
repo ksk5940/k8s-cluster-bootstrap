@@ -58,6 +58,74 @@ echo -e "
 step "1/9" "System prerequisites"
 # =============================================================================
 
+# ── Clock synchronization (must happen before any apt/dnf operation) ─────────
+# CRITICAL: observed in practice — apt refuses a repo's Release file with
+# "not valid yet (invalid for another Nmin)" when this node's clock is
+# behind real time, which aborts every subsequent apt-get/dnf install in
+# this script (containerd, kubeadm/kubelet/kubectl, etc). The worker script
+# already force-syncs the clock before `kubeadm join` for the equivalent
+# x509 "certificate is not yet valid" failure mode — the master needs the
+# same guarantee, and needs it first, since package installation is the
+# very first thing that can fail here.
+sync_clock() {
+  local synced=false
+  local now_before
+  now_before=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  info "Clock before sync: ${now_before}"
+
+  if [[ "$PKG_MGR" == "apt" ]]; then
+    # Ubuntu/Debian — use systemd-timesyncd
+    timedatectl set-ntp true 2>/dev/null || true
+    systemctl restart systemd-timesyncd 2>/dev/null || true
+
+    local w=0
+    while [[ $w -lt 30 ]]; do
+      timedatectl status 2>/dev/null | grep -q "synchronized: yes" && { synced=true; break; }
+      sleep 2
+      w=$((w+2))
+    done
+
+    if [[ "$synced" == "false" ]] && command -v ntpdate &>/dev/null; then
+      ntpdate -u pool.ntp.org 2>/dev/null && synced=true || true
+    fi
+  else
+    # RHEL/Rocky/AlmaLinux/SUSE — use chrony
+    if ! command -v chronyd &>/dev/null; then
+      info "Installing chrony..."
+      if [[ "$PKG_MGR" == "dnf" ]]; then
+        dnf install -y -q chrony 2>/dev/null || true
+      elif [[ "$PKG_MGR" == "zypper" ]]; then
+        zypper --non-interactive install chrony 2>/dev/null || true
+      fi
+    fi
+
+    if command -v chronyd &>/dev/null; then
+      systemctl enable --now chronyd 2>/dev/null || true
+      sleep 2
+      if chronyc makestep 2>/dev/null; then
+        synced=true
+      fi
+      info "Chrony tracking:"
+      chronyc tracking 2>/dev/null | grep -E 'System time|RMS offset|Last offset' || true
+    fi
+
+    if [[ "$synced" == "false" ]] && command -v ntpdate &>/dev/null; then
+      ntpdate -u pool.ntp.org 2>/dev/null && synced=true || true
+    fi
+  fi
+
+  local now_after
+  now_after=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  if [[ "$synced" == "true" ]]; then
+    ok "Clock synced — UTC: ${now_after}"
+  else
+    warn "Clock sync uncertain — UTC: ${now_after}"
+    warn "If apt/kubeadm fails with time-related errors, run: chronyc makestep (or) timedatectl set-ntp true"
+  fi
+}
+
+sync_clock
+
 # ── Repair any interrupted dpkg state (common on reused VMs) ─────────────────
 if [[ "$PKG_MGR" == "apt" ]]; then
   dpkg --configure -a --force-confold 2>/dev/null || true
@@ -498,13 +566,15 @@ configure_crio() {
     if [[ "${PKG_MGR}" == "apt" ]] && dpkg-query -W -f='${Status}' cri-o 2>/dev/null | grep -q "install ok installed"; then
       UNIT_PATH="$(
         dpkg -L cri-o 2>/dev/null |
-          awk '/\/(crio|cri-o)\.service$/ {print; exit}'
+          awk '/\/(crio|cri-o)\.service$/ {print}'
       )"
+      UNIT_PATH="${UNIT_PATH%%$'\n'*}"
     elif [[ "${PKG_MGR}" == "dnf" ]] && rpm -q cri-o &>/dev/null; then
       UNIT_PATH="$(
         rpm -ql cri-o 2>/dev/null |
-          awk '/\/(crio|cri-o)\.service$/ {print; exit}'
+          awk '/\/(crio|cri-o)\.service$/ {print}'
       )"
+      UNIT_PATH="${UNIT_PATH%%$'\n'*}"
     fi
 
     if [[ -n "${UNIT_PATH}" && -f "${UNIT_PATH}" ]]; then
@@ -544,24 +614,40 @@ configure_crio() {
 
     systemctl daemon-reload 2>/dev/null || true
 
+    # NOTE: awk has no -f/-x file-test operators. `-f $0` parses as unary
+    # minus of the uninitialized variable `f` (→ 0) string-concatenated with
+    # $0, which is always a non-empty (truthy) string — so a prior version
+    # of this check silently never verified the file at all, and could pick
+    # up a non-binary path (like the /etc/crio config directory, which also
+    # matches /crio$) if the package listed it before the real binary. Find
+    # candidates with awk/grep, then verify each with a real bash file test,
+    # exactly like the primary discovery path above.
     if [[ "${PKG_MGR}" == "apt" ]]; then
-      CRIO_BIN="$(
-        dpkg -L cri-o 2>/dev/null |
-          awk '/\/crio$/ && -f $0 && -x $0 {print; exit}'
-      )"
+      CRIO_BIN=""
+      while IFS= read -r candidate; do
+        if [[ -f "${candidate}" && -x "${candidate}" ]]; then
+          CRIO_BIN="${candidate}"
+          break
+        fi
+      done < <(dpkg -L cri-o 2>/dev/null | grep -E '/crio$' || true)
       UNIT_PATH="$(
         dpkg -L cri-o 2>/dev/null |
-          awk '/\/(crio|cri-o)\.service$/ {print; exit}'
+          awk '/\/(crio|cri-o)\.service$/ {print}'
       )"
+      UNIT_PATH="${UNIT_PATH%%$'\n'*}"
     else
-      CRIO_BIN="$(
-        rpm -ql cri-o 2>/dev/null |
-          awk '/\/crio$/ && -f $0 && -x $0 {print; exit}'
-      )"
+      CRIO_BIN=""
+      while IFS= read -r candidate; do
+        if [[ -f "${candidate}" && -x "${candidate}" ]]; then
+          CRIO_BIN="${candidate}"
+          break
+        fi
+      done < <(rpm -ql cri-o 2>/dev/null | grep -E '/crio$' || true)
       UNIT_PATH="$(
         rpm -ql cri-o 2>/dev/null |
-          awk '/\/(crio|cri-o)\.service$/ {print; exit}'
+          awk '/\/(crio|cri-o)\.service$/ {print}'
       )"
+      UNIT_PATH="${UNIT_PATH%%$'\n'*}"
     fi
 
     if [[ -z "${CRIO_BIN}" ]]; then
@@ -859,16 +945,26 @@ install_calico() {
   # Detect host-only interface (the non-NAT NIC — typically the 192.168.x.x one)
   local IFACE
 
+  # NOTE ON SIGPIPE 141: do not use `awk '{...; exit}'` reading from a pipe
+  # under `set -o pipefail`. If `ip -o -4 addr show` still has more lines
+  # queued when awk exits early after its first match, awk closing its end
+  # of the pipe delivers SIGPIPE to `ip`, and pipefail then reports the
+  # whole pipeline as exit status 141 — even though a match was found. This
+  # is exactly what happened here in practice. The fix is to let awk consume
+  # ALL of its input (no `exit`) so `ip` always finishes and exits normally,
+  # then take the first line of awk's output in pure bash.
+
   # Prefer the interface that actually owns MASTER_IP. This avoids selecting
   # the NAT interface on multi-NIC VMs.
   IFACE="$(ip -o -4 addr show 2>/dev/null |
-    awk -v ip="${MASTER_IP}" '$4 ~ ("^" ip "/") {print $2; exit}')"
+    awk -v ip="${MASTER_IP}" '$4 ~ ("^" ip "/") {print $2}')"
+  IFACE="${IFACE%%$'\n'*}"
 
-  # Fallback without awk|head: with `set -o pipefail`, awk can receive
-  # SIGPIPE from head and make the entire bootstrap exit with status 141.
+  # Fallback: first non-loopback/virtual interface with an IPv4 address.
   if [[ -z "${IFACE}" ]]; then
     IFACE="$(ip -o -4 addr show 2>/dev/null |
-      awk '$2 !~ /^(lo|docker|cni|flannel|weave|cali|veth|br-)/ && $4 !~ /^127\./ {print $2; exit}')"
+      awk '$2 !~ /^(lo|docker|cni|flannel|weave|cali|veth|br-)/ && $4 !~ /^127\./ {print $2}')"
+    IFACE="${IFACE%%$'\n'*}"
   fi
 
   [[ -n "${IFACE}" ]] || die "Unable to determine a usable IPv4 interface for Calico"
