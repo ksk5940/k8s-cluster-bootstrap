@@ -506,21 +506,30 @@ configure_crio() {
   # 1. Discover CRI-O binary from the installed package.
   # ---------------------------------------------------------------------------
   if [[ "${PKG_MGR}" == "apt" ]] && dpkg-query -W -f='${Status}' cri-o 2>/dev/null | grep -q "install ok installed"; then
-    CRIO_BIN="$(
-      dpkg -L cri-o 2>/dev/null |
-        awk '/\/crio$/ && -f $0 && -x $0 {print; exit}'
-    )"
+    CRIO_BIN=""
+    while IFS= read -r candidate; do
+      if [[ -f "${candidate}" && -x "${candidate}" ]]; then
+        CRIO_BIN="${candidate}"
+        break
+      fi
+    done < <(dpkg -L cri-o 2>/dev/null | grep -E '/crio$' || true)
   elif [[ "${PKG_MGR}" == "dnf" ]] && rpm -q cri-o &>/dev/null; then
-    CRIO_BIN="$(
-      rpm -ql cri-o 2>/dev/null |
-        awk '/\/crio$/ && -f $0 && -x $0 {print; exit}'
-    )"
+    CRIO_BIN=""
+    while IFS= read -r candidate; do
+      if [[ -f "${candidate}" && -x "${candidate}" ]]; then
+        CRIO_BIN="${candidate}"
+        break
+      fi
+    done < <(rpm -ql cri-o 2>/dev/null | grep -E '/crio$' || true)
   fi
 
   # PATH fallback for package layouts that do not expose the file through the
   # package query in the expected form.
   if [[ -z "${CRIO_BIN}" ]]; then
     CRIO_BIN="$(command -v crio 2>/dev/null || true)"
+    if [[ ! -f "${CRIO_BIN}" || ! -x "${CRIO_BIN}" ]]; then
+      CRIO_BIN=""
+    fi
   fi
 
   # Known package locations as an additional safety net.
@@ -618,7 +627,12 @@ configure_crio() {
       )"
     fi
 
-    [[ -n "${CRIO_BIN}" ]] || CRIO_BIN="$(command -v crio 2>/dev/null || true)"
+    if [[ -z "${CRIO_BIN}" ]]; then
+      CRIO_BIN="$(command -v crio 2>/dev/null || true)"
+      if [[ ! -f "${CRIO_BIN}" || ! -x "${CRIO_BIN}" ]]; then
+        CRIO_BIN=""
+      fi
+    fi
 
     if [[ -n "${UNIT_PATH:-}" && -f "${UNIT_PATH}" ]]; then
       CRIO_UNIT="$(basename "${UNIT_PATH}")"
@@ -635,8 +649,8 @@ configure_crio() {
   [[ -n "${CRIO_BIN}" ]] ||
     die "CRI-O package is installed but the crio binary could not be located"
 
-  [[ -x "${CRIO_BIN}" ]] ||
-    die "CRI-O binary is not executable: ${CRIO_BIN}"
+  [[ -f "${CRIO_BIN}" && -x "${CRIO_BIN}" ]] ||
+    die "CRI-O binary path is invalid (must be an executable regular file): ${CRIO_BIN}"
 
   [[ -n "${CRIO_UNIT}" ]] ||
     die "CRI-O package is installed but no crio/cri-o systemd service was found"
