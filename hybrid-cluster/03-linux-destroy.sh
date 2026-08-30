@@ -82,6 +82,21 @@ run_bounded() {
     fi
 }
 
+
+# Unmount all filesystems below a path, deepest-first.
+unmount_tree() {
+    local root="$1" mounts="" mountpoint=""
+    have_cmd findmnt || return 0
+    have_cmd umount || return 0
+    mounts="$(findmnt -R -n -o TARGET -- "$root" 2>/dev/null || true)"
+    [[ -n "$mounts" ]] || return 0
+    while IFS= read -r mountpoint; do
+        [[ -n "$mountpoint" ]] || continue
+        info "Unmounting filesystem: $mountpoint"
+        umount -l -- "$mountpoint" >/dev/null 2>&1 || true
+    done < <(printf '%s\n' "$mounts" | awk '{print length, $0}' | sort -rn | cut -d' ' -f2-)
+}
+
 remove_path() {
     local p="$1"
 
@@ -339,6 +354,9 @@ if [[ "$RUNTIME" == "containerd" ]]; then
     # Package names differ between distributions/install methods.
     remove_packages containerd.io containerd
 
+    unmount_tree /var/lib/containerd
+    unmount_tree /run/containerd
+
     remove_path /etc/containerd
     remove_path /var/lib/containerd
     remove_path /run/containerd
@@ -348,6 +366,12 @@ if [[ "$RUNTIME" == "containerd" ]]; then
 else
     # CRI-O package names commonly used by RPM and DEB installations.
     remove_packages cri-o cri-o-runc
+
+    kill_processes_by_name crio
+    kill_processes_by_name conmon
+    unmount_tree /var/lib/containers/storage
+    unmount_tree /run/containers
+    unmount_tree /run/crio
 
     remove_path /etc/crio
     remove_path /etc/crio/crio.conf
@@ -657,6 +681,10 @@ if [[ "$RUNTIME" == "containerd" ]]; then
     [[ ! -d /var/lib/containerd ]] || die "/var/lib/containerd still exists"
 else
     [[ ! -e /run/crio/crio.sock ]] || die "CRI-O socket still exists"
+    [[ ! -d /var/lib/containers/storage ]] || die "CRI-O storage still exists"
+    if have_cmd findmnt && findmnt -R -n /var/lib/containers/storage >/dev/null 2>&1; then
+        die "CRI-O storage still has mounted filesystems"
+    fi
 fi
 
 # Ensure Kubernetes state is gone.

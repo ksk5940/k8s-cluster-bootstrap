@@ -197,7 +197,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                 def remote = [name: host, host: host, user: params.SSH_USER,
                               password: env.SSH_PASS, allowAnyHosts: true]
                 sshCommand remote: remote,
-                  command: 'echo "SSH OK from \$(hostname) as \$(whoami)"'
+                  command: 'echo "SSH OK from $(hostname) as $(whoami)"'
                 sshCommand remote: remote,
                   command: "sudo -n whoami | grep -q root && echo 'SUDO OK' || (echo 'SUDO FAILED' && exit 1)"
               }
@@ -286,19 +286,19 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                 def registryCheck = '''
 set -eu
 
-REGISTRY_IP="\$(getent ahostsv4 registry.k8s.io 2>/dev/null | sed -n '1s/[[:space:]].*//p')"
+REGISTRY_IP="$(getent ahostsv4 registry.k8s.io 2>/dev/null | sed -n '1s/[[:space:]].*//p')"
 
-if [ -z "\$REGISTRY_IP" ]; then
+if [ -z "$REGISTRY_IP" ]; then
   echo "ERROR: registry.k8s.io has no IPv4 address on this node"
   exit 1
 fi
 
-if ! timeout 10 bash -c 'cat </dev/null >/dev/tcp/'"\$REGISTRY_IP"'/443' 2>/dev/null; then
-  echo "ERROR: registry.k8s.io:443 is unreachable over IPv4: \$REGISTRY_IP"
+if ! timeout 10 bash -c 'cat </dev/null >/dev/tcp/'"$REGISTRY_IP"'/443' 2>/dev/null; then
+  echo "ERROR: registry.k8s.io:443 is unreachable over IPv4: $REGISTRY_IP"
   exit 1
 fi
 
-echo "registry.k8s.io IPv4 connectivity OK: \$REGISTRY_IP:443"
+echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
 '''
                 sshCommand remote: host, command: registryCheck.trim()
               }
@@ -338,7 +338,7 @@ echo "registry.k8s.io IPv4 connectivity OK: \$REGISTRY_IP:443"
                      CNI_PLUGIN='${params.CNI_PLUGIN}' \\
                      POD_CIDR='${params.POD_CIDR}' \\
                      SETUP_USER='${params.SSH_USER}' \\
-                     ENABLE_FIREWALL='" + firewallValue + "' \\
+                     ENABLE_FIREWALL='${firewallValue}' \\
                      DEBIAN_FRONTEND=noninteractive && \\
               set +e
               sudo -E bash /tmp/01-linux-master-setup.sh
@@ -439,7 +439,7 @@ echo "registry.k8s.io IPv4 connectivity OK: \$REGISTRY_IP:443"
                          JOIN_COMMAND_FILE='/tmp/k8s-join-command.sh' \
                          NODE_IP='${ip}' \
                          SETUP_USER='${params.SSH_USER}' \
-                         ENABLE_FIREWALL='" + firewallValue + "' \
+                         ENABLE_FIREWALL='${firewallValue}' \
                          DEBIAN_FRONTEND=noninteractive && \
                   set +e
                   sudo -E bash /tmp/02-linux-worker-setup.sh
@@ -560,11 +560,11 @@ echo "registry.k8s.io IPv4 connectivity OK: \$REGISTRY_IP:443"
               def raw = sshCommand remote: masterRemote,
                 command: '''
                   set -o pipefail
-                  v=\\$(sudo kubectl version -o json 2>/dev/null |
+                  v=$(sudo kubectl version -o json 2>/dev/null |
                       grep -oP '"gitVersion"\\s*:\\s*"v\\K\\d+\\.\\d+\\.\\d+"' |
                       head -1) || true
-                  if [ -n "\\$v" ]; then
-                    printf '%s\\n' "\\$v"
+                  if [ -n "$v" ]; then
+                    printf '%s\\n' "$v"
                   else
                     kubelet --version 2>/dev/null |
                       grep -oP '\\d+\\.\\d+\\.\\d+' |
