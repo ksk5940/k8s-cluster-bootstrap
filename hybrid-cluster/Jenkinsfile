@@ -280,10 +280,23 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
             def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
                                 user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
             def joinFile = "${env.WORKSPACE}/.k8s-join-command.sh"
-            sshGet remote: masterRemote, from: '/tmp/k8s-join-command.sh', into: joinFile, override: true
+
+            // The join-command file is created by the privileged master setup.
+            // Do NOT use sshGet here: the SSH user may not have read permission
+            // on the root-owned file. Read it through sudo instead, without
+            // exposing the join token in the Jenkins console.
+            def joinCommand = sshCommand remote: masterRemote,
+              command: "sudo cat /tmp/k8s-join-command.sh"
+
+            if (!joinCommand?.trim()) {
+              error("Failed to extract Kubernetes join command: /tmp/k8s-join-command.sh is empty or unavailable")
+            }
+
+            writeFile file: joinFile, text: joinCommand.trim() + "\n"
             sh "chmod 600 '${joinFile}'"
+
             env.JOIN_CMD_FILE = joinFile
-            echo "Join command extracted securely."
+            echo "Join command extracted securely via sudo."
           }
         }
       }
@@ -308,6 +321,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                 def remote = [name: ip, host: ip, user: params.SSH_USER,
                               password: env.SSH_PASS, allowAnyHosts: true]
                 sshPut remote: remote, from: localWorker, into: '/tmp/02-linux-worker-setup.sh'
+                // The join command is stored in the Jenkins workspace with mode 0600.
                 sshPut remote: remote, from: env.JOIN_CMD_FILE, into: '/tmp/k8s-join-command.sh'
 
                 def tStart = System.currentTimeMillis()
