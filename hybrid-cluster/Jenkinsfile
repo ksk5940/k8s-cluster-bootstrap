@@ -262,23 +262,50 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
 
     stage('Registry Network Preflight') {
       steps {
-        withCredentials([usernamePassword(credentialsId: params.SSH_CREDS_ID, usernameVariable: 'SSH_USER', passwordVariable: 'SSH_PASS')]) {
+        withCredentials([usernamePassword(
+          credentialsId: params.SSH_CREDS_ID,
+          usernameVariable: 'SSH_USER',
+          passwordVariable: 'SSH_PASS'
+        )]) {
           script {
             def nodes = ([params.MASTER_IP] + params.WORKER_IPS.tokenize(',').collect { it.trim() }).unique()
             def branches = [:]
-            nodes.each { ip ->
-              branches["registry-check: ${ip}"] = {
-                def host = [name: ip, host: ip, user: env.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
-                sshCommand(remote: host, command: '''
-                  set -eu
-                  V4="\\$(getent ahostsv4 registry.k8s.io 2>/dev/null | awk 'NR==1{print \$1}')"
-                  test -n "\\$V4"
-                  timeout 10 bash -c "cat </dev/null >/dev/tcp/\\$V4/443"
-                  echo "registry.k8s.io IPv4 connectivity OK: \\$V4:443"
-                ''')
+
+            nodes.each { nodeIp ->
+              branches["registry-check: ${nodeIp}"] = {
+                def host = [
+                  name: nodeIp,
+                  host: nodeIp,
+                  user: env.SSH_USER,
+                  password: env.SSH_PASS,
+                  allowAnyHosts: true
+                ]
+
+                // Triple-single-quoted Groovy string: shell $ variables are
+                // not interpreted by Groovy.
+                def registryCheck = '''
+set -eu
+
+REGISTRY_IP="$(getent ahostsv4 registry.k8s.io 2>/dev/null | sed -n '1s/[[:space:]].*//p')"
+
+if [ -z "$REGISTRY_IP" ]; then
+  echo "ERROR: registry.k8s.io has no IPv4 address on this node"
+  exit 1
+fi
+
+if ! timeout 10 bash -c 'cat </dev/null >/dev/tcp/'"$REGISTRY_IP"'/443' 2>/dev/null; then
+  echo "ERROR: registry.k8s.io:443 is unreachable over IPv4: $REGISTRY_IP"
+  exit 1
+fi
+
+echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
+'''
+                sshCommand remote: host, command: registryCheck.trim()
               }
             }
+
             parallel branches
+            echo "Registry IPv4 preflight passed on all nodes."
           }
         }
       }
