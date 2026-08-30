@@ -197,7 +197,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                 def remote = [name: host, host: host, user: params.SSH_USER,
                               password: env.SSH_PASS, allowAnyHosts: true]
                 sshCommand remote: remote,
-                  command: 'echo "SSH OK from $(hostname) as $(whoami)"'
+                  command: 'echo "SSH OK from \$(hostname) as \$(whoami)"'
                 sshCommand remote: remote,
                   command: "sudo -n whoami | grep -q root && echo 'SUDO OK' || (echo 'SUDO FAILED' && exit 1)"
               }
@@ -281,24 +281,24 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                   allowAnyHosts: true
                 ]
 
-                // Triple-single-quoted Groovy string: shell $ variables are
+                // Triple-single-quoted Groovy string: shell \$ variables are
                 // not interpreted by Groovy.
                 def registryCheck = '''
 set -eu
 
-REGISTRY_IP="$(getent ahostsv4 registry.k8s.io 2>/dev/null | sed -n '1s/[[:space:]].*//p')"
+REGISTRY_IP="\$(getent ahostsv4 registry.k8s.io 2>/dev/null | sed -n '1s/[[:space:]].*//p')"
 
-if [ -z "$REGISTRY_IP" ]; then
+if [ -z "\$REGISTRY_IP" ]; then
   echo "ERROR: registry.k8s.io has no IPv4 address on this node"
   exit 1
 fi
 
-if ! timeout 10 bash -c 'cat </dev/null >/dev/tcp/'"$REGISTRY_IP"'/443' 2>/dev/null; then
-  echo "ERROR: registry.k8s.io:443 is unreachable over IPv4: $REGISTRY_IP"
+if ! timeout 10 bash -c 'cat </dev/null >/dev/tcp/'"\$REGISTRY_IP"'/443' 2>/dev/null; then
+  echo "ERROR: registry.k8s.io:443 is unreachable over IPv4: \$REGISTRY_IP"
   exit 1
 fi
 
-echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
+echo "registry.k8s.io IPv4 connectivity OK: \$REGISTRY_IP:443"
 '''
                 sshCommand remote: host, command: registryCheck.trim()
               }
@@ -343,13 +343,13 @@ echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
               set +e
               sudo -E bash /tmp/01-linux-master-setup.sh
               rc=\$?
-              if [ "\\$rc" -eq 141 ]; then
+              if [ "\$rc" -eq 141 ]; then
                 echo "Bootstrap returned 141 (SIGPIPE); retrying once..."
                 sleep 2
                 sudo -E bash /tmp/01-linux-master-setup.sh
                 rc=\$?
               fi
-              exit "\\$rc" 
+              exit "\$rc" 
             """.stripIndent().trim()
 
             recordTiming(timings, 'master', tStart, System.currentTimeMillis())
@@ -444,13 +444,13 @@ echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
                   set +e
                   sudo -E bash /tmp/02-linux-worker-setup.sh
                   rc=\$?
-                  if [ "\\$rc" -eq 141 ]; then
+                  if [ "\$rc" -eq 141 ]; then
                     echo "Worker bootstrap returned 141 (SIGPIPE); retrying once..."
                     sleep 2
                     sudo -E bash /tmp/02-linux-worker-setup.sh
                     rc=\$?
                   fi
-                  exit "\\$rc" 
+                  exit "\$rc" 
                 """.stripIndent().trim()
 
                 recordTiming(timings, "worker-${ip}", tStart, System.currentTimeMillis())
