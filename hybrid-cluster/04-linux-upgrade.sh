@@ -129,8 +129,13 @@ fi
 step "4" "Drain node"
 # =============================================================================
 
+# Do not pipe into `head -1` here: under `set -o pipefail`, if awk is still
+# writing when head closes the pipe early, awk can be killed by SIGPIPE and
+# the whole pipeline reports exit status 141 even though a match was found
+# (this is the same class of bug fixed in 01-linux-master-setup.sh's Calico
+# interface detection). Let awk terminate itself after the first match instead.
 NODE_NAME=$(kubectl get nodes --no-headers 2>/dev/null \
-  | awk -v ip="${HOSTNAME}" '$1==ip || $1==ENVIRON["HOSTNAME"]{print $1}' | head -1)
+  | awk -v ip="${HOSTNAME}" '$1==ip || $1==ENVIRON["HOSTNAME"]{print $1; exit}')
 [[ -z "${NODE_NAME}" ]] && NODE_NAME=$(hostname)
 
 if [[ "${NODE_ROLE}" == "master" ]]; then

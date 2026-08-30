@@ -150,6 +150,43 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
           if (!(params.K8S_VERSION ==~ /\d+\.\d+\.\d+/)) {
             error("K8S_VERSION must be in format MAJOR.MINOR.PATCH (e.g. 1.32.3)")
           }
+
+          // ── IPv4 address validation ──────────────────────────────────────
+          def ipv4Pattern = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+          def isValidIPv4 = { String ip ->
+            def m = (ip =~ ipv4Pattern)
+            if (!m.matches()) return false
+            return m[0][1..4].every { it.toInteger() <= 255 }
+          }
+
+          if (!isValidIPv4(params.MASTER_IP)) {
+            error("MASTER_IP is not a valid IPv4 address: ${params.MASTER_IP}")
+          }
+          workers.each { w ->
+            if (!isValidIPv4(w)) {
+              error("WORKER_IPS contains an invalid IPv4 address: ${w}")
+            }
+          }
+
+          // ── Duplicate IP validation ──────────────────────────────────────
+          if (workers.size() != workers.unique(false).size()) {
+            error("WORKER_IPS contains duplicate IP addresses: ${params.WORKER_IPS}")
+          }
+          if (workers.contains(params.MASTER_IP)) {
+            error("MASTER_IP (${params.MASTER_IP}) must not also appear in WORKER_IPS")
+          }
+          if (workers.isEmpty()) {
+            error("WORKER_IPS must contain at least one worker IP")
+          }
+
+          // ── Pod CIDR validation ───────────────────────────────────────────
+          if (!(params.POD_CIDR ==~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}$/)) {
+            error("POD_CIDR must be a valid CIDR, e.g. 10.244.0.0/16 (got: ${params.POD_CIDR})")
+          }
+
+          // RUNTIME and CNI_PLUGIN are Jenkins `choice` parameters, so the UI
+          // already restricts them to the supported enum values — no further
+          // validation needed here.
         }
       }
     }
@@ -292,7 +329,18 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
               error("Failed to extract Kubernetes join command: /tmp/k8s-join-command.sh is empty or unavailable")
             }
 
-            writeFile file: joinFile, text: joinCommand.trim() + "\n"
+            // Defense in depth: the master script already verifies the JWS
+            // signature before writing this file, but never hand an
+            // unexpected/malformed string to workers regardless of source.
+            def trimmedJoin = joinCommand.trim()
+            if (!trimmedJoin.startsWith('kubeadm join')) {
+              error("Extracted join command does not start with 'kubeadm join' — refusing to distribute it to workers")
+            }
+            if (!trimmedJoin.contains('--token') || !trimmedJoin.contains('--discovery-token-ca-cert-hash')) {
+              error("Extracted join command is missing required discovery arguments — refusing to distribute it to workers")
+            }
+
+            writeFile file: joinFile, text: trimmedJoin + "\n"
             sh "chmod 600 '${joinFile}'"
 
             env.JOIN_CMD_FILE = joinFile
@@ -330,8 +378,10 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                   chmod +x /tmp/02-linux-worker-setup.sh /tmp/k8s-join-command.sh && \
                   export K8S_VERSION='${params.K8S_VERSION}' \
                          RUNTIME='${params.RUNTIME}' \
+                         CNI_PLUGIN='${params.CNI_PLUGIN}' \
                          JOIN_COMMAND_FILE='/tmp/k8s-join-command.sh' \
                          NODE_IP='${ip}' \
+                         MASTER_IP='${params.MASTER_IP}' \
                          SETUP_USER='${params.SSH_USER}' \
                          ENABLE_FIREWALL='${params.ENABLE_FIREWALL}' \
                          DEBIAN_FRONTEND=noninteractive && \

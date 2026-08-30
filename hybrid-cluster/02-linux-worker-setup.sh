@@ -14,6 +14,7 @@ CNI_PLUGIN="${CNI_PLUGIN:-calico}"
 JOIN_COMMAND="${JOIN_COMMAND:-}"         # full kubeadm join ... string
 JOIN_COMMAND_FILE="${JOIN_COMMAND_FILE:-/tmp/k8s-join-command.sh}"
 SETUP_USER="${SETUP_USER:-k8sadmin}"
+MASTER_IP="${MASTER_IP:-}"               # control-plane IP for the TCP precheck
 
 # Kubernetes/host-only subnet.
 # Example:
@@ -58,6 +59,45 @@ ok()   { echo -e "  ${GR}[OK]${NC}   $*"; }
 warn() { echo -e "  ${YL}[WARN]${NC} $*"; }
 die()  { echo -e "  ${RD}[FAIL]${NC} $*" >&2; exit 1; }
 info() { echo -e "  ${CY}[....]${NC} $*"; }
+
+# Collect the standard set of node-side diagnostics on a join failure so the
+# Jenkins console log has enough information to root-cause without a manual
+# SSH session. Never print secrets/tokens here.
+collect_join_diagnostics() {
+  echo "──────────────── JOIN FAILURE DIAGNOSTICS ────────────────" >&2
+  echo "-- systemctl status kubelet --" >&2
+  systemctl status kubelet --no-pager -l 2>&1 | tail -40 >&2 || true
+  echo "-- journalctl -u kubelet (last 60 lines) --" >&2
+  journalctl -u kubelet -n 60 --no-pager 2>&1 >&2 || true
+  if [[ "${RUNTIME}" == "containerd" ]]; then
+    echo "-- systemctl status containerd --" >&2
+    systemctl status containerd --no-pager -l 2>&1 | tail -20 >&2 || true
+    echo "-- journalctl -u containerd (last 40 lines) --" >&2
+    journalctl -u containerd -n 40 --no-pager 2>&1 >&2 || true
+  else
+    echo "-- systemctl status crio/cri-o --" >&2
+    systemctl status crio --no-pager -l 2>&1 | tail -20 >&2 ||
+      systemctl status cri-o --no-pager -l 2>&1 | tail -20 >&2 || true
+    echo "-- journalctl -u crio/cri-o (last 40 lines) --" >&2
+    journalctl -u crio -n 40 --no-pager 2>&1 >&2 ||
+      journalctl -u cri-o -n 40 --no-pager 2>&1 >&2 || true
+  fi
+  echo "-- crictl info --" >&2
+  crictl --runtime-endpoint="${CRI_SOCKET:-}" info 2>&1 >&2 || true
+  echo "-- crictl ps -a --" >&2
+  crictl --runtime-endpoint="${CRI_SOCKET:-}" ps -a 2>&1 >&2 || true
+  echo "-- ip addr --" >&2
+  ip addr 2>&1 >&2 || true
+  echo "-- ip route --" >&2
+  ip route 2>&1 >&2 || true
+  echo "-- hostname / resolution --" >&2
+  echo "hostname: $(hostname); hostname -s: $(hostname -s)" >&2
+  getent hosts "$(hostname -s)" >&2 || echo "getent hosts: no entry" >&2
+  echo "-- time --" >&2
+  timedatectl 2>&1 >&2 || true
+  date -u >&2 || true
+  echo "────────────────────────────────────────────────────────" >&2
+}
 
 # ── APT non-interactive ───────────────────────────────────────────────────────
 export DEBIAN_FRONTEND=noninteractive
@@ -159,8 +199,22 @@ configure_firewall_worker() {
   command -v ufw &>/dev/null && FWT="ufw"
   command -v firewall-cmd &>/dev/null && FWT="firewalld"
 
-  local UFW_PORTS=(22/tcp 10250/tcp 10256/tcp 4789/udp 8472/udp 6783/tcp 6783/udp 6784/udp)
-  local FWD_PORTS=(22/tcp 10250/tcp 10256/tcp 4789/udp 8472/udp 6783/tcp 6783/udp 6784/udp)
+  # Base worker ports, plus only the CNI-specific ports the selected CNI
+  # actually needs (Calico: VXLAN 4789/udp; Flannel: VXLAN 8472/udp; Weave:
+  # 6783/tcp control + 6783-6784/udp data). CNI_PLUGIN is empty in
+  # environments that never set it (defaults to calico's port set to match
+  # the historical default rather than silently opening nothing).
+  local CNI_SEL="${CNI_PLUGIN:-calico}"
+  local CNI_PORTS=()
+  case "${CNI_SEL}" in
+    calico)  CNI_PORTS=(4789/udp) ;;
+    flannel) CNI_PORTS=(8472/udp) ;;
+    weave)   CNI_PORTS=(6783/tcp 6783/udp 6784/udp) ;;
+    *)       CNI_PORTS=(4789/udp 8472/udp 6783/tcp 6783/udp 6784/udp) ;;
+  esac
+
+  local UFW_PORTS=(22/tcp 10250/tcp 10256/tcp "${CNI_PORTS[@]}")
+  local FWD_PORTS=(22/tcp 10250/tcp 10256/tcp "${CNI_PORTS[@]}")
 
   if [[ "$enable" == "true" ]]; then
     case "$FWT" in
@@ -190,7 +244,7 @@ configure_firewall_worker() {
 
       *)
         warn "No ufw/firewalld found — skipping firewall config"
-        info "Ensure external firewall allows: 22/tcp 10250/tcp 10256/tcp 4789/udp 8472/udp"
+        info "Ensure external firewall allows: ${UFW_PORTS[*]}"
         ;;
     esac
   else
@@ -686,6 +740,32 @@ configure_crio() {
 pause_image = "registry.k8s.io/pause:3.10"
 EOF
 
+  # kubeadm/kubelet default to the systemd cgroup driver (cgroupDriver:
+  # systemd) since Kubernetes 1.22+. containerd's SystemdCgroup=true is
+  # explicitly set and verified above (see configure_containerd); CRI-O
+  # needs the equivalent guarantee here on the worker too, or pods can
+  # silently fail to schedule/start with a driver mismatch.
+  cat >/etc/crio/crio.conf.d/20-kubernetes-cgroup.conf <<'EOF'
+[crio.runtime]
+cgroup_manager = "systemd"
+conmon_cgroup = "pod"
+EOF
+
+  # CNI config/binary directories must match where kubeadm/kubelet install
+  # CNI plugins (/opt/cni/bin) and where the master's CNI manifest writes
+  # its config (/etc/cni/net.d), regardless of which CNI is selected.
+  if "${CRIO_BIN}" config 2>/dev/null | grep -q .; then
+    CRIO_MERGED_CONFIG="$("${CRIO_BIN}" config 2>/dev/null)"
+    if ! grep -q 'network_dir[[:space:]]*=[[:space:]]*"/etc/cni/net.d/*"' <<<"${CRIO_MERGED_CONFIG}"; then
+      warn "CRI-O network_dir does not appear to be /etc/cni/net.d — CNI plugin manifests may not be picked up"
+    fi
+    if ! grep -q 'plugin_dirs' <<<"${CRIO_MERGED_CONFIG}" || ! grep -q '/opt/cni/bin' <<<"${CRIO_MERGED_CONFIG}"; then
+      warn "CRI-O plugin_dirs does not appear to include /opt/cni/bin — CNI plugin binaries may not be found"
+    fi
+  else
+    info "CRI-O binary does not support 'config' dump on this build; skipping CNI path cross-check (packaged defaults expected)"
+  fi
+
   # Validate only when the executable supports the command.
   if "${CRIO_BIN}" config validate >/dev/null 2>&1; then
     :
@@ -980,6 +1060,50 @@ if [[ -z "${JOIN_COMMAND}" ]]; then
   die "No kubeadm join command supplied — cannot join cluster"
 fi
 
+# -----------------------------------------------------------------------------
+# Validate the join command before ever executing it (section 6/7 of the audit
+# requirements). It must be a genuine kubeadm-generated command with the
+# expected discovery arguments — never an arbitrary string.
+# -----------------------------------------------------------------------------
+[[ "${JOIN_COMMAND}" == kubeadm\ join* ]] ||
+  die "Refusing to run: join command does not start with 'kubeadm join'"
+[[ "${JOIN_COMMAND}" == *"--token"* ]] ||
+  die "Refusing to run: join command is missing --token"
+[[ "${JOIN_COMMAND}" == *"--discovery-token-ca-cert-hash"* ]] ||
+  die "Refusing to run: join command is missing --discovery-token-ca-cert-hash"
+
+# -----------------------------------------------------------------------------
+# Network connectivity precheck (section 35): verify the API server endpoint
+# is reachable over TCP before attempting to join. A ping-only check is not
+# sufficient — the port itself must accept connections.
+# -----------------------------------------------------------------------------
+API_ENDPOINT=$(printf '%s' "${JOIN_COMMAND}" | grep -oP 'kubeadm join \K[0-9.]+:[0-9]+' || true)
+if [[ -z "${API_ENDPOINT}" && -n "${MASTER_IP}" ]]; then
+  API_ENDPOINT="${MASTER_IP}:6443"
+fi
+
+if [[ -n "${API_ENDPOINT}" ]]; then
+  API_HOST="${API_ENDPOINT%%:*}"
+  API_PORT="${API_ENDPOINT##*:}"
+  info "Checking TCP connectivity to API server ${API_HOST}:${API_PORT}..."
+  conn_wait=0
+  conn_ok=false
+  until [[ ${conn_wait} -ge 30 ]]; do
+    if timeout 5 bash -c "cat </dev/null >/dev/tcp/${API_HOST}/${API_PORT}" 2>/dev/null; then
+      conn_ok=true
+      break
+    fi
+    sleep 2
+    conn_wait=$((conn_wait + 2))
+  done
+  [[ "${conn_ok}" == "true" ]] ||
+    die "Cannot reach API server at ${API_HOST}:${API_PORT} over TCP after 30s." \
+        "Check firewall rules and that the control plane is Ready."
+  ok "API server ${API_HOST}:${API_PORT} is reachable"
+else
+  warn "Could not determine API server endpoint to precheck (no MASTER_IP and none parsed from join command)"
+fi
+
 # Ensure runtime socket is ready
 RT_SOCK="${CRI_SOCKET#unix://}"
 
@@ -1007,12 +1131,23 @@ rm -rf \
 # Execute join with explicit CRI socket appended
 # Add the selected CRI endpoint only when the supplied join command does not
 # already specify one. Avoid eval where possible; the join command is expected
-# to be generated by kubeadm and may contain quoted arguments.
+# to be generated by kubeadm and may contain quoted arguments, so it is
+# re-parsed through a single shell invocation rather than eval'd or manually
+# tokenized (which risks corrupting valid kubeadm arguments).
+set +e
 if [[ "${JOIN_COMMAND}" == *"--cri-socket"* ]]; then
   bash -c "${JOIN_COMMAND}"
 else
   bash -c "${JOIN_COMMAND} --cri-socket ${CRI_SOCKET}"
 fi
+JOIN_RC=$?
+set -e
+
+if [[ ${JOIN_RC} -ne 0 ]]; then
+  collect_join_diagnostics
+  die "kubeadm join failed (exit ${JOIN_RC}) — see diagnostics above"
+fi
+
 rm -f -- "${JOIN_COMMAND_FILE}" 2>/dev/null || true
 
 ok "Node joined cluster"

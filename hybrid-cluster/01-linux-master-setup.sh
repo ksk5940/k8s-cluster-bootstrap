@@ -623,6 +623,36 @@ configure_crio() {
 pause_image = "registry.k8s.io/pause:3.10"
 EOF
 
+  # kubeadm/kubelet default to the systemd cgroup driver (cgroupDriver:
+  # systemd) since Kubernetes 1.22+. containerd's SystemdCgroup=true is
+  # explicitly set and verified above; CRI-O needs the equivalent guarantee.
+  # A driver mismatch between kubelet and the CRI does not fail loudly — pods
+  # simply fail to schedule/start with confusing cgroup errors, and this is
+  # the kind of gap that only surfaces on the CRI-O combinations. Do not rely
+  # on the packaged default; pin it explicitly.
+  cat >/etc/crio/crio.conf.d/20-kubernetes-cgroup.conf <<'EOF'
+[crio.runtime]
+cgroup_manager = "systemd"
+conmon_cgroup = "pod"
+EOF
+
+  # CNI config/binary directories must match where kubeadm/kubelet install
+  # CNI plugins (/opt/cni/bin) and where the CNI manifest (Calico/Flannel)
+  # writes its config (/etc/cni/net.d). These are CRI-O's packaged defaults,
+  # but verify rather than assume — a mismatch here silently breaks pod
+  # networking regardless of which CNI is selected.
+  if "${CRIO_BIN}" config 2>/dev/null | grep -q .; then
+    CRIO_MERGED_CONFIG="$("${CRIO_BIN}" config 2>/dev/null)"
+    if ! grep -q 'network_dir[[:space:]]*=[[:space:]]*"/etc/cni/net.d/*"' <<<"${CRIO_MERGED_CONFIG}"; then
+      warn "CRI-O network_dir does not appear to be /etc/cni/net.d — CNI plugin manifests may not be picked up"
+    fi
+    if ! grep -q 'plugin_dirs' <<<"${CRIO_MERGED_CONFIG}" || ! grep -q '/opt/cni/bin' <<<"${CRIO_MERGED_CONFIG}"; then
+      warn "CRI-O plugin_dirs does not appear to include /opt/cni/bin — CNI plugin binaries may not be found"
+    fi
+  else
+    info "CRI-O binary does not support 'config' dump on this build; skipping CNI path cross-check (packaged defaults expected)"
+  fi
+
   # Validate only when the executable supports the command.
   if "${CRIO_BIN}" config validate >/dev/null 2>&1; then
     :
@@ -795,14 +825,17 @@ ok "kubeadm init complete"
 step "5/9" "Configuring kubectl for ${SETUP_USER}"
 # =============================================================================
 
-USER_HOME=$(eval echo "~${SETUP_USER}")
+USER_HOME=$(getent passwd "${SETUP_USER}" | cut -d: -f6)
+[[ -n "${USER_HOME}" && -d "${USER_HOME}" ]] || die "Could not resolve home directory for user ${SETUP_USER}"
 mkdir -p "${USER_HOME}/.kube"
 cp /etc/kubernetes/admin.conf "${USER_HOME}/.kube/config"
 chown -R "${SETUP_USER}:${SETUP_USER}" "${USER_HOME}/.kube"
+chmod 600 "${USER_HOME}/.kube/config"
 
 # Also configure for root
 mkdir -p /root/.kube
 cp /etc/kubernetes/admin.conf /root/.kube/config
+chmod 600 /root/.kube/config
 export KUBECONFIG=/etc/kubernetes/admin.conf
 
 ok "kubectl configured for ${SETUP_USER} and root"
@@ -1057,14 +1090,73 @@ wait_for_cni
 wait_for_system_pods
 
 # =============================================================================
-step "8/9" "Generating secure join command"
+step "8/9" "Generating and verifying secure join command"
 # =============================================================================
 
-JOIN_CMD=$(kubeadm token create --print-join-command 2>/dev/null)
+# -----------------------------------------------------------------------------
+# CRITICAL (historical failure A):
+#   "couldn't validate the identity of the API Server: could not find a JWS
+#    signature in the cluster-info ConfigMap for token ID ..."
+#
+# kubeadm's bootstrap-token discovery requires that the token's JWS signature
+# has actually been published to kube-public/cluster-info by the
+# bootstrap-signer controller BEFORE any worker uses that token to join.
+# Publication is asynchronous — "token create" returning successfully does
+# NOT guarantee the JWS has landed yet. We must generate the token, extract
+# its ID, and poll cluster-info for the matching jws-kubeconfig-<id> entry
+# before the join command is handed to any worker.
+# -----------------------------------------------------------------------------
+
+JOIN_CMD=$(kubeadm token create --ttl 24h --print-join-command 2>/dev/null)
 [[ -n "${JOIN_CMD}" ]] || die "Failed to generate kubeadm join command"
+
+# Validate the shape of what kubeadm gave us before trusting it further.
+[[ "${JOIN_CMD}" == kubeadm\ join* ]] ||
+  die "Generated join command does not start with 'kubeadm join': ${JOIN_CMD%% *}..."
+[[ "${JOIN_CMD}" == *"--token"* ]] ||
+  die "Generated join command is missing --token"
+[[ "${JOIN_CMD}" == *"--discovery-token-ca-cert-hash"* ]] ||
+  die "Generated join command is missing --discovery-token-ca-cert-hash"
+
+# Extract the token ID (the part before the dot in <id>.<secret>).
+TOKEN_ID=$(printf '%s' "${JOIN_CMD}" | grep -oP -- '--token\s+\K[a-z0-9]+(?=\.)')
+[[ -n "${TOKEN_ID}" ]] || die "Could not parse token ID from generated join command"
+info "Bootstrap token ID: ${TOKEN_ID}"
+
+# Poll kube-public/cluster-info for the signer to publish this token's JWS.
+# This is asynchronous — retry with a bounded timeout instead of assuming
+# it is already present.
+JWS_KEY="jws-kubeconfig-${TOKEN_ID}"
+jws_wait=0
+jws_timeout=60
+jws_found=false
+info "Waiting for JWS signature (${JWS_KEY}) in kube-public/cluster-info..."
+while (( jws_wait < jws_timeout )); do
+  if kubectl -n kube-public get configmap cluster-info \
+       -o jsonpath="{.data.${JWS_KEY}}" 2>/dev/null | grep -q .; then
+    jws_found=true
+    break
+  fi
+  sleep 2
+  jws_wait=$((jws_wait + 2))
+done
+
+if [[ "${jws_found}" != "true" ]]; then
+  warn "JWS signature for token ${TOKEN_ID} did not appear within ${jws_timeout}s"
+  info "cluster-info ConfigMap keys currently present:"
+  kubectl -n kube-public get configmap cluster-info -o jsonpath='{.data}' 2>/dev/null |
+    grep -oP '"jws-kubeconfig-[a-z0-9]+"' || true
+  echo "" >&2
+  die "Refusing to hand out an unverified join token. The bootstrap-signer" \
+      "controller never published a JWS signature for token ID ${TOKEN_ID}." \
+      "Workers must NEVER be started with an unverified join command."
+fi
+
+ok "JWS signature verified for token ${TOKEN_ID} (${jws_wait}s)"
+
 printf '%s\n' "${JOIN_CMD}" >/tmp/k8s-join-command.sh
 chmod 600 /tmp/k8s-join-command.sh
-ok "Join command generated and stored securely"
+ok "Verified join command generated and stored securely (mode 600)"
 
 # =============================================================================
 step "9/9" "Final cluster state"

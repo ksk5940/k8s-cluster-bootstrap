@@ -166,10 +166,19 @@ case "${RUNTIME}" in
 esac
 
 if command -v kubeadm &>/dev/null; then
+  # Destroy must tolerate partially-configured/broken nodes (a runtime that
+  # never started, a node that never fully joined, etc). We deliberately do
+  # NOT use --ignore-preflight-errors=all here: that would silently swallow
+  # every preflight class, including ones worth knowing about. Ignore only
+  # the specific checks that legitimately fire on a torn-down/partial node.
   if [[ -n "${CRI_SOCKET}" ]]; then
-    kubeadm reset -f --cri-socket "${CRI_SOCKET}" --ignore-preflight-errors=all 2>/dev/null || true
+    kubeadm reset -f --cri-socket "${CRI_SOCKET}" \
+      --ignore-preflight-errors=CRI,Swap,FileAvailable--etc-kubernetes-manifests-etcd.yaml \
+      2>/dev/null || true
   else
-    kubeadm reset -f --ignore-preflight-errors=all 2>/dev/null || true
+    kubeadm reset -f \
+      --ignore-preflight-errors=CRI,Swap,FileAvailable--etc-kubernetes-manifests-etcd.yaml \
+      2>/dev/null || true
   fi
   ok "kubeadm reset complete"
 else
