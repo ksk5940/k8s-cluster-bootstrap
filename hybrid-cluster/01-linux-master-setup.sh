@@ -445,12 +445,12 @@ configure_crio() {
   if [[ "${PKG_MGR}" == "apt" ]] && dpkg-query -W -f='${Status}' cri-o 2>/dev/null | grep -q "install ok installed"; then
     CRIO_BIN="$(
       dpkg -L cri-o 2>/dev/null |
-        awk '/\/crio$/ && -x $0 {print; exit}'
+        awk '/\/crio$/ && -f $0 && -x $0 {print; exit}'
     )"
   elif [[ "${PKG_MGR}" == "dnf" ]] && rpm -q cri-o &>/dev/null; then
     CRIO_BIN="$(
       rpm -ql cri-o 2>/dev/null |
-        awk '/\/crio$/ && -x $0 {print; exit}'
+        awk '/\/crio$/ && -f $0 && -x $0 {print; exit}'
     )"
   fi
 
@@ -467,7 +467,7 @@ configure_crio() {
       /usr/sbin/crio \
       /usr/libexec/crio \
       /usr/local/bin/crio; do
-      if [[ -x "${candidate}" ]]; then
+      if [[ -f "${candidate}" && -x "${candidate}" ]]; then
         CRIO_BIN="${candidate}"
         break
       fi
@@ -538,7 +538,7 @@ configure_crio() {
     if [[ "${PKG_MGR}" == "apt" ]]; then
       CRIO_BIN="$(
         dpkg -L cri-o 2>/dev/null |
-          awk '/\/crio$/ && -x $0 {print; exit}'
+          awk '/\/crio$/ && -f $0 && -x $0 {print; exit}'
       )"
       UNIT_PATH="$(
         dpkg -L cri-o 2>/dev/null |
@@ -547,7 +547,7 @@ configure_crio() {
     else
       CRIO_BIN="$(
         rpm -ql cri-o 2>/dev/null |
-          awk '/\/crio$/ && -x $0 {print; exit}'
+          awk '/\/crio$/ && -f $0 && -x $0 {print; exit}'
       )"
       UNIT_PATH="$(
         rpm -ql cri-o 2>/dev/null |
