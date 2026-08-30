@@ -431,13 +431,52 @@ PYEOF
   ok "containerd ${CONTAINERD_VERSION} installed and configured (SystemdCgroup=true, sandbox=${PAUSE_IMAGE})"
 }
 configure_crio() {
-  # CRI-O normally installs crio.service. Some package builds expose the
-  # unit under a different alias or fail to register the unit with systemd.
-  # Discover the installed unit instead of hard-coding one service name.
+  # CRI-O package layouts can differ slightly between distro/package builds.
+  # Discover the service and binary from the package itself instead of relying
+  # only on PATH or one hard-coded systemd location.
   systemctl daemon-reload 2>/dev/null || true
 
   local CRIO_UNIT=""
-  local candidate
+  local CRIO_BIN=""
+
+  # ---------------------------------------------------------------------------
+  # 1. Discover CRI-O binary from the installed package.
+  # ---------------------------------------------------------------------------
+  if [[ "${PKG_MGR}" == "apt" ]] && dpkg-query -W -f='${Status}' cri-o 2>/dev/null | grep -q "install ok installed"; then
+    CRIO_BIN="$(
+      dpkg -L cri-o 2>/dev/null |
+        awk '/\/crio$/ && -x $0 {print; exit}'
+    )"
+  elif [[ "${PKG_MGR}" == "dnf" ]] && rpm -q cri-o &>/dev/null; then
+    CRIO_BIN="$(
+      rpm -ql cri-o 2>/dev/null |
+        awk '/\/crio$/ && -x $0 {print; exit}'
+    )"
+  fi
+
+  # PATH fallback for package layouts that do not expose the file through the
+  # package query in the expected form.
+  if [[ -z "${CRIO_BIN}" ]]; then
+    CRIO_BIN="$(command -v crio 2>/dev/null || true)"
+  fi
+
+  # Known package locations as an additional safety net.
+  if [[ -z "${CRIO_BIN}" ]]; then
+    for candidate in \
+      /usr/bin/crio \
+      /usr/sbin/crio \
+      /usr/libexec/crio \
+      /usr/local/bin/crio; do
+      if [[ -x "${candidate}" ]]; then
+        CRIO_BIN="${candidate}"
+        break
+      fi
+    done
+  fi
+
+  # ---------------------------------------------------------------------------
+  # 2. Discover the systemd unit from systemd and from the package file list.
+  # ---------------------------------------------------------------------------
   for candidate in crio.service cri-o.service; do
     if systemctl cat "${candidate}" &>/dev/null; then
       CRIO_UNIT="${candidate}"
@@ -445,13 +484,34 @@ configure_crio() {
     fi
   done
 
-  # Also inspect common systemd unit locations.
+  if [[ -z "${CRIO_UNIT}" ]]; then
+    local UNIT_PATH=""
+    if [[ "${PKG_MGR}" == "apt" ]] && dpkg-query -W -f='${Status}' cri-o 2>/dev/null | grep -q "install ok installed"; then
+      UNIT_PATH="$(
+        dpkg -L cri-o 2>/dev/null |
+          awk '/\/(crio|cri-o)\.service$/ {print; exit}'
+      )"
+    elif [[ "${PKG_MGR}" == "dnf" ]] && rpm -q cri-o &>/dev/null; then
+      UNIT_PATH="$(
+        rpm -ql cri-o 2>/dev/null |
+          awk '/\/(crio|cri-o)\.service$/ {print; exit}'
+      )"
+    fi
+
+    if [[ -n "${UNIT_PATH}" && -f "${UNIT_PATH}" ]]; then
+      CRIO_UNIT="$(basename "${UNIT_PATH}")"
+    fi
+  fi
+
+  # Common systemd locations.
   if [[ -z "${CRIO_UNIT}" ]]; then
     for candidate in \
       /usr/lib/systemd/system/crio.service \
       /lib/systemd/system/crio.service \
       /usr/lib/systemd/system/cri-o.service \
-      /lib/systemd/system/cri-o.service; do
+      /lib/systemd/system/cri-o.service \
+      /usr/local/lib/systemd/system/crio.service \
+      /usr/local/lib/systemd/system/cri-o.service; do
       if [[ -f "${candidate}" ]]; then
         CRIO_UNIT="$(basename "${candidate}")"
         break
@@ -459,62 +519,89 @@ configure_crio() {
     done
   fi
 
-  # Last-resort recovery for a package that contains the CRI-O binary but
-  # failed to install/register its systemd unit.
-  if [[ -z "${CRIO_UNIT}" ]]; then
-    local CRIO_BIN=""
-    CRIO_BIN="$(command -v crio 2>/dev/null || true)"
+  # ---------------------------------------------------------------------------
+  # 3. If package metadata says CRI-O is installed but its files are missing,
+  #    repair the package. Do not manufacture a fake systemd unit.
+  # ---------------------------------------------------------------------------
+  if [[ -z "${CRIO_BIN}" || -z "${CRIO_UNIT}" ]]; then
+    warn "CRI-O package is installed but its runtime/service files were not discovered."
+    info "Repairing the CRI-O package installation."
 
-    if [[ -n "${CRIO_BIN}" ]]; then
-      info "CRI-O binary found at ${CRIO_BIN}, but no systemd unit was registered."
-      info "Creating a minimal managed systemd unit for this package layout."
+    if [[ "${PKG_MGR}" == "apt" ]]; then
+      apt-get install ${APT_OPTS} --reinstall cri-o
+    elif [[ "${PKG_MGR}" == "dnf" ]]; then
+      dnf reinstall -y cri-o
+    fi
 
-      cat >/etc/systemd/system/crio.service <<EOF
-[Unit]
-Description=CRI-O Container Runtime
-Wants=network-online.target
-After=network-online.target
-Before=kubelet.service
+    systemctl daemon-reload 2>/dev/null || true
 
-[Service]
-Type=notify
-EnvironmentFile=-/etc/sysconfig/crio
-ExecStart=${CRIO_BIN}
-Restart=on-failure
-RestartSec=10
-TasksMax=infinity
-LimitNPROC=1048576
-LimitCORE=infinity
-OOMScoreAdjust=-999
-TimeoutStartSec=0
+    if [[ "${PKG_MGR}" == "apt" ]]; then
+      CRIO_BIN="$(
+        dpkg -L cri-o 2>/dev/null |
+          awk '/\/crio$/ && -x $0 {print; exit}'
+      )"
+      UNIT_PATH="$(
+        dpkg -L cri-o 2>/dev/null |
+          awk '/\/(crio|cri-o)\.service$/ {print; exit}'
+      )"
+    else
+      CRIO_BIN="$(
+        rpm -ql cri-o 2>/dev/null |
+          awk '/\/crio$/ && -x $0 {print; exit}'
+      )"
+      UNIT_PATH="$(
+        rpm -ql cri-o 2>/dev/null |
+          awk '/\/(crio|cri-o)\.service$/ {print; exit}'
+      )"
+    fi
 
-[Install]
-WantedBy=multi-user.target
-EOF
+    [[ -n "${CRIO_BIN}" ]] || CRIO_BIN="$(command -v crio 2>/dev/null || true)"
 
-      systemctl daemon-reload
-      CRIO_UNIT="crio.service"
+    if [[ -n "${UNIT_PATH:-}" && -f "${UNIT_PATH}" ]]; then
+      CRIO_UNIT="$(basename "${UNIT_PATH}")"
+    else
+      for candidate in crio.service cri-o.service; do
+        if systemctl cat "${candidate}" &>/dev/null; then
+          CRIO_UNIT="${candidate}"
+          break
+        fi
+      done
     fi
   fi
 
-  [[ -n "${CRIO_UNIT}" ]] ||
-    die "CRI-O package is installed but no usable crio systemd unit/binary was found"
+  [[ -n "${CRIO_BIN}" ]] ||
+    die "CRI-O package is installed but the crio binary could not be located"
 
+  [[ -x "${CRIO_BIN}" ]] ||
+    die "CRI-O binary is not executable: ${CRIO_BIN}"
+
+  [[ -n "${CRIO_UNIT}" ]] ||
+    die "CRI-O package is installed but no crio/cri-o systemd service was found"
+
+  info "CRI-O binary: ${CRIO_BIN}"
+  info "CRI-O systemd unit: ${CRIO_UNIT}"
+
+  # ---------------------------------------------------------------------------
+  # 4. Start CRI-O and verify the actual CRI socket.
+  # ---------------------------------------------------------------------------
   systemctl enable --now "${CRIO_UNIT}" ||
     die "Failed to start ${CRIO_UNIT}. Check: journalctl -u ${CRIO_UNIT} -n 100 --no-pager"
 
   local sock="/var/run/crio/crio.sock"
   local retries=0
-  while [[ ! -S "${sock}" && ${retries} -lt 30 ]]; do
+
+  while [[ ${retries} -lt 30 ]]; do
+    if systemctl is-active --quiet "${CRIO_UNIT}" && [[ -S "${sock}" ]]; then
+      break
+    fi
     sleep 1
     retries=$((retries + 1))
   done
 
-  [[ -S "${sock}" ]] ||
-    die "CRI-O service is active but CRI socket ${sock} was not created"
+  [[ -S "${sock}" ]] && systemctl is-active --quiet "${CRIO_UNIT}" ||
+    die "CRI-O did not become ready. Check: systemctl status ${CRIO_UNIT} -l --no-pager; journalctl -u ${CRIO_UNIT} -n 100 --no-pager"
 
-  # Kubernetes kubeadm expects the CRI sandbox/pause image to be explicit.
-  # Keep the same image on every node so kubeadm and CRI-O agree.
+  # Kubernetes kubeadm expects an explicit, consistent sandbox image.
   mkdir -p /etc/crio/crio.conf.d
 
   cat >/etc/crio/crio.conf.d/10-kubernetes-pause.conf <<'EOF'
@@ -522,36 +609,32 @@ EOF
 pause_image = "registry.k8s.io/pause:3.10"
 EOF
 
-  # Validate that CRI-O can parse the configuration before proceeding.
-  if have_cmd crio; then
-    crio config validate >/dev/null 2>&1 ||
-      die "CRI-O configuration validation failed after setting pause_image"
+  # Validate only when the executable supports the command.
+  if "${CRIO_BIN}" config validate >/dev/null 2>&1; then
+    :
+  else
+    # Some packaged CRI-O builds do not expose "config validate".
+    # The service restart below remains the authoritative configuration check.
+    info "CRI-O config validate is unavailable or returned non-zero; validating via service restart."
   fi
 
-  # The pause_image option supports live reload, but restart here gives the
-  # bootstrap a deterministic runtime state before kubeadm init/join.
   systemctl restart "${CRIO_UNIT}" ||
     die "Failed to restart ${CRIO_UNIT} after configuring pause_image"
 
-  local pause_retries=0
-  while [[ ${pause_retries} -lt 30 ]]; do
-    if [[ -S "${sock}" ]] && systemctl is-active --quiet "${CRIO_UNIT}"; then
+  retries=0
+  while [[ ${retries} -lt 30 ]]; do
+    if systemctl is-active --quiet "${CRIO_UNIT}" && [[ -S "${sock}" ]]; then
       break
     fi
     sleep 1
-    pause_retries=$((pause_retries + 1))
+    retries=$((retries + 1))
   done
 
   [[ -S "${sock}" ]] && systemctl is-active --quiet "${CRIO_UNIT}" ||
     die "CRI-O did not become ready after pause_image configuration"
 
-  ok "CRI-O installed and running (${CRIO_UNIT}, socket=${sock}, sandbox=registry.k8s.io/pause:3.10)"
+  ok "CRI-O installed and running (${CRIO_UNIT}, binary=${CRIO_BIN}, socket=${sock}, sandbox=registry.k8s.io/pause:3.10)"
 }
-
-
-
-
-
 case "${RUNTIME}" in
   containerd)
     if [[ "$PKG_MGR" == "apt" ]]; then install_containerd_apt; else install_containerd_dnf; fi
