@@ -197,7 +197,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                 def remote = [name: host, host: host, user: params.SSH_USER,
                               password: env.SSH_PASS, allowAnyHosts: true]
                 sshCommand remote: remote,
-                  command: "echo \"SSH OK from \$(hostname) as \$(whoami)\""
+                  command: "echo \"SSH OK from \\$(hostname) as \\$(whoami)\""
                 sshCommand remote: remote,
                   command: "sudo -n whoami | grep -q root && echo 'SUDO OK' || (echo 'SUDO FAILED' && exit 1)"
               }
@@ -271,10 +271,10 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                 def host = [name: ip, host: ip, user: env.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
                 sshCommand(remote: host, command: '''
                   set -eu
-                  V4="\$(getent ahostsv4 registry.k8s.io 2>/dev/null | awk 'NR==1{print $1}')"
-                  test -n "\$V4"
-                  timeout 10 bash -c "cat </dev/null >/dev/tcp/\$V4/443"
-                  echo "registry.k8s.io IPv4 connectivity OK: \$V4:443"
+                  V4="\\$(getent ahostsv4 registry.k8s.io 2>/dev/null | awk 'NR==1{print \$1}')"
+                  test -n "\\$V4"
+                  timeout 10 bash -c "cat </dev/null >/dev/tcp/\\$V4/443"
+                  echo "registry.k8s.io IPv4 connectivity OK: \\$V4:443"
                 ''')
               }
             }
@@ -311,18 +311,18 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                      CNI_PLUGIN='${params.CNI_PLUGIN}' \\
                      POD_CIDR='${params.POD_CIDR}' \\
                      SETUP_USER='${params.SSH_USER}' \\
-                     ENABLE_FIREWALL='${firewallValue}' \\
+                     ENABLE_FIREWALL='" + firewallValue + "' \\
                      DEBIAN_FRONTEND=noninteractive && \\
               set +e
               sudo -E bash /tmp/01-linux-master-setup.sh
-              rc=$?
-              if [ "\$rc" -eq 141 ]; then
+              rc=\$?
+              if [ "\\$rc" -eq 141 ]; then
                 echo "Bootstrap returned 141 (SIGPIPE); retrying once..."
                 sleep 2
                 sudo -E bash /tmp/01-linux-master-setup.sh
-                rc=$?
+                rc=\$?
               fi
-              exit "\$rc" 
+              exit "\\$rc" 
             """.stripIndent().trim()
 
             recordTiming(timings, 'master', tStart, System.currentTimeMillis())
@@ -412,18 +412,18 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                          JOIN_COMMAND_FILE='/tmp/k8s-join-command.sh' \
                          NODE_IP='${ip}' \
                          SETUP_USER='${params.SSH_USER}' \
-                         ENABLE_FIREWALL='${firewallValue}' \
+                         ENABLE_FIREWALL='" + firewallValue + "' \
                          DEBIAN_FRONTEND=noninteractive && \
                   set +e
                   sudo -E bash /tmp/02-linux-worker-setup.sh
-                  rc=$?
-                  if [ "\$rc" -eq 141 ]; then
+                  rc=\$?
+                  if [ "\\$rc" -eq 141 ]; then
                     echo "Worker bootstrap returned 141 (SIGPIPE); retrying once..."
                     sleep 2
                     sudo -E bash /tmp/02-linux-worker-setup.sh
-                    rc=$?
+                    rc=\$?
                   fi
-                  exit "\$rc" 
+                  exit "\\$rc" 
                 """.stripIndent().trim()
 
                 recordTiming(timings, "worker-${ip}", tStart, System.currentTimeMillis())
@@ -533,11 +533,11 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
               def raw = sshCommand remote: masterRemote,
                 command: '''
                   set -o pipefail
-                  v=\$(sudo kubectl version -o json 2>/dev/null |
+                  v=\\$(sudo kubectl version -o json 2>/dev/null |
                       grep -oP '"gitVersion"\\s*:\\s*"v\\K\\d+\\.\\d+\\.\\d+"' |
                       head -1) || true
-                  if [ -n "\$v" ]; then
-                    printf '%s\\n' "\$v"
+                  if [ -n "\\$v" ]; then
+                    printf '%s\\n' "\\$v"
                   else
                     kubelet --version 2>/dev/null |
                       grep -oP '\\d+\\.\\d+\\.\\d+' |
