@@ -127,28 +127,6 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
   stages {
 
     // ── 0. Validate ───────────────────────────────────────────────────────────
-    stage('Validate Repository') {
-      steps {
-        script {
-          def required = [
-            '00-set-static-ip-hostname.sh',
-            '01-linux-master-setup.sh',
-            '02-linux-worker-setup.sh',
-            '03-linux-destroy.sh',
-            '04-linux-upgrade.sh',
-            '07-validate.sh'
-          ]
-          def missing = required.findAll { f ->
-            !fileExists("${env.WORKSPACE}/${SCRIPT_DIR}/${f}")
-          }
-          if (!missing.isEmpty()) {
-            error("Required cluster script(s) missing from ${SCRIPT_DIR}: ${missing.join(', ')}")
-          }
-          echo "Repository preflight passed: ${required.size()} required scripts present."
-        }
-      }
-    }
-
     stage('Validate Inputs') {
       steps {
         script {
@@ -167,14 +145,10 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
 
           if (!params.MASTER_IP?.trim())  error('MASTER_IP is required')
           if (!params.WORKER_IPS?.trim()) error('WORKER_IPS is required')
+          if (!params.K8S_VERSION?.trim()) error('K8S_VERSION is required')
 
-          if (params.ACTION in ['bootstrap', 'reset', 'upgrade']) {
-            if (!params.K8S_VERSION?.trim()) {
-              error('K8S_VERSION is required for bootstrap/reset/upgrade')
-            }
-            if (!(params.K8S_VERSION ==~ /\d+\.\d+\.\d+/)) {
-              error("K8S_VERSION must be in format MAJOR.MINOR.PATCH (e.g. 1.32.3)")
-            }
+          if (!(params.K8S_VERSION ==~ /\d+\.\d+\.\d+/)) {
+            error("K8S_VERSION must be in format MAJOR.MINOR.PATCH (e.g. 1.32.3)")
           }
         }
       }
@@ -197,7 +171,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                 def remote = [name: host, host: host, user: params.SSH_USER,
                               password: env.SSH_PASS, allowAnyHosts: true]
                 sshCommand remote: remote,
-                  command: 'echo "SSH OK from $(hostname) as $(whoami)"'
+                  command: 'echo \"SSH OK from $(hostname) as $(whoami)\"'
                 sshCommand remote: remote,
                   command: "sudo -n whoami | grep -q root && echo 'SUDO OK' || (echo 'SUDO FAILED' && exit 1)"
               }
@@ -211,11 +185,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
 
     // ── 1b. Optional: Set Static IP + Hostname ────────────────────────────────
     stage('Set Static IP and Hostname') {
-      when {
-        expression {
-          params.SET_STATIC_IP && params.ACTION in ['bootstrap', 'reset']
-        }
-      }
+      when { expression { params.SET_STATIC_IP } }
       steps {
         withCredentials([usernamePassword(
             credentialsId: params.SSH_CREDS_ID,
@@ -260,57 +230,6 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
     //  BOOTSTRAP  (master first, then workers in parallel)
     // ═════════════════════════════════════════════════════════════════════════
 
-    stage('Registry Network Preflight') {
-      steps {
-        withCredentials([usernamePassword(
-          credentialsId: params.SSH_CREDS_ID,
-          usernameVariable: 'SSH_USER',
-          passwordVariable: 'SSH_PASS'
-        )]) {
-          script {
-            def nodes = ([params.MASTER_IP] + params.WORKER_IPS.tokenize(',').collect { it.trim() }).unique()
-            def branches = [:]
-
-            nodes.each { nodeIp ->
-              branches["registry-check: ${nodeIp}"] = {
-                def host = [
-                  name: nodeIp,
-                  host: nodeIp,
-                  user: env.SSH_USER,
-                  password: env.SSH_PASS,
-                  allowAnyHosts: true
-                ]
-
-                // Triple-single-quoted Groovy string: shell \$ variables are
-                // not interpreted by Groovy.
-                def registryCheck = '''
-set -eu
-
-REGISTRY_IP="$(getent ahostsv4 registry.k8s.io 2>/dev/null | sed -n '1s/[[:space:]].*//p')"
-
-if [ -z "$REGISTRY_IP" ]; then
-  echo "ERROR: registry.k8s.io has no IPv4 address on this node"
-  exit 1
-fi
-
-if ! timeout 10 bash -c 'cat </dev/null >/dev/tcp/'"$REGISTRY_IP"'/443' 2>/dev/null; then
-  echo "ERROR: registry.k8s.io:443 is unreachable over IPv4: $REGISTRY_IP"
-  exit 1
-fi
-
-echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
-'''
-                sshCommand remote: host, command: registryCheck.trim()
-              }
-            }
-
-            parallel branches
-            echo "Registry IPv4 preflight passed on all nodes."
-          }
-        }
-      }
-    }
-
     stage('Provision Master Node') {
       when { expression { params.ACTION in ['bootstrap', 'reset'] } }
       steps {
@@ -328,7 +247,6 @@ echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
             sshPut remote: masterRemote, from: localMaster, into: '/tmp/01-linux-master-setup.sh'
 
             def tStart = System.currentTimeMillis()
-            def firewallValue = params.ENABLE_FIREWALL.toString()
             sshCommand remote: masterRemote, command: """
               sed -i 's/\\r//' /tmp/01-linux-master-setup.sh && \\
               chmod +x /tmp/01-linux-master-setup.sh && \\
@@ -338,18 +256,9 @@ echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
                      CNI_PLUGIN='${params.CNI_PLUGIN}' \\
                      POD_CIDR='${params.POD_CIDR}' \\
                      SETUP_USER='${params.SSH_USER}' \\
-                     ENABLE_FIREWALL='${firewallValue}' \\
+                     ENABLE_FIREWALL='${params.ENABLE_FIREWALL}' \\
                      DEBIAN_FRONTEND=noninteractive && \\
-              set +e
               sudo -E bash /tmp/01-linux-master-setup.sh
-              rc=\$?
-              if [ "\$rc" -eq 141 ]; then
-                echo "Bootstrap returned 141 (SIGPIPE); retrying once..."
-                sleep 2
-                sudo -E bash /tmp/01-linux-master-setup.sh
-                rc=\$?
-              fi
-              exit "\$rc" 
             """.stripIndent().trim()
 
             recordTiming(timings, 'master', tStart, System.currentTimeMillis())
@@ -370,38 +279,11 @@ echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
           script {
             def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
                                 user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
-            // The join-command file is root-owned on the master.
-            // Do NOT use sshGet/SFTP here because SFTP cannot sudo.
-            // Read it through the existing NOPASSWD sudo permission instead.
-            def joinCommand = sshCommand(
-              remote: masterRemote,
-              command: "sudo -n cat /tmp/k8s-join-command.sh"
-            ).trim()
-
-            if (!joinCommand) {
-              error("Failed to extract Kubernetes join command from master")
-            }
-
-            // Basic safety validation: kubeadm join must be the command
-            // generated by the master setup script.
-            if (!joinCommand.startsWith("kubeadm join ")) {
-              error("Invalid kubeadm join command received from master")
-            }
-            if (joinCommand.contains("\n") || joinCommand.contains("\r")) {
-              error("Join command contains unexpected newline characters")
-            }
-
             def joinFile = "${env.WORKSPACE}/.k8s-join-command.sh"
-
-            writeFile(
-              file: joinFile,
-              text: "${joinCommand}\n"
-            )
-
+            sshGet remote: masterRemote, from: '/tmp/k8s-join-command.sh', into: joinFile, override: true
             sh "chmod 600 '${joinFile}'"
-
             env.JOIN_CMD_FILE = joinFile
-            echo "Join command extracted securely via sudo."
+            echo "Join command extracted securely."
           }
         }
       }
@@ -418,7 +300,6 @@ echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
           script {
             def workers     = params.WORKER_IPS.tokenize(',').collect { it.trim() }
             def localWorker = "${env.WORKSPACE}/${SCRIPT_DIR}/02-linux-worker-setup.sh"
-            def firewallValue = params.ENABLE_FIREWALL.toString()
             def branches    = [:]
 
             workers.each { workerIp ->
@@ -435,22 +316,12 @@ echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
                   chmod +x /tmp/02-linux-worker-setup.sh /tmp/k8s-join-command.sh && \
                   export K8S_VERSION='${params.K8S_VERSION}' \
                          RUNTIME='${params.RUNTIME}' \
-                         CNI_PLUGIN='${params.CNI_PLUGIN}' \
                          JOIN_COMMAND_FILE='/tmp/k8s-join-command.sh' \
                          NODE_IP='${ip}' \
                          SETUP_USER='${params.SSH_USER}' \
-                         ENABLE_FIREWALL='${firewallValue}' \
+                         ENABLE_FIREWALL='${params.ENABLE_FIREWALL}' \
                          DEBIAN_FRONTEND=noninteractive && \
-                  set +e
                   sudo -E bash /tmp/02-linux-worker-setup.sh
-                  rc=\$?
-                  if [ "\$rc" -eq 141 ]; then
-                    echo "Worker bootstrap returned 141 (SIGPIPE); retrying once..."
-                    sleep 2
-                    sudo -E bash /tmp/02-linux-worker-setup.sh
-                    rc=\$?
-                  fi
-                  exit "\$rc" 
                 """.stripIndent().trim()
 
                 recordTiming(timings, "worker-${ip}", tStart, System.currentTimeMillis())
@@ -480,10 +351,6 @@ echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
                                 user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
             def localValidate = "${env.WORKSPACE}/${SCRIPT_DIR}/07-validate.sh"
 
-            if (!fileExists(localValidate)) {
-              error("Validation script not found: ${localValidate}")
-            }
-
             sshPut remote: masterRemote, from: localValidate, into: '/tmp/07-validate.sh'
             sshCommand remote: masterRemote, command: """
               sed -i 's/\\r//' /tmp/07-validate.sh && \\
@@ -508,17 +375,18 @@ echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
             passwordVariable: 'SSH_PASS'
         )]) {
           script {
-            def allIPs = ([params.MASTER_IP] + params.WORKER_IPS.tokenize(',').collect { it.trim() }).unique()
+            def workers = params.WORKER_IPS.tokenize(',').collect { it.trim() }.findAll { it }.unique()
             def localDestroy = "${env.WORKSPACE}/${SCRIPT_DIR}/03-linux-destroy.sh"
-            def branches = [:]
 
-            allIPs.each { ip ->
-              def host = ip
-              branches["destroy: ${host}"] = {
+            // Workers first: keep the control plane/API available while worker
+            // runtimes, CNI state and storage mounts are being removed.
+            def workerBranches = [:]
+            workers.each { workerIp ->
+              def host = workerIp
+              workerBranches["destroy-worker: ${host}"] = {
                 def remote = [name: host, host: host, user: params.SSH_USER,
                               password: env.SSH_PASS, allowAnyHosts: true]
                 sshPut remote: remote, from: localDestroy, into: '/tmp/03-linux-destroy.sh'
-
                 def tStart = System.currentTimeMillis()
                 sshCommand remote: remote, command: """
                   sed -i 's/\\r//' /tmp/03-linux-destroy.sh && \\
@@ -528,12 +396,31 @@ echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
                          DEBIAN_FRONTEND=noninteractive && \\
                   sudo -E bash /tmp/03-linux-destroy.sh
                 """.stripIndent().trim()
-
-                recordTiming(timings, "destroy-${host}", tStart, System.currentTimeMillis())
-                echo "Destroy complete on ${host}"
+                recordTiming(timings, "destroy-worker-${host}", tStart, System.currentTimeMillis())
+                echo "Destroy complete on worker ${host}"
               }
             }
-            parallel branches
+            if (!workerBranches.isEmpty()) {
+              parallel workerBranches
+            }
+
+            // Master last: kubeadm/API/etcd remain available until workers are
+            // fully removed. This also avoids simultaneous CRI cleanup races.
+            def host = params.MASTER_IP
+            def remote = [name: host, host: host, user: params.SSH_USER,
+                          password: env.SSH_PASS, allowAnyHosts: true]
+            sshPut remote: remote, from: localDestroy, into: '/tmp/03-linux-destroy.sh'
+            def tStart = System.currentTimeMillis()
+            sshCommand remote: remote, command: """
+              sed -i 's/\\r//' /tmp/03-linux-destroy.sh && \\
+              chmod +x /tmp/03-linux-destroy.sh && \\
+              export RUNTIME='${params.RUNTIME}' \\
+                     CNI_PLUGIN='${params.CNI_PLUGIN}' \\
+                     DEBIAN_FRONTEND=noninteractive && \\
+              sudo -E bash /tmp/03-linux-destroy.sh
+            """.stripIndent().trim()
+            recordTiming(timings, "destroy-master-${host}", tStart, System.currentTimeMillis())
+            echo "Destroy complete on master ${host}"
           }
         }
       }
@@ -558,19 +445,7 @@ echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
               def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
                                   user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
               def raw = sshCommand remote: masterRemote,
-                command: '''
-                  set -o pipefail
-                  v=$(sudo kubectl version -o json 2>/dev/null |
-                      grep -oP '"gitVersion"\\s*:\\s*"v\\K\\d+\\.\\d+\\.\\d+"' |
-                      head -1) || true
-                  if [ -n "$v" ]; then
-                    printf '%s\\n' "$v"
-                  else
-                    kubelet --version 2>/dev/null |
-                      grep -oP '\\d+\\.\\d+\\.\\d+' |
-                      head -1
-                  fi
-                '''.stripIndent().trim()
+                command: "sudo kubectl version --short 2>/dev/null | grep 'Server Version' | grep -oP '\\d+\\.\\d+\\.\\d+' || kubelet --version 2>/dev/null | grep -oP '\\d+\\.\\d+\\.\\d+' | head -1"
               env.CURRENT_K8S_VERSION = raw.trim()
               echo "Auto-detected current version: ${env.CURRENT_K8S_VERSION}"
             }
@@ -604,10 +479,6 @@ echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
             }
             env.UPGRADE_PATH = hops.join(',')
             echo "Multi-step upgrade path: ${from} → ${hops.join(' → ')}"
-          }
-
-          if (!env.UPGRADE_PATH?.trim()) {
-            error("Upgrade path is empty; refusing to run upgrade")
           }
         }
       }
@@ -682,7 +553,7 @@ echo "registry.k8s.io IPv4 connectivity OK: $REGISTRY_IP:443"
       script {
         sh("rm -f -- '${env.WORKSPACE}/.k8s-join-command.sh' 2>/dev/null || true")
         def pipeEnd   = System.currentTimeMillis()
-        def totalMs   = (pipeStart > 0L) ? (pipeEnd - pipeStart) : 0L
+        def totalMs   = pipeEnd - pipeStart
 
         def fmtDur = { long ms ->
           if (ms <= 0) return 'N/A'
