@@ -197,7 +197,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
                 def remote = [name: host, host: host, user: params.SSH_USER,
                               password: env.SSH_PASS, allowAnyHosts: true]
                 sshCommand remote: remote,
-                  command: "echo \"SSH OK from \\$(hostname) as \\$(whoami)\""
+                  command: 'echo "SSH OK from $(hostname) as $(whoami)"'
                 sshCommand remote: remote,
                   command: "sudo -n whoami | grep -q root && echo 'SUDO OK' || (echo 'SUDO FAILED' && exit 1)"
               }
