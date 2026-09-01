@@ -724,20 +724,18 @@ EOF
 
   # CNI config/binary directories must match where kubeadm/kubelet install
   # CNI plugins (/opt/cni/bin) and where the CNI manifest (Calico/Flannel)
-  # writes its config (/etc/cni/net.d). These are CRI-O's packaged defaults,
-  # but verify rather than assume — a mismatch here silently breaks pod
+  # writes its config (/etc/cni/net.d). Earlier revisions of this script only
+  # checked this via `crio config`, but that subcommand is not supported on
+  # every packaged CRI-O build (confirmed in practice: "CRI-O binary does not
+  # support 'config' dump on this build"), which left the check unable to run
+  # at all on those builds. Write it explicitly instead of hoping the
+  # packaged default matches — a mismatch here silently breaks pod
   # networking regardless of which CNI is selected.
-  if "${CRIO_BIN}" config 2>/dev/null | grep -q .; then
-    CRIO_MERGED_CONFIG="$("${CRIO_BIN}" config 2>/dev/null)"
-    if ! grep -q 'network_dir[[:space:]]*=[[:space:]]*"/etc/cni/net.d/*"' <<<"${CRIO_MERGED_CONFIG}"; then
-      warn "CRI-O network_dir does not appear to be /etc/cni/net.d — CNI plugin manifests may not be picked up"
-    fi
-    if ! grep -q 'plugin_dirs' <<<"${CRIO_MERGED_CONFIG}" || ! grep -q '/opt/cni/bin' <<<"${CRIO_MERGED_CONFIG}"; then
-      warn "CRI-O plugin_dirs does not appear to include /opt/cni/bin — CNI plugin binaries may not be found"
-    fi
-  else
-    info "CRI-O binary does not support 'config' dump on this build; skipping CNI path cross-check (packaged defaults expected)"
-  fi
+  cat >/etc/crio/crio.conf.d/30-kubernetes-cni.conf <<'EOF'
+[crio.network]
+network_dir = "/etc/cni/net.d/"
+plugin_dirs = ["/opt/cni/bin/"]
+EOF
 
   # Validate only when the executable supports the command.
   if "${CRIO_BIN}" config validate >/dev/null 2>&1; then

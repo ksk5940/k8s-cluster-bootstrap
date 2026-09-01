@@ -129,6 +129,38 @@ unmount_calico_cgroup() {
   done
 }
 
+# ── Runtime presence detection ───────────────────────────────────────────────
+# Destroy must be runtime-aware, not just runtime-tolerant: if containerd was
+# never installed on this node, don't touch it (no spurious "removing"
+# log lines, no risk of package-manager side effects on shared dependencies
+# like runc); same for CRI-O. Check package manager state, the binary, the
+# socket, and the systemd unit — any one of these existing means it's
+# actually present, not just that RUNTIME happened to be set a certain way
+# (a node can have leftovers from a runtime it was never told to use, e.g.
+# after a manual experiment, and destroy should still find and remove that
+# too — this is a presence check, not a trust-RUNTIME check).
+pkg_installed() {
+  local pkg="$1"
+  if [[ "${PKG_MGR}" == "apt" ]]; then
+    dpkg-query -W -f='${Status}' "${pkg}" 2>/dev/null | grep -q "install ok installed"
+  else
+    rpm -q "${pkg}" &>/dev/null
+  fi
+}
+
+containerd_present() {
+  pkg_installed containerd.io || pkg_installed containerd ||
+    command -v containerd &>/dev/null || command -v ctr &>/dev/null ||
+    [[ -S /run/containerd/containerd.sock ]] ||
+    systemctl list-units --full --all 2>/dev/null | grep -q "containerd.service"
+}
+
+crio_present() {
+  pkg_installed cri-o || command -v crio &>/dev/null ||
+    [[ -S /var/run/crio/crio.sock || -S /run/crio/crio.sock ]] ||
+    systemctl list-units --full --all 2>/dev/null | grep -qE "crio\.service|cri-o\.service"
+}
+
 # ── Detect OS ─────────────────────────────────────────────────────────────────
 if [[ -f /etc/os-release ]]; then
   source /etc/os-release
@@ -233,84 +265,88 @@ purge_paths \
 step "4/11" "Remove containerd — packages · config · data · sockets · logs"
 # =============================================================================
 
-stop_service containerd
+if containerd_present; then
+  stop_service containerd
 
-if [[ "${PKG_MGR}" == "apt" ]]; then
-  remove_pkg_apt containerd.io containerd docker-ce docker-ce-cli docker-ce-rootless-extras
-  DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y -q 2>/dev/null || true
+  if [[ "${PKG_MGR}" == "apt" ]]; then
+    remove_pkg_apt containerd.io containerd docker-ce docker-ce-cli docker-ce-rootless-extras
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y -q 2>/dev/null || true
+  else
+    remove_pkg_dnf containerd.io containerd container-selinux
+  fi
+
+  purge_paths \
+    /etc/containerd \
+    /var/lib/containerd \
+    /run/containerd \
+    /var/run/containerd \
+    /etc/systemd/system/containerd.service \
+    /etc/systemd/system/containerd.service.d \
+    /usr/lib/systemd/system/containerd.service \
+    /lib/systemd/system/containerd.service \
+    /var/log/containerd \
+    /usr/bin/containerd \
+    /usr/bin/containerd-shim \
+    /usr/bin/containerd-shim-runc-v1 \
+    /usr/bin/containerd-shim-runc-v2 \
+    /usr/bin/ctr \
+    /usr/local/bin/containerd \
+    /usr/local/bin/containerd-shim \
+    /usr/local/bin/containerd-shim-runc-v2 \
+    /usr/local/bin/ctr \
+    /usr/bin/runc \
+    /usr/local/bin/runc \
+    /usr/sbin/runc
+
+  ok "containerd fully removed"
 else
-  remove_pkg_dnf containerd.io containerd container-selinux
+  info "containerd not present on this node — nothing to remove"
 fi
-
-purge_paths \
-  /etc/containerd \
-  /var/lib/containerd \
-  /run/containerd \
-  /var/run/containerd \
-  /etc/systemd/system/containerd.service \
-  /etc/systemd/system/containerd.service.d \
-  /usr/lib/systemd/system/containerd.service \
-  /lib/systemd/system/containerd.service \
-  /var/log/containerd \
-  /usr/bin/containerd \
-  /usr/bin/containerd-shim \
-  /usr/bin/containerd-shim-runc-v1 \
-  /usr/bin/containerd-shim-runc-v2 \
-  /usr/bin/ctr \
-  /usr/local/bin/containerd \
-  /usr/local/bin/containerd-shim \
-  /usr/local/bin/containerd-shim-runc-v2 \
-  /usr/local/bin/ctr \
-  /usr/bin/runc \
-  /usr/local/bin/runc \
-  /usr/sbin/runc
-
-ok "containerd fully removed"
 
 # =============================================================================
 step "5/11" "Remove CRI-O — packages · config · data · sockets · logs"
 # =============================================================================
 
-# Stop processes and unmount overlay storage BEFORE package removal/path purge.
-cleanup_crio_storage_mounts
+if crio_present; then
+  # Stop processes and unmount overlay storage BEFORE package removal/path purge.
+  cleanup_crio_storage_mounts
 
-if [[ "${PKG_MGR}" == "apt" ]]; then
-  remove_pkg_apt cri-o cri-o-runc cri-tools
-else
-  remove_pkg_dnf cri-o cri-tools
-fi
+  if [[ "${PKG_MGR}" == "apt" ]]; then
+    remove_pkg_apt cri-o cri-o-runc cri-tools
+  else
+    remove_pkg_dnf cri-o cri-tools
+  fi
 
-# Package removal can expose another layer of mounts, so perform a second
-# mount cleanup before deleting the storage directory.
-cleanup_crio_storage_mounts
-verify_no_mounts_under /var/lib/containers/storage || true
+  # Package removal can expose another layer of mounts, so perform a second
+  # mount cleanup before deleting the storage directory.
+  cleanup_crio_storage_mounts
+  verify_no_mounts_under /var/lib/containers/storage || true
 
-purge_paths \
-  /etc/crio \
-  /var/lib/crio \
-  /var/cache/crio \
-  /var/run/crio \
-  /run/crio \
-  /etc/systemd/system/crio.service \
-  /etc/systemd/system/crio.service.d \
-  /usr/lib/systemd/system/crio.service \
-  /lib/systemd/system/crio.service \
-  /var/log/crio \
-  /usr/bin/crio \
-  /usr/local/bin/crio \
-  /usr/bin/crio-status \
-  /usr/libexec/crio \
-  /usr/local/libexec/crio
+  purge_paths \
+    /etc/crio \
+    /var/lib/crio \
+    /var/cache/crio \
+    /var/run/crio \
+    /run/crio \
+    /etc/systemd/system/crio.service \
+    /etc/systemd/system/crio.service.d \
+    /usr/lib/systemd/system/crio.service \
+    /lib/systemd/system/crio.service \
+    /var/log/crio \
+    /usr/bin/crio \
+    /usr/local/bin/crio \
+    /usr/bin/crio-status \
+    /usr/libexec/crio \
+    /usr/local/libexec/crio
 
-# Only remove the storage tree after all overlay mounts have been released.
-unmount_tree /var/lib/containers/storage
-unmount_tree /var/lib/containers
-verify_no_mounts_under /var/lib/containers/storage || true
-purge_paths /var/lib/containers/storage /var/lib/containers
+  # Only remove the storage tree after all overlay mounts have been released.
+  unmount_tree /var/lib/containers/storage
+  unmount_tree /var/lib/containers
+  verify_no_mounts_under /var/lib/containers/storage || true
+  purge_paths /var/lib/containers/storage /var/lib/containers
 
-ok "CRI-O fully removed"
+  ok "CRI-O fully removed"
 
-if [[ "${RUNTIME}" == "crio" ]]; then
   if [[ -e /var/lib/containers/storage ]]; then
     if verify_no_mounts_under /var/lib/containers/storage; then
       purge_paths /var/lib/containers/storage
@@ -318,6 +354,8 @@ if [[ "${RUNTIME}" == "crio" ]]; then
   fi
   verify_no_mounts_under /var/lib/containers/storage || die "CRI-O storage mounts remain after cleanup"
   [[ ! -e /var/lib/containers/storage ]] || die "CRI-O storage still exists after cleanup"
+else
+  info "CRI-O not present on this node — nothing to remove"
 fi
 
 # =============================================================================

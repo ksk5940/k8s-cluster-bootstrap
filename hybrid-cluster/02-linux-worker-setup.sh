@@ -766,18 +766,15 @@ EOF
 
   # CNI config/binary directories must match where kubeadm/kubelet install
   # CNI plugins (/opt/cni/bin) and where the master's CNI manifest writes
-  # its config (/etc/cni/net.d), regardless of which CNI is selected.
-  if "${CRIO_BIN}" config 2>/dev/null | grep -q .; then
-    CRIO_MERGED_CONFIG="$("${CRIO_BIN}" config 2>/dev/null)"
-    if ! grep -q 'network_dir[[:space:]]*=[[:space:]]*"/etc/cni/net.d/*"' <<<"${CRIO_MERGED_CONFIG}"; then
-      warn "CRI-O network_dir does not appear to be /etc/cni/net.d — CNI plugin manifests may not be picked up"
-    fi
-    if ! grep -q 'plugin_dirs' <<<"${CRIO_MERGED_CONFIG}" || ! grep -q '/opt/cni/bin' <<<"${CRIO_MERGED_CONFIG}"; then
-      warn "CRI-O plugin_dirs does not appear to include /opt/cni/bin — CNI plugin binaries may not be found"
-    fi
-  else
-    info "CRI-O binary does not support 'config' dump on this build; skipping CNI path cross-check (packaged defaults expected)"
-  fi
+  # its config (/etc/cni/net.d), regardless of which CNI is selected. Write
+  # this explicitly rather than relying on `crio config` (not supported on
+  # every packaged CRI-O build, confirmed in practice) or on the packaged
+  # default — a mismatch here silently breaks pod networking.
+  cat >/etc/crio/crio.conf.d/30-kubernetes-cni.conf <<'EOF'
+[crio.network]
+network_dir = "/etc/cni/net.d/"
+plugin_dirs = ["/opt/cni/bin/"]
+EOF
 
   # Validate only when the executable supports the command.
   if "${CRIO_BIN}" config validate >/dev/null 2>&1; then
@@ -1164,6 +1161,74 @@ fi
 rm -f -- "${JOIN_COMMAND_FILE}" 2>/dev/null || true
 
 ok "Node joined cluster"
+
+# -----------------------------------------------------------------------------
+# CRI-O ONLY: work around a real, reproduced race where CRI-O's CNI
+# config-directory watcher isn't reliably armed yet on a just-joined worker.
+# The master's CRI-O has typically been running for minutes (image pulls,
+# cert generation) before its own CNI gets applied, so its watcher is fully
+# up by then — but a worker's CRI-O has been running mere seconds before the
+# CNI DaemonSet schedules onto it and writes /etc/cni/net.d/<cni>.conflist.
+# When CRI-O misses that create event, kubelet reports indefinitely:
+#   Ready=False KubeletNotReady "container runtime network not ready:
+#   NetworkReady=false ... no CNI configuration file in /etc/cni/net.d/"
+# and it does NOT self-heal — confirmed by direct `kubectl describe node`
+# output showing the condition still false after 5+ minutes on both Calico
+# and Flannel. The fix: wait for the CNI plugin to actually write its config
+# file, then restart CRI-O once to force it to (re-)detect it.
+if [[ "${RUNTIME}" == "crio" ]]; then
+  info "Waiting for CNI plugin to write its config to /etc/cni/net.d..."
+  cni_wait=0
+  cni_conf_found=false
+  while (( cni_wait < 90 )); do
+    if compgen -G "/etc/cni/net.d/*.conf*" > /dev/null 2>&1; then
+      cni_conf_found=true
+      break
+    fi
+    sleep 3
+    cni_wait=$((cni_wait + 3))
+  done
+
+  if [[ "${cni_conf_found}" == "true" ]]; then
+    ok "CNI config file present in /etc/cni/net.d (${cni_wait}s)"
+
+    CRIO_SVC_NAME=""
+    for u in crio.service cri-o.service; do
+      if systemctl list-unit-files "${u}" &>/dev/null; then
+        CRIO_SVC_NAME="${u}"
+        break
+      fi
+    done
+
+    if [[ -n "${CRIO_SVC_NAME}" ]]; then
+      info "Restarting ${CRIO_SVC_NAME} so it (re-)detects the CNI configuration..."
+      if systemctl restart "${CRIO_SVC_NAME}"; then
+        rt_wait=0
+        rt_ready=false
+        while (( rt_wait < 30 )); do
+          if [[ -S "${CRI_SOCKET#unix://}" ]] &&
+             crictl --runtime-endpoint="${CRI_SOCKET}" info &>/dev/null; then
+            rt_ready=true
+            break
+          fi
+          sleep 2
+          rt_wait=$((rt_wait + 2))
+        done
+        if [[ "${rt_ready}" == "true" ]]; then
+          ok "${CRIO_SVC_NAME} restarted and CRI socket is responding again"
+        else
+          warn "${CRIO_SVC_NAME} restarted but CRI socket did not come back within 30s — check systemctl status ${CRIO_SVC_NAME}"
+        fi
+      else
+        warn "Failed to restart ${CRIO_SVC_NAME} — node may remain NotReady until it is restarted manually"
+      fi
+    else
+      warn "Could not determine the CRI-O systemd unit name to restart it — node may remain NotReady"
+    fi
+  else
+    warn "No CNI config file appeared in /etc/cni/net.d within ${cni_wait}s — the node may report NotReady until the CNI DaemonSet schedules here and CRI-O is restarted"
+  fi
+fi
 
 # Ensure the node's own hostname resolves locally even when external DNS has no
 # record for it (common on lab/host-only networks and isolated enterprise DNS).
