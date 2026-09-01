@@ -25,6 +25,38 @@ info() { echo -e "  ${CY}[....${NC}  $*"; }
 warn() { echo -e "  ${YL}[WARN]${NC} $*"; }
 die()  { echo -e "  ${RD}[FAIL]${NC} $*" >&2; exit 1; }
 
+# On fresh VMs, Ubuntu's own apt-daily/apt-daily-upgrade timers (or
+# unattended-upgrades) can grab the dpkg lock shortly after boot — and this
+# has been observed in practice colliding with this script's own back-to-back
+# apt-get calls too (one call's dpkg cleanup hadn't fully released the lock
+# before the very next apt-get call started). `apt-get` itself does not wait
+# for the lock — it just fails immediately with exit 100. Poll for the lock
+# to be free before every apt-get invocation rather than hoping it never
+# collides.
+wait_for_apt_lock() {
+  [[ "${PKG_MGR}" == "apt" ]] || return 0
+  local waited=0
+  local max_wait=120
+  # Prefer flock (util-linux — present on virtually every distro) over fuser
+  # (psmisc — not guaranteed on minimal cloud images). If neither tool is
+  # available, don't block indefinitely on a check we can't perform.
+  while (( waited < max_wait )); do
+    if command -v flock &>/dev/null; then
+      flock -n -x /var/lib/dpkg/lock-frontend -c true 2>/dev/null && return 0
+    elif command -v fuser &>/dev/null; then
+      fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock 2>/dev/null | grep -q . || return 0
+    else
+      return 0
+    fi
+    if (( waited == 0 )); then
+      info "Waiting for another apt/dpkg process to release its lock..."
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+  warn "dpkg/apt lock still held after ${max_wait}s — proceeding anyway; the next apt-get call may fail"
+}
+
 # ── APT non-interactive — fixes debconf dialog errors ────────────────────────
 export DEBIAN_FRONTEND=noninteractive
 APT_OPTS="-y -q \
@@ -128,6 +160,7 @@ sync_clock
 
 # ── Repair any interrupted dpkg state (common on reused VMs) ─────────────────
 if [[ "$PKG_MGR" == "apt" ]]; then
+  wait_for_apt_lock
   dpkg --configure -a --force-confold 2>/dev/null || true
   apt-get install -f -y -q 2>/dev/null || true
   ok "dpkg state verified / repaired"
@@ -238,6 +271,7 @@ step "2/9" "Installing container runtime: ${RUNTIME}"
 # =============================================================================
 
 install_containerd_apt() {
+  wait_for_apt_lock
   apt-get update -qq
   apt-get install ${APT_OPTS} ca-certificates curl gnupg python3
   install -m 0755 -d /etc/apt/keyrings
@@ -261,6 +295,7 @@ install_containerd_apt() {
   chmod a+r "${KEYRING_FILE}"
   echo "deb [arch=$(dpkg --print-architecture) signed-by=${KEYRING_FILE}] ${REPO_URL} ${CODENAME} stable" \
     >/etc/apt/sources.list.d/docker.list
+  wait_for_apt_lock
   apt-get update -qq
   apt-get install ${APT_OPTS} containerd.io
 }
@@ -280,6 +315,7 @@ install_crio_apt() {
   echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] \
     https://pkgs.k8s.io/addons:/cri-o:/stable:/v${VERSION}/deb/ /" \
     >/etc/apt/sources.list.d/cri-o.list
+  wait_for_apt_lock
   apt-get update -qq
   apt-get install ${APT_OPTS} cri-o
 }
@@ -607,6 +643,7 @@ configure_crio() {
     info "Repairing the CRI-O package installation."
 
     if [[ "${PKG_MGR}" == "apt" ]]; then
+      wait_for_apt_lock
       apt-get install ${APT_OPTS} --reinstall cri-o
     elif [[ "${PKG_MGR}" == "dnf" ]]; then
       dnf reinstall -y cri-o
@@ -817,12 +854,14 @@ step "3/9" "Installing kubeadm / kubelet / kubectl  (v${K8S_VERSION})"
 K8S_MINOR="${K8S_VERSION%.*}"   # e.g. 1.32
 
 install_k8s_apt() {
+  wait_for_apt_lock
   apt-get install ${APT_OPTS} apt-transport-https curl
   curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/Release.key" | \
     gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --batch --yes
   echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
     https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/ /" \
     >/etc/apt/sources.list.d/kubernetes.list
+  wait_for_apt_lock
   apt-get update -qq
   apt-get install ${APT_OPTS} \
     kubelet="${K8S_VERSION}-*" \

@@ -148,7 +148,15 @@ if [[ "${NODE_ROLE}" == "master" ]]; then
     --delete-emptydir-data \
     --force \
     --grace-period=60 \
-    --timeout=120s 2>/dev/null || warn "Drain had warnings (non-fatal)"
+    --timeout=120s 2>/dev/null || {
+      warn "First drain attempt had warnings — retrying once with a longer timeout..."
+      kubectl drain "${NODE_NAME}" \
+        --ignore-daemonsets \
+        --delete-emptydir-data \
+        --force \
+        --grace-period=60 \
+        --timeout=180s 2>/dev/null || warn "Drain still reported warnings after retry (non-fatal) — check for PodDisruptionBudgets blocking eviction"
+    }
   ok "Master drained"
 else
   # Workers need master API. Poll until reachable.
@@ -163,7 +171,15 @@ else
     --delete-emptydir-data \
     --force \
     --grace-period=60 \
-    --timeout=120s 2>/dev/null || warn "Drain had warnings (non-fatal)"
+    --timeout=120s 2>/dev/null || {
+      warn "First drain attempt had warnings — retrying once with a longer timeout..."
+      kubectl drain "${NODE_NAME}" \
+        --ignore-daemonsets \
+        --delete-emptydir-data \
+        --force \
+        --grace-period=60 \
+        --timeout=180s 2>/dev/null || warn "Drain still reported warnings after retry (non-fatal) — check for PodDisruptionBudgets blocking eviction"
+    }
   ok "Worker drained"
 fi
 
@@ -196,11 +212,38 @@ kubectl uncordon "${NODE_NAME}" 2>/dev/null || warn "Uncordon failed — check m
 ok "Node ${NODE_NAME} uncordoned"
 
 # =============================================================================
-step "7" "Verify node version"
+step "7" "Verify node version and Ready status"
 # =============================================================================
 
-sleep 5
-kubectl get nodes -o wide 2>/dev/null | head -5 || true
+# Don't just sleep-and-hope: actually poll until this node reports Ready
+# AND is running the target kubelet version before declaring the hop done.
+# Proceeding to the next node/hop while this one is still converging is
+# exactly how a multi-node upgrade compounds problems and makes root-causing
+# harder — verify each node before moving on, per real-world rolling-upgrade
+# practice.
+verify_wait=0
+verify_timeout=180
+node_ready="false"
+node_version=""
+while (( verify_wait < verify_timeout )); do
+  node_version=$(kubectl get node "${NODE_NAME}" -o jsonpath='{.status.nodeInfo.kubeletVersion}' 2>/dev/null || true)
+  node_ready_status=$(kubectl get node "${NODE_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+  if [[ "${node_ready_status}" == "True" && "${node_version}" == "v${K8S_VERSION}" ]]; then
+    node_ready="true"
+    break
+  fi
+  sleep 5
+  verify_wait=$((verify_wait + 5))
+done
+
+if [[ "${node_ready}" == "true" ]]; then
+  ok "${NODE_NAME} is Ready on ${node_version} (${verify_wait}s)"
+else
+  warn "${NODE_NAME} did not confirm Ready+v${K8S_VERSION} within ${verify_timeout}s (last seen: ready=${node_ready_status:-unknown} version=${node_version:-unknown})"
+  warn "Continuing, but check this node manually — proceeding to the next node/hop with an unconfirmed node risks compounding the problem"
+fi
+
+kubectl get nodes -o wide 2>/dev/null | head -10 || true
 
 echo -e "
   ${GR}+================================================================+${NC}

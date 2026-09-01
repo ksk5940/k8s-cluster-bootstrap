@@ -58,6 +58,38 @@ step() { echo -e "\n  ${CY}[$1]${NC} $2\n  $(printf '%0.s-' {1..66})"; }
 ok()   { echo -e "  ${GR}[OK]${NC}   $*"; }
 warn() { echo -e "  ${YL}[WARN]${NC} $*"; }
 die()  { echo -e "  ${RD}[FAIL]${NC} $*" >&2; exit 1; }
+
+# On fresh VMs, Ubuntu's own apt-daily/apt-daily-upgrade timers (or
+# unattended-upgrades) can grab the dpkg lock shortly after boot — and this
+# has been observed colliding with this script's own back-to-back apt-get
+# calls in practice (one call's dpkg cleanup hadn't fully released the lock
+# before the next apt-get call started, on the master's equivalent flow).
+# `apt-get` itself does not wait for the lock — it just fails immediately
+# with exit 100. Poll for the lock to be free before every apt-get
+# invocation rather than hoping it never collides.
+wait_for_apt_lock() {
+  [[ "${PKG_MGR}" == "apt" ]] || return 0
+  local waited=0
+  local max_wait=120
+  # Prefer flock (util-linux — present on virtually every distro) over fuser
+  # (psmisc — not guaranteed on minimal cloud images). If neither tool is
+  # available, don't block indefinitely on a check we can't perform.
+  while (( waited < max_wait )); do
+    if command -v flock &>/dev/null; then
+      flock -n -x /var/lib/dpkg/lock-frontend -c true 2>/dev/null && return 0
+    elif command -v fuser &>/dev/null; then
+      fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock 2>/dev/null | grep -q . || return 0
+    else
+      return 0
+    fi
+    if (( waited == 0 )); then
+      info "Waiting for another apt/dpkg process to release its lock..."
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+  warn "dpkg/apt lock still held after ${max_wait}s — proceeding anyway; the next apt-get call may fail"
+}
 info() { echo -e "  ${CY}[....]${NC} $*"; }
 
 # Collect the standard set of node-side diagnostics on a join failure so the
@@ -145,6 +177,7 @@ step "1/7" "System prerequisites"
 
 # ── Repair any interrupted dpkg state (common on reused VMs) ─────────────────
 if [[ "$PKG_MGR" == "apt" ]]; then
+  wait_for_apt_lock
   dpkg --configure -a --force-confold 2>/dev/null || true
   apt-get install -f -y -q 2>/dev/null || true
   ok "dpkg state verified / repaired"
@@ -273,6 +306,7 @@ step "2/7" "Installing container runtime: ${RUNTIME}"
 # =============================================================================
 
 install_containerd_apt() {
+  wait_for_apt_lock
   apt-get update -qq
   apt-get install ${APT_OPTS} ca-certificates curl gnupg
 
@@ -302,6 +336,7 @@ install_containerd_apt() {
   echo "deb [arch=$(dpkg --print-architecture) signed-by=${KEYRING_FILE}] ${REPO_URL} ${CODENAME} stable" \
     >/etc/apt/sources.list.d/docker.list
 
+  wait_for_apt_lock
   apt-get update -qq
   apt-get install ${APT_OPTS} containerd.io
 }
@@ -327,6 +362,7 @@ install_crio_apt() {
     https://pkgs.k8s.io/addons:/cri-o:/stable:/v${VERSION}/deb/ /" \
     >/etc/apt/sources.list.d/cri-o.list
 
+  wait_for_apt_lock
   apt-get update -qq
   apt-get install ${APT_OPTS} cri-o
 }
@@ -656,6 +692,7 @@ configure_crio() {
     info "Repairing the CRI-O package installation."
 
     if [[ "${PKG_MGR}" == "apt" ]]; then
+      wait_for_apt_lock
       apt-get install ${APT_OPTS} --reinstall cri-o
     elif [[ "${PKG_MGR}" == "dnf" ]]; then
       dnf reinstall -y cri-o
@@ -873,6 +910,7 @@ step "3/7" "Installing kubeadm / kubelet / kubectl / cri-tools  (v${K8S_VERSION}
 K8S_MINOR="${K8S_VERSION%.*}"
 
 install_k8s_apt() {
+  wait_for_apt_lock
   apt-get install ${APT_OPTS} apt-transport-https curl
 
   curl -fsSL \
@@ -885,6 +923,7 @@ install_k8s_apt() {
     https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/ /" \
     >/etc/apt/sources.list.d/kubernetes.list
 
+  wait_for_apt_lock
   apt-get update -qq
 
   apt-get install ${APT_OPTS} \
@@ -1176,57 +1215,89 @@ ok "Node joined cluster"
 # output showing the condition still false after 5+ minutes on both Calico
 # and Flannel. The fix: wait for the CNI plugin to actually write its config
 # file, then restart CRI-O once to force it to (re-)detect it.
+#
+# TIMEOUT NOTE: an earlier version of this wait used a 90s budget, and a live
+# run showed a Rocky/CRI-O worker's calico-node pod finish starting right at
+# the ~91s mark — a hair too slow for that 90s window, and my wait bailed
+# out before the file ever appeared. Image pull time for the CNI pod is
+# genuinely variable (slower registries, RHEL-family dnf mirrors, etc.), so
+# give this real margin instead of a tight timeout, and restart CRI-O
+# regardless of whether the file was confirmed within the wait — a restart
+# is cheap, and if the file lands moments after the loop gives up, the
+# restart still picks it up rather than leaving the node stuck.
 if [[ "${RUNTIME}" == "crio" ]]; then
   info "Waiting for CNI plugin to write its config to /etc/cni/net.d..."
   cni_wait=0
   cni_conf_found=false
-  while (( cni_wait < 90 )); do
+  while (( cni_wait < 300 )); do
     if compgen -G "/etc/cni/net.d/*.conf*" > /dev/null 2>&1; then
       cni_conf_found=true
       break
     fi
-    sleep 3
-    cni_wait=$((cni_wait + 3))
+    sleep 5
+    cni_wait=$((cni_wait + 5))
   done
 
   if [[ "${cni_conf_found}" == "true" ]]; then
     ok "CNI config file present in /etc/cni/net.d (${cni_wait}s)"
+  else
+    warn "No CNI config file appeared in /etc/cni/net.d within ${cni_wait}s — restarting CRI-O anyway in case it lands momentarily; if it doesn't, the node will need this step re-run manually"
+  fi
 
-    CRIO_SVC_NAME=""
-    for u in crio.service cri-o.service; do
-      if systemctl list-unit-files "${u}" &>/dev/null; then
-        CRIO_SVC_NAME="${u}"
-        break
+  CRIO_SVC_NAME=""
+  for u in crio.service cri-o.service; do
+    if systemctl list-unit-files "${u}" &>/dev/null; then
+      CRIO_SVC_NAME="${u}"
+      break
+    fi
+  done
+
+  if [[ -n "${CRIO_SVC_NAME}" ]]; then
+    info "Restarting ${CRIO_SVC_NAME} so it (re-)detects the CNI configuration..."
+    if systemctl restart "${CRIO_SVC_NAME}"; then
+      rt_wait=0
+      rt_ready=false
+      while (( rt_wait < 30 )); do
+        if [[ -S "${CRI_SOCKET#unix://}" ]] &&
+           crictl --runtime-endpoint="${CRI_SOCKET}" info &>/dev/null; then
+          rt_ready=true
+          break
+        fi
+        sleep 2
+        rt_wait=$((rt_wait + 2))
+      done
+      if [[ "${rt_ready}" == "true" ]]; then
+        ok "${CRIO_SVC_NAME} restarted and CRI socket is responding again"
+      else
+        warn "${CRIO_SVC_NAME} restarted but CRI socket did not come back within 30s — check systemctl status ${CRIO_SVC_NAME}"
       fi
-    done
 
-    if [[ -n "${CRIO_SVC_NAME}" ]]; then
-      info "Restarting ${CRIO_SVC_NAME} so it (re-)detects the CNI configuration..."
-      if systemctl restart "${CRIO_SVC_NAME}"; then
-        rt_wait=0
-        rt_ready=false
-        while (( rt_wait < 30 )); do
-          if [[ -S "${CRI_SOCKET#unix://}" ]] &&
-             crictl --runtime-endpoint="${CRI_SOCKET}" info &>/dev/null; then
-            rt_ready=true
+      # If the CNI file hadn't appeared yet when we restarted, give it one
+      # more chance to show up and nudge CRI-O again — covers the case where
+      # the DaemonSet pod was still mid-pull during the first restart.
+      if [[ "${cni_conf_found}" != "true" ]]; then
+        info "Giving the CNI config file one more chance to appear (up to 60s more)..."
+        extra_wait=0
+        while (( extra_wait < 60 )); do
+          if compgen -G "/etc/cni/net.d/*.conf*" > /dev/null 2>&1; then
+            cni_conf_found=true
             break
           fi
-          sleep 2
-          rt_wait=$((rt_wait + 2))
+          sleep 5
+          extra_wait=$((extra_wait + 5))
         done
-        if [[ "${rt_ready}" == "true" ]]; then
-          ok "${CRIO_SVC_NAME} restarted and CRI socket is responding again"
+        if [[ "${cni_conf_found}" == "true" ]]; then
+          ok "CNI config file appeared after all (+${extra_wait}s) — restarting ${CRIO_SVC_NAME} once more"
+          systemctl restart "${CRIO_SVC_NAME}" || warn "Second restart of ${CRIO_SVC_NAME} failed"
         else
-          warn "${CRIO_SVC_NAME} restarted but CRI socket did not come back within 30s — check systemctl status ${CRIO_SVC_NAME}"
+          warn "CNI config file still not present after ${cni_wait}s + ${extra_wait}s — this node will likely need 'systemctl restart ${CRIO_SVC_NAME}' run manually once the CNI DaemonSet actually schedules here"
         fi
-      else
-        warn "Failed to restart ${CRIO_SVC_NAME} — node may remain NotReady until it is restarted manually"
       fi
     else
-      warn "Could not determine the CRI-O systemd unit name to restart it — node may remain NotReady"
+      warn "Failed to restart ${CRIO_SVC_NAME} — node may remain NotReady until it is restarted manually"
     fi
   else
-    warn "No CNI config file appeared in /etc/cni/net.d within ${cni_wait}s — the node may report NotReady until the CNI DaemonSet schedules here and CRI-O is restarted"
+    warn "Could not determine the CRI-O systemd unit name to restart it — node may remain NotReady"
   fi
 fi
 
