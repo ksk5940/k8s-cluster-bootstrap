@@ -92,6 +92,25 @@ wait_for_apt_lock() {
 }
 info() { echo -e "  ${CY}[....]${NC} $*"; }
 
+# A CRI-O service restarted several times in quick succession (install,
+# package-repair if that path fires, later CNI-detection nudges) can trip
+# systemd's own StartLimitBurst rate limiting — `systemctl restart` then
+# fails even though the unit itself is perfectly fine. Observed in practice:
+# "Failed to restart crio.service" immediately after two earlier restarts in
+# the same run. `systemctl reset-failed` clears that counter so a retry can
+# actually succeed, instead of giving up (or, worse, `die`-ing) after a
+# single attempt.
+restart_crio_service() {
+  local unit="$1"
+  if systemctl restart "${unit}" 2>/dev/null; then
+    return 0
+  fi
+  warn "${unit} restart failed — clearing systemd's failure/rate-limit state and retrying once..."
+  systemctl reset-failed "${unit}" 2>/dev/null || true
+  sleep 2
+  systemctl restart "${unit}"
+}
+
 # Collect the standard set of node-side diagnostics on a join failure so the
 # Jenkins console log has enough information to root-cause without a manual
 # SSH session. Never print secrets/tokens here.
@@ -822,8 +841,8 @@ EOF
     info "CRI-O config validate is unavailable or returned non-zero; validating via service restart."
   fi
 
-  systemctl restart "${CRIO_UNIT}" ||
-    die "Failed to restart ${CRIO_UNIT} after configuring pause_image"
+  restart_crio_service "${CRIO_UNIT}" ||
+    die "Failed to restart ${CRIO_UNIT} after configuring pause_image (including after a reset-failed retry)"
 
   retries=0
   while [[ ${retries} -lt 30 ]]; do
@@ -1201,117 +1220,26 @@ rm -f -- "${JOIN_COMMAND_FILE}" 2>/dev/null || true
 
 ok "Node joined cluster"
 
-# -----------------------------------------------------------------------------
-# CRI-O ONLY: work around a real, reproduced race where CRI-O's CNI
-# config-directory watcher isn't reliably armed yet on a just-joined worker.
-# The master's CRI-O has typically been running for minutes (image pulls,
-# cert generation) before its own CNI gets applied, so its watcher is fully
-# up by then — but a worker's CRI-O has been running mere seconds before the
-# CNI DaemonSet schedules onto it and writes /etc/cni/net.d/<cni>.conflist.
-# When CRI-O misses that create event, kubelet reports indefinitely:
-#   Ready=False KubeletNotReady "container runtime network not ready:
-#   NetworkReady=false ... no CNI configuration file in /etc/cni/net.d/"
-# and it does NOT self-heal — confirmed by direct `kubectl describe node`
-# output showing the condition still false after 5+ minutes on both Calico
-# and Flannel. The fix: wait for the CNI plugin to actually write its config
-# file, then restart CRI-O once to force it to (re-)detect it.
-#
-# TIMEOUT NOTE: an earlier version of this wait used a 90s budget, and a live
-# run showed a Rocky/CRI-O worker's calico-node pod finish starting right at
-# the ~91s mark — a hair too slow for that 90s window, and my wait bailed
-# out before the file ever appeared. Image pull time for the CNI pod is
-# genuinely variable (slower registries, RHEL-family dnf mirrors, etc.), so
-# give this real margin instead of a tight timeout, and restart CRI-O
-# regardless of whether the file was confirmed within the wait — a restart
-# is cheap, and if the file lands moments after the loop gives up, the
-# restart still picks it up rather than leaving the node stuck.
-if [[ "${RUNTIME}" == "crio" ]]; then
-  info "Waiting for CNI plugin to write its config to /etc/cni/net.d..."
-  cni_wait=0
-  cni_conf_found=false
-  while (( cni_wait < 300 )); do
-    if compgen -G "/etc/cni/net.d/*.conf*" > /dev/null 2>&1; then
-      cni_conf_found=true
-      break
-    fi
-    sleep 5
-    cni_wait=$((cni_wait + 5))
-  done
-
-  if [[ "${cni_conf_found}" == "true" ]]; then
-    ok "CNI config file present in /etc/cni/net.d (${cni_wait}s)"
-  else
-    warn "No CNI config file appeared in /etc/cni/net.d within ${cni_wait}s — restarting CRI-O anyway in case it lands momentarily; if it doesn't, the node will need this step re-run manually"
-  fi
-
-  CRIO_SVC_NAME=""
-  for u in crio.service cri-o.service; do
-    if systemctl list-unit-files "${u}" &>/dev/null; then
-      CRIO_SVC_NAME="${u}"
-      break
-    fi
-  done
-
-  if [[ -n "${CRIO_SVC_NAME}" ]]; then
-    info "Restarting ${CRIO_SVC_NAME} so it (re-)detects the CNI configuration..."
-    if systemctl restart "${CRIO_SVC_NAME}"; then
-      rt_wait=0
-      rt_ready=false
-      while (( rt_wait < 30 )); do
-        if [[ -S "${CRI_SOCKET#unix://}" ]] &&
-           crictl --runtime-endpoint="${CRI_SOCKET}" info &>/dev/null; then
-          rt_ready=true
-          break
-        fi
-        sleep 2
-        rt_wait=$((rt_wait + 2))
-      done
-      if [[ "${rt_ready}" == "true" ]]; then
-        ok "${CRIO_SVC_NAME} restarted and CRI socket is responding again"
-      else
-        warn "${CRIO_SVC_NAME} restarted but CRI socket did not come back within 30s — check systemctl status ${CRIO_SVC_NAME}"
-      fi
-
-      # If the CNI file hadn't appeared yet when we restarted, give it one
-      # more chance to show up and nudge CRI-O again — covers the case where
-      # the DaemonSet pod was still mid-pull during the first restart.
-      if [[ "${cni_conf_found}" != "true" ]]; then
-        info "Giving the CNI config file one more chance to appear (up to 60s more)..."
-        extra_wait=0
-        while (( extra_wait < 60 )); do
-          if compgen -G "/etc/cni/net.d/*.conf*" > /dev/null 2>&1; then
-            cni_conf_found=true
-            break
-          fi
-          sleep 5
-          extra_wait=$((extra_wait + 5))
-        done
-        if [[ "${cni_conf_found}" == "true" ]]; then
-          ok "CNI config file appeared after all (+${extra_wait}s) — restarting ${CRIO_SVC_NAME} once more"
-          systemctl restart "${CRIO_SVC_NAME}" || warn "Second restart of ${CRIO_SVC_NAME} failed"
-        else
-          warn "CNI config file still not present after ${cni_wait}s + ${extra_wait}s — this node will likely need 'systemctl restart ${CRIO_SVC_NAME}' run manually once the CNI DaemonSet actually schedules here"
-        fi
-      fi
-    else
-      warn "Failed to restart ${CRIO_SVC_NAME} — node may remain NotReady until it is restarted manually"
-    fi
-  else
-    warn "Could not determine the CRI-O systemd unit name to restart it — node may remain NotReady"
-  fi
-fi
-
-# Ensure the node's own hostname resolves locally even when external DNS has no
-# record for it (common on lab/host-only networks and isolated enterprise DNS).
-NODE_HOSTNAME=$(hostname -s)
-if ! getent hosts "${NODE_HOSTNAME}" >/dev/null 2>&1; then
-  printf '%s %s\n' "${NODE_IP}" "${NODE_HOSTNAME}" >> /etc/hosts
-  ok "Added local hostname mapping: ${NODE_IP} ${NODE_HOSTNAME}"
-fi
-
 # =============================================================================
 step "6/7" "Configuring kubelet node IP and DNS"
 # =============================================================================
+#
+# CRITICAL ORDERING NOTE: this must run BEFORE the CRI-O CNI-wait/restart
+# logic below, not after — confirmed by a live run. kubeadm join pulls its
+# initial /var/lib/kubelet/config.yaml from the cluster-wide kubelet-config
+# ConfigMap, which was populated from the MASTER's own resolvConf value at
+# `kubeadm init` time. On a mixed-OS cluster (Ubuntu master + Rocky worker),
+# that means a Rocky worker initially inherits Ubuntu's
+# `/run/systemd/resolve/resolv.conf` path — which doesn't exist on Rocky
+# (NetworkManager, not systemd-resolved) — and DaemonSet pods (kube-proxy,
+# calico-node) get scheduled onto the node the moment it registers, well
+# before this script would otherwise get around to fixing it. Observed in
+# practice: "FailedCreatePodSandBox ... open /run/systemd/resolve/resolv.conf:
+# no such file or directory" retried for 3+ minutes, only resolving once this
+# fix-and-restart step finally ran — and it used to run AFTER the CRI-O
+# CNI-wait block, which can itself take up to several minutes, compounding
+# the delay. Running this immediately after join instead minimizes the
+# window where pods fail sandbox creation on a mismatched resolver path.
 
 # kubelet drop-in location differs by distro:
 #
@@ -1425,6 +1353,114 @@ grep -E 'node-ip|resolvConf' \
   "${KUBELET_ENV_FILE}" \
   /var/lib/kubelet/config.yaml 2>/dev/null ||
   true
+
+# -----------------------------------------------------------------------------
+# CRI-O ONLY: work around a real, reproduced race where CRI-O's CNI
+# config-directory watcher isn't reliably armed yet on a just-joined worker.
+# The master's CRI-O has typically been running for minutes (image pulls,
+# cert generation) before its own CNI gets applied, so its watcher is fully
+# up by then — but a worker's CRI-O has been running mere seconds before the
+# CNI DaemonSet schedules onto it and writes /etc/cni/net.d/<cni>.conflist.
+# When CRI-O misses that create event, kubelet reports indefinitely:
+#   Ready=False KubeletNotReady "container runtime network not ready:
+#   NetworkReady=false ... no CNI configuration file in /etc/cni/net.d/"
+# and it does NOT self-heal — confirmed by direct `kubectl describe node`
+# output showing the condition still false after 5+ minutes on both Calico
+# and Flannel. The fix: wait for the CNI plugin to actually write its config
+# file, then restart CRI-O once to force it to (re-)detect it.
+#
+# TIMEOUT NOTE: an earlier version of this wait used a 90s budget, and a live
+# run showed a Rocky/CRI-O worker's calico-node pod finish starting right at
+# the ~91s mark — a hair too slow for that 90s window, and my wait bailed
+# out before the file ever appeared. Image pull time for the CNI pod is
+# genuinely variable (slower registries, RHEL-family dnf mirrors, etc.), so
+# give this real margin instead of a tight timeout, and restart CRI-O
+# regardless of whether the file was confirmed within the wait — a restart
+# is cheap, and if the file lands moments after the loop gives up, the
+# restart still picks it up rather than leaving the node stuck.
+if [[ "${RUNTIME}" == "crio" ]]; then
+  info "Waiting for CNI plugin to write its config to /etc/cni/net.d..."
+  cni_wait=0
+  cni_conf_found=false
+  while (( cni_wait < 300 )); do
+    if compgen -G "/etc/cni/net.d/*.conf*" > /dev/null 2>&1; then
+      cni_conf_found=true
+      break
+    fi
+    sleep 5
+    cni_wait=$((cni_wait + 5))
+  done
+
+  if [[ "${cni_conf_found}" == "true" ]]; then
+    ok "CNI config file present in /etc/cni/net.d (${cni_wait}s)"
+  else
+    warn "No CNI config file appeared in /etc/cni/net.d within ${cni_wait}s — restarting CRI-O anyway in case it lands momentarily; if it doesn't, the node will need this step re-run manually"
+  fi
+
+  CRIO_SVC_NAME=""
+  for u in crio.service cri-o.service; do
+    if systemctl list-unit-files "${u}" &>/dev/null; then
+      CRIO_SVC_NAME="${u}"
+      break
+    fi
+  done
+
+  if [[ -n "${CRIO_SVC_NAME}" ]]; then
+    info "Restarting ${CRIO_SVC_NAME} so it (re-)detects the CNI configuration..."
+    if restart_crio_service "${CRIO_SVC_NAME}"; then
+      rt_wait=0
+      rt_ready=false
+      while (( rt_wait < 30 )); do
+        if [[ -S "${CRI_SOCKET#unix://}" ]] &&
+           crictl --runtime-endpoint="${CRI_SOCKET}" info &>/dev/null; then
+          rt_ready=true
+          break
+        fi
+        sleep 2
+        rt_wait=$((rt_wait + 2))
+      done
+      if [[ "${rt_ready}" == "true" ]]; then
+        ok "${CRIO_SVC_NAME} restarted and CRI socket is responding again"
+      else
+        warn "${CRIO_SVC_NAME} restarted but CRI socket did not come back within 30s — check systemctl status ${CRIO_SVC_NAME}"
+      fi
+
+      # If the CNI file hadn't appeared yet when we restarted, give it one
+      # more chance to show up and nudge CRI-O again — covers the case where
+      # the DaemonSet pod was still mid-pull during the first restart.
+      if [[ "${cni_conf_found}" != "true" ]]; then
+        info "Giving the CNI config file one more chance to appear (up to 60s more)..."
+        extra_wait=0
+        while (( extra_wait < 60 )); do
+          if compgen -G "/etc/cni/net.d/*.conf*" > /dev/null 2>&1; then
+            cni_conf_found=true
+            break
+          fi
+          sleep 5
+          extra_wait=$((extra_wait + 5))
+        done
+        if [[ "${cni_conf_found}" == "true" ]]; then
+          ok "CNI config file appeared after all (+${extra_wait}s) — restarting ${CRIO_SVC_NAME} once more"
+          restart_crio_service "${CRIO_SVC_NAME}" || warn "Second restart of ${CRIO_SVC_NAME} failed"
+        else
+          warn "CNI config file still not present after ${cni_wait}s + ${extra_wait}s — this node will likely need 'systemctl restart ${CRIO_SVC_NAME}' run manually once the CNI DaemonSet actually schedules here"
+        fi
+      fi
+    else
+      warn "Failed to restart ${CRIO_SVC_NAME} — node may remain NotReady until it is restarted manually"
+    fi
+  else
+    warn "Could not determine the CRI-O systemd unit name to restart it — node may remain NotReady"
+  fi
+fi
+
+# Ensure the node's own hostname resolves locally even when external DNS has no
+# record for it (common on lab/host-only networks and isolated enterprise DNS).
+NODE_HOSTNAME=$(hostname -s)
+if ! getent hosts "${NODE_HOSTNAME}" >/dev/null 2>&1; then
+  printf '%s %s\n' "${NODE_IP}" "${NODE_HOSTNAME}" >> /etc/hosts
+  ok "Added local hostname mapping: ${NODE_IP} ${NODE_HOSTNAME}"
+fi
 
 # =============================================================================
 step "7/7" "Done"

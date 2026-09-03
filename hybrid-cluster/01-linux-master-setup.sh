@@ -57,6 +57,23 @@ wait_for_apt_lock() {
   warn "dpkg/apt lock still held after ${max_wait}s — proceeding anyway; the next apt-get call may fail"
 }
 
+# A CRI-O service restarted several times in quick succession (install,
+# package-repair if that path fires, later validation restarts) can trip
+# systemd's own StartLimitBurst rate limiting — `systemctl restart` then
+# fails even though the unit itself is perfectly fine. `systemctl
+# reset-failed` clears that counter so a retry can actually succeed, instead
+# of giving up (or, worse, `die`-ing) after a single attempt.
+restart_crio_service() {
+  local unit="$1"
+  if systemctl restart "${unit}" 2>/dev/null; then
+    return 0
+  fi
+  warn "${unit} restart failed — clearing systemd's failure/rate-limit state and retrying once..."
+  systemctl reset-failed "${unit}" 2>/dev/null || true
+  sleep 2
+  systemctl restart "${unit}"
+}
+
 # ── APT non-interactive — fixes debconf dialog errors ────────────────────────
 export DEBIAN_FRONTEND=noninteractive
 APT_OPTS="-y -q \
@@ -783,8 +800,8 @@ EOF
     info "CRI-O config validate is unavailable or returned non-zero; validating via service restart."
   fi
 
-  systemctl restart "${CRIO_UNIT}" ||
-    die "Failed to restart ${CRIO_UNIT} after configuring pause_image"
+  restart_crio_service "${CRIO_UNIT}" ||
+    die "Failed to restart ${CRIO_UNIT} after configuring pause_image (including after a reset-failed retry)"
 
   retries=0
   while [[ ${retries} -lt 30 ]]; do

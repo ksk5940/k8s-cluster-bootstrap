@@ -77,17 +77,17 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
     choice(
       name: 'RUNTIME',
       choices: ['containerd', 'crio'],
-      description: 'Container runtime: containerd | crio'
+      description: '[bootstrap/reset/destroy/upgrade] Container runtime: containerd | crio'
     )
     choice(
       name: 'CNI_PLUGIN',
       choices: ['calico', 'flannel', 'weave'],
-      description: 'CNI plugin: calico | flannel | weave'
+      description: '[bootstrap/reset/destroy only — not used for upgrade] CNI plugin: calico | flannel | weave'
     )
     string(
       name: 'K8S_VERSION',
       defaultValue: '1.32.3',
-      description: 'Target Kubernetes version (e.g. 1.32.3)'
+      description: '[bootstrap/reset/upgrade only — not used for destroy] Target Kubernetes version (e.g. 1.32.3)'
     )
     string(
       name: 'K8S_CURRENT_VERSION',
@@ -97,17 +97,17 @@ upgrade  — upgrade cluster version (minor-by-minor if gap > 1)'''
     string(
       name: 'POD_CIDR',
       defaultValue: '10.244.0.0/16',
-      description: 'Pod network CIDR'
+      description: '[bootstrap/reset only — not used for destroy/upgrade] Pod network CIDR'
     )
     booleanParam(
       name: 'SET_STATIC_IP',
       defaultValue: false,
-      description: 'Run 00-set-static-ip-hostname.sh on all nodes before provisioning'
+      description: '[bootstrap/reset only — not used for destroy/upgrade] Run 00-set-static-ip-hostname.sh on all nodes before provisioning'
     )
     booleanParam(
       name: 'ENABLE_FIREWALL',
       defaultValue: true,
-      description: '''Enable firewall on all nodes and open required Kubernetes ports.
+      description: '''[bootstrap/reset only — not used for destroy/upgrade] Enable firewall on all nodes and open required Kubernetes ports.
 Checked (true):  firewall is enabled; required K8s ports are opened on each node role.
                  If firewall is already active, only the required ports are added.
 Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld disable).'''
@@ -143,12 +143,58 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
           echo "Set Static IP    : ${params.SET_STATIC_IP}"
           echo "Enable Firewall  : ${params.ENABLE_FIREWALL}"
 
+          // -------------------------------------------------------------------
+          // Which parameters actually matter depends on ACTION. Vanilla Jenkins
+          // declarative `parameters {}` cannot conditionally show/hide fields
+          // based on another parameter's value without the Active Choices
+          // plugin — so every field is always visible in the UI regardless of
+          // ACTION. What we CAN do without any extra plugin dependency is make
+          // REQUIREMENT and VALIDATION genuinely dynamic: only enforce/validate
+          // what the selected ACTION will actually use, and say plainly which
+          // supplied values are being ignored rather than silently validating
+          // (and potentially failing the build on) irrelevant input.
+          //
+          //   bootstrap/reset : MASTER_IP, WORKER_IPS, RUNTIME, CNI_PLUGIN,
+          //                     K8S_VERSION, POD_CIDR, SET_STATIC_IP,
+          //                     ENABLE_FIREWALL — all of it.
+          //   destroy         : MASTER_IP, WORKER_IPS, RUNTIME, CNI_PLUGIN
+          //                     (needed to target the right runtime/CNI state
+          //                     for cleanup). NOT: K8S_VERSION, POD_CIDR,
+          //                     SET_STATIC_IP, ENABLE_FIREWALL (destroy does
+          //                     not touch firewall state by design, does not
+          //                     reconfigure IPs, and does not care about a
+          //                     target Kubernetes version).
+          //   upgrade         : MASTER_IP, WORKER_IPS, RUNTIME (used to derive
+          //                     the CRI socket for the post-restart health
+          //                     check), K8S_VERSION, K8S_CURRENT_VERSION.
+          //                     NOT: CNI_PLUGIN (upgrade never touches CNI),
+          //                     POD_CIDR, SET_STATIC_IP, ENABLE_FIREWALL.
+          // -------------------------------------------------------------------
+          def needsK8sVersion   = params.ACTION in ['bootstrap', 'reset', 'upgrade']
+          def needsPodCidr      = params.ACTION in ['bootstrap', 'reset']
+          def needsCni          = params.ACTION in ['bootstrap', 'reset', 'destroy']
+          def needsFirewallOpts = params.ACTION in ['bootstrap', 'reset']
+
+          def ignored = []
+          if (!needsK8sVersion)   ignored << 'K8S_VERSION'
+          if (!needsPodCidr)      ignored << 'POD_CIDR'
+          if (!needsCni)          ignored << 'CNI_PLUGIN'
+          if (!needsFirewallOpts) ignored << 'SET_STATIC_IP, ENABLE_FIREWALL'
+          if (params.ACTION != 'upgrade' && params.K8S_CURRENT_VERSION?.trim()) {
+            ignored << 'K8S_CURRENT_VERSION'
+          }
+          if (!ignored.isEmpty()) {
+            echo "Not applicable for ACTION=${params.ACTION} (ignored): ${ignored.join(' | ')}"
+          }
+
           if (!params.MASTER_IP?.trim())  error('MASTER_IP is required')
           if (!params.WORKER_IPS?.trim()) error('WORKER_IPS is required')
-          if (!params.K8S_VERSION?.trim()) error('K8S_VERSION is required')
 
-          if (!(params.K8S_VERSION ==~ /\d+\.\d+\.\d+/)) {
-            error("K8S_VERSION must be in format MAJOR.MINOR.PATCH (e.g. 1.32.3)")
+          if (needsK8sVersion) {
+            if (!params.K8S_VERSION?.trim()) error('K8S_VERSION is required for ACTION=' + params.ACTION)
+            if (!(params.K8S_VERSION ==~ /\d+\.\d+\.\d+/)) {
+              error("K8S_VERSION must be in format MAJOR.MINOR.PATCH (e.g. 1.32.3)")
+            }
           }
 
           // ── IPv4 address validation ──────────────────────────────────────
@@ -179,9 +225,15 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
             error("WORKER_IPS must contain at least one worker IP")
           }
 
-          // ── Pod CIDR validation ───────────────────────────────────────────
-          if (!(params.POD_CIDR ==~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}$/)) {
+          // ── Pod CIDR validation (bootstrap/reset only) ────────────────────
+          if (needsPodCidr && !(params.POD_CIDR ==~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}$/)) {
             error("POD_CIDR must be a valid CIDR, e.g. 10.244.0.0/16 (got: ${params.POD_CIDR})")
+          }
+
+          // ── Upgrade-specific validation ────────────────────────────────────
+          if (params.ACTION == 'upgrade' && params.K8S_CURRENT_VERSION?.trim() &&
+              !(params.K8S_CURRENT_VERSION ==~ /\d+\.\d+\.\d+/)) {
+            error("K8S_CURRENT_VERSION must be in format MAJOR.MINOR.PATCH (e.g. 1.30.5), or left blank to auto-detect")
           }
 
           // RUNTIME and CNI_PLUGIN are Jenkins `choice` parameters, so the UI
@@ -200,21 +252,62 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
             passwordVariable: 'SSH_PASS'
         )]) {
           script {
-            def allIPs = ([params.MASTER_IP] + params.WORKER_IPS.tokenize(',').collect { it.trim() }).unique()
-            def branches = [:]
-            allIPs.each { ip ->
-              def host = ip
-              branches["ssh-check: ${host}"] = {
-                def remote = [name: host, host: host, user: params.SSH_USER,
-                              password: env.SSH_PASS, allowAnyHosts: true]
+            // Master is required: if it's unreachable, there is no cluster to
+            // bootstrap/destroy/upgrade against, so stop immediately with a
+            // clear, unambiguous message rather than letting the pipeline
+            // stumble through several more stages that will all fail anyway.
+            def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
+                                user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
+            try {
+              sshCommand remote: masterRemote,
+                command: 'echo \"SSH OK from $(hostname) as $(whoami)\"'
+              sshCommand remote: masterRemote,
+                command: "sudo -n whoami | grep -q root && echo 'SUDO OK' || (echo 'SUDO FAILED' && exit 1)"
+            } catch (Exception e) {
+              error("MASTER ${params.MASTER_IP} is UNREACHABLE (or sudo failed) — cannot proceed " +
+                    "without a control-plane node. Stopping now rather than continuing with a cluster " +
+                    "that has no master. Underlying error: ${e.message}")
+            }
+            echo "Master ${params.MASTER_IP} is reachable."
+
+            // Workers degrade gracefully: an unreachable worker is logged and
+            // dropped from this run rather than failing the whole pipeline —
+            // bootstrap/destroy/upgrade proceed against whichever workers
+            // actually respond. Each worker is checked independently so one
+            // node being off doesn't prevent checking the others.
+            def requestedWorkers = params.WORKER_IPS.tokenize(',').collect { it.trim() }.findAll { it }.unique()
+            def liveWorkers = []
+            def deadWorkers = []
+            requestedWorkers.each { ip ->
+              def remote = [name: ip, host: ip, user: params.SSH_USER,
+                            password: env.SSH_PASS, allowAnyHosts: true]
+              try {
                 sshCommand remote: remote,
                   command: 'echo \"SSH OK from $(hostname) as $(whoami)\"'
                 sshCommand remote: remote,
                   command: "sudo -n whoami | grep -q root && echo 'SUDO OK' || (echo 'SUDO FAILED' && exit 1)"
+                liveWorkers << ip
+              } catch (Exception e) {
+                deadWorkers << ip
+                echo "WARNING: worker ${ip} is UNREACHABLE (or sudo failed) — skipping it for this run. " +
+                     "Underlying error: ${e.message}"
               }
             }
-            parallel branches
-            echo "All ${allIPs.size()} node(s) reachable."
+
+            env.LIVE_WORKER_IPS = liveWorkers.join(',')
+
+            if (!deadWorkers.isEmpty()) {
+              echo "─────────────────────────────────────────────────────────"
+              echo "  ${deadWorkers.size()} of ${requestedWorkers.size()} requested worker(s) unreachable and will be SKIPPED:"
+              deadWorkers.each { echo "    - ${it}" }
+              echo "  Proceeding with ${liveWorkers.size()} reachable worker(s): ${env.LIVE_WORKER_IPS ?: '(none)'}"
+              echo "─────────────────────────────────────────────────────────"
+            }
+            if (liveWorkers.isEmpty()) {
+              echo "WARNING: no requested worker nodes are reachable — proceeding with the master only."
+            }
+
+            echo "Master reachable; ${liveWorkers.size()} of ${requestedWorkers.size()} worker(s) reachable."
           }
         }
       }
@@ -231,7 +324,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
         )]) {
           script {
             def masterIp  = params.MASTER_IP
-            def workerList = params.WORKER_IPS.tokenize(',').collect { it.trim() }
+            def workerList = (env.LIVE_WORKER_IPS ?: '').tokenize(',').collect { it.trim() }.findAll { it }
             def allNodes  = [[ip: masterIp, role: 'master', hostname: 'k8s-master']]
             workerList.eachWithIndex { ip, idx ->
               allNodes << [ip: ip, role: 'worker', hostname: "k8s-worker-${idx + 1}"]
@@ -284,7 +377,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
             passwordVariable: 'SSH_PASS'
         )]) {
           script {
-            def workers = params.WORKER_IPS.tokenize(',').collect { it.trim() }.findAll { it }.unique()
+            def workers = (env.LIVE_WORKER_IPS ?: '').tokenize(',').collect { it.trim() }.findAll { it }.unique()
             def localDestroy = "${env.WORKSPACE}/${SCRIPT_DIR}/03-linux-destroy.sh"
 
             // Workers first: keep the control plane/API available while worker
@@ -431,7 +524,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
             passwordVariable: 'SSH_PASS'
         )]) {
           script {
-            def workers     = params.WORKER_IPS.tokenize(',').collect { it.trim() }
+            def workers     = (env.LIVE_WORKER_IPS ?: '').tokenize(',').collect { it.trim() }.findAll { it }
             def localWorker = "${env.WORKSPACE}/${SCRIPT_DIR}/02-linux-worker-setup.sh"
             def branches    = [:]
 
@@ -517,7 +610,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
               def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
                                   user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
               def raw = sshCommand remote: masterRemote,
-                command: "sudo kubectl version --short 2>/dev/null | grep 'Server Version' | grep -oP '\\d+\\.\\d+\\.\\d+' || kubelet --version 2>/dev/null | grep -oP '\\d+\\.\\d+\\.\\d+' | head -1"
+                command: "sudo kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null | grep -oP '\\d+\\.\\d+\\.\\d+' || kubelet --version 2>/dev/null | grep -oP '\\d+\\.\\d+\\.\\d+' | head -1"
               env.CURRENT_K8S_VERSION = raw.trim()
               echo "Auto-detected current version: ${env.CURRENT_K8S_VERSION}"
             }
@@ -546,11 +639,20 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
             error("Downgrade not supported: current=${from} target=${to}")
           } else {
             def steps = buildVersionPath(from, to)
+            // Intermediate hops are passed as MINOR-ONLY (e.g. "1.31"), not
+            // hardcoded to "1.31.0": 04-linux-upgrade.sh resolves a
+            // minor-only version to whatever patch is actually latest in
+            // the repo at upgrade time. Kubernetes package repos rotate
+            // patches — assuming the very first ".0" release of an older
+            // minor is still present risks "version not found" on a repo
+            // that has since pruned it. Only the FINAL hop uses the exact
+            // version you requested.
             def hops = steps.collect { minor ->
-              minor == "${to.split('\\.')[0]}.${toMinor}" ? to : "${minor}.0"
+              minor == "${to.split('\\.')[0]}.${toMinor}" ? to : minor
             }
             env.UPGRADE_PATH = hops.join(',')
-            echo "Multi-step upgrade path: ${from} → ${hops.join(' → ')}"
+            echo "Multi-step upgrade path: ${from} → ${hops.join(' → ')} " +
+                 "(intermediate hops resolve to their latest available patch at upgrade time)"
           }
         }
       }
@@ -567,7 +669,7 @@ Unchecked (false): firewall is disabled on all nodes (ufw disable / firewalld di
           script {
             def masterRemote = [name: params.MASTER_IP, host: params.MASTER_IP,
                                 user: params.SSH_USER, password: env.SSH_PASS, allowAnyHosts: true]
-            def workers      = params.WORKER_IPS.tokenize(',').collect { it.trim() }
+            def workers      = (env.LIVE_WORKER_IPS ?: '').tokenize(',').collect { it.trim() }.findAll { it }
             def localUpgrade = "${env.WORKSPACE}/${SCRIPT_DIR}/04-linux-upgrade.sh"
             def localValidate = "${env.WORKSPACE}/${SCRIPT_DIR}/07-validate.sh"
             def hopVersions  = env.UPGRADE_PATH.split(',').collect { it.trim() }
@@ -682,7 +784,7 @@ ${rows.join('\n')}
 |  ${icon}  K8s Cluster ${params.ACTION.toUpperCase()}  —  ${currentBuild.currentResult}
 +==============================================================+
 |  Master  : ${params.MASTER_IP}
-|  Workers : ${params.WORKER_IPS}
+|  Workers : ${params.WORKER_IPS}${env.LIVE_WORKER_IPS != null && env.LIVE_WORKER_IPS != params.WORKER_IPS ? " (used: ${env.LIVE_WORKER_IPS ?: 'none — all unreachable'})" : ''}
 |  Runtime : ${params.RUNTIME}  |  CNI: ${params.CNI_PLUGIN}
 |  Version : ${params.K8S_VERSION}
 |  Firewall: ${params.ENABLE_FIREWALL}
