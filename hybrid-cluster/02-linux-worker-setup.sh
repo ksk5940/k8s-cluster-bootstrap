@@ -180,6 +180,11 @@ else
   die "Unsupported OS: ${OS_ID}"
 fi
 
+# See the matching comment in 01-linux-master-setup.sh: safe dnf speed
+# flags (skip weak/recommended deps and docs) — trims dependency-resolution
+# and extraction work without changing what's functionally installed.
+DNF_OPTS="-y --setopt=install_weak_deps=False --setopt=tsflags=nodocs"
+
 echo -e "
   ${CY}+================================================================+${NC}
   ${CY}|     KUBERNETES WORKER NODE SETUP  v${K8S_VERSION}              |${NC}
@@ -365,7 +370,7 @@ install_containerd_dnf() {
     https://download.docker.com/linux/centos/docker-ce.repo \
     -y 2>/dev/null || true
 
-  dnf install -y containerd.io
+  dnf install ${DNF_OPTS} containerd.io
 }
 
 install_crio_apt() {
@@ -397,7 +402,7 @@ gpgcheck=1
 gpgkey=https://pkgs.k8s.io/addons:/cri-o:/stable:/v${VERSION}/rpm/repodata/repomd.xml.key
 EOF
 
-  dnf install -y cri-o
+  dnf install ${DNF_OPTS} cri-o
 }
 
 configure_containerd() {
@@ -714,7 +719,7 @@ configure_crio() {
       wait_for_apt_lock
       apt-get install ${APT_OPTS} --reinstall cri-o
     elif [[ "${PKG_MGR}" == "dnf" ]]; then
-      dnf reinstall -y cri-o
+      dnf reinstall ${DNF_OPTS} cri-o
     fi
 
     systemctl daemon-reload 2>/dev/null || true
@@ -964,7 +969,7 @@ gpgkey=https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/rpm/repodata/repomd.xml.k
 exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
 EOF
 
-  dnf install -y --disableexcludes=kubernetes \
+  dnf install ${DNF_OPTS} --disableexcludes=kubernetes \
     "kubelet-${K8S_VERSION}" \
     "kubeadm-${K8S_VERSION}" \
     "kubectl-${K8S_VERSION}" \

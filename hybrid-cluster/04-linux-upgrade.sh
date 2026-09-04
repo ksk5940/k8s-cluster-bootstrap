@@ -53,6 +53,10 @@ case "${RUNTIME}" in
   *)          CRI_SOCKET="" ;;
 esac
 
+# Same safe dnf speed flags as the bootstrap scripts — see the matching
+# comment in 01-linux-master-setup.sh.
+DNF_OPTS="-y --setopt=install_weak_deps=False --setopt=tsflags=nodocs"
+
 # Same dpkg-lock race documented and fixed in 01-linux-master-setup.sh and
 # 02-linux-worker-setup.sh: a fresh/recently-active VM's own apt-daily timers
 # (or this script's own back-to-back apt-get calls) can collide on the dpkg
@@ -169,7 +173,7 @@ if [[ "${PKG_MGR}" == "apt" ]]; then
   apt-get install ${APT_OPTS} "kubeadm=${K8S_VERSION}-*"
   apt-mark hold kubeadm
 else
-  dnf install -y --disableexcludes=kubernetes "kubeadm-${K8S_VERSION}"
+  dnf install ${DNF_OPTS} --disableexcludes=kubernetes "kubeadm-${K8S_VERSION}"
   dnf versionlock delete kubeadm 2>/dev/null || true
   dnf versionlock add    kubeadm 2>/dev/null || true
 fi
@@ -266,7 +270,7 @@ if [[ "${PKG_MGR}" == "apt" ]]; then
   apt-get install ${APT_OPTS} "kubelet=${K8S_VERSION}-*" "kubectl=${K8S_VERSION}-*"
   apt-mark hold kubelet kubectl
 else
-  dnf install -y --disableexcludes=kubernetes \
+  dnf install ${DNF_OPTS} --disableexcludes=kubernetes \
     "kubelet-${K8S_VERSION}" "kubectl-${K8S_VERSION}"
   dnf versionlock delete kubelet kubectl 2>/dev/null || true
   dnf versionlock add    kubelet kubectl 2>/dev/null || true

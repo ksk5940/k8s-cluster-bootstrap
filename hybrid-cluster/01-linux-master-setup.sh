@@ -93,6 +93,17 @@ elif command -v dnf     &>/dev/null;  then PKG_MGR="dnf"
 elif command -v zypper  &>/dev/null;  then PKG_MGR="zypper"
 else die "Unsupported OS: ${OS_ID}. Only Debian/RHEL/SUSE families are supported."; fi
 
+# Standard, safe dnf speed flags: skip weak/recommended deps (man pages,
+# bash-completion, etc. — not needed for an automated server bootstrap) and
+# skip installing docs. These do not change what actually gets installed
+# functionally, only trim the dependency-resolution and extraction work dnf
+# does on every call. Note honestly: this narrows part of the gap but dnf's
+# transaction/dependency-resolution architecture is inherently heavier than
+# apt's — RHEL-family nodes will still take somewhat longer to provision
+# than Debian-family nodes for the package-install steps specifically; this
+# is a real, expected characteristic of the package manager, not a bug.
+DNF_OPTS="-y --setopt=install_weak_deps=False --setopt=tsflags=nodocs"
+
 echo -e "
   ${CY}+================================================================+${NC}
   ${CY}|     KUBERNETES MASTER NODE SETUP  v${K8S_VERSION}              |${NC}
@@ -320,7 +331,7 @@ install_containerd_apt() {
 install_containerd_dnf() {
   dnf config-manager --add-repo \
     https://download.docker.com/linux/centos/docker-ce.repo -y 2>/dev/null || true
-  dnf install -y containerd.io
+  dnf install ${DNF_OPTS} containerd.io
 }
 
 install_crio_apt() {
@@ -346,7 +357,7 @@ baseurl=https://pkgs.k8s.io/addons:/cri-o:/stable:/v${VERSION}/rpm/
 gpgcheck=1
 gpgkey=https://pkgs.k8s.io/addons:/cri-o:/stable:/v${VERSION}/rpm/repodata/repomd.xml.key
 EOF
-  dnf install -y cri-o
+  dnf install ${DNF_OPTS} cri-o
 }
 
 configure_containerd() {
@@ -663,7 +674,7 @@ configure_crio() {
       wait_for_apt_lock
       apt-get install ${APT_OPTS} --reinstall cri-o
     elif [[ "${PKG_MGR}" == "dnf" ]]; then
-      dnf reinstall -y cri-o
+      dnf reinstall ${DNF_OPTS} cri-o
     fi
 
     systemctl daemon-reload 2>/dev/null || true
@@ -897,7 +908,7 @@ gpgcheck=1
 gpgkey=https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/rpm/repodata/repomd.xml.key
 exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
 EOF
-  dnf install -y --disableexcludes=kubernetes \
+  dnf install ${DNF_OPTS} --disableexcludes=kubernetes \
     "kubelet-${K8S_VERSION}" "kubeadm-${K8S_VERSION}" "kubectl-${K8S_VERSION}" cri-tools
   dnf versionlock add kubelet kubeadm kubectl 2>/dev/null || true
 }
