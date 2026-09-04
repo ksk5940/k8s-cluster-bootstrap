@@ -90,6 +90,42 @@ wait_for_apt_lock() {
   done
   warn "dpkg/apt lock still held after ${max_wait}s — proceeding anyway; the next apt-get call may fail"
 }
+
+# wait_for_apt_lock() above only reduces the common case (a lock already
+# held for a while, e.g. an apt-daily timer mid-run) — it cannot fully
+# close the race: another process can grab the lock in the gap between our
+# check returning "free" and our own apt-get call actually starting.
+# Observed in practice: "Could not get lock /var/lib/dpkg/lock-frontend"
+# firing 19ms after a passed lock check, at step [3/9]. The only complete
+# fix is to retry the ACTUAL apt-get command on a lock-related failure, not
+# just pre-check availability beforehand.
+apt_get_retry() {
+  [[ "${PKG_MGR}" == "apt" ]] || { apt-get "$@"; return $?; }
+  local attempt=1
+  local max_attempts=5
+  local output rc
+  while (( attempt <= max_attempts )); do
+    wait_for_apt_lock
+    output=$(apt-get "$@" 2>&1)
+    rc=$?
+    if [[ ${rc} -eq 0 ]]; then
+      [[ -n "${output}" ]] && echo "${output}"
+      return 0
+    fi
+    if echo "${output}" | grep -qE "Could not get lock|Unable to acquire the dpkg frontend lock|dpkg was interrupted"; then
+      echo "${output}" >&2
+      warn "apt-get $1 hit a lock conflict (attempt ${attempt}/${max_attempts}) — retrying in 5s..."
+      sleep 5
+      attempt=$((attempt + 1))
+      continue
+    fi
+    # Non-lock-related failure: surface it immediately, don't waste retries
+    echo "${output}" >&2
+    return ${rc}
+  done
+  echo "${output}" >&2
+  die "apt-get $1 failed after ${max_attempts} attempts due to persistent dpkg/apt lock contention"
+}
 info() { echo -e "  ${CY}[....]${NC} $*"; }
 
 # A CRI-O service restarted several times in quick succession (install,
@@ -330,9 +366,8 @@ step "2/7" "Installing container runtime: ${RUNTIME}"
 # =============================================================================
 
 install_containerd_apt() {
-  wait_for_apt_lock
-  apt-get update -qq
-  apt-get install ${APT_OPTS} ca-certificates curl gnupg
+  apt_get_retry update -qq
+  apt_get_retry install ${APT_OPTS} ca-certificates curl gnupg
 
   install -m 0755 -d /etc/apt/keyrings
 
@@ -360,9 +395,8 @@ install_containerd_apt() {
   echo "deb [arch=$(dpkg --print-architecture) signed-by=${KEYRING_FILE}] ${REPO_URL} ${CODENAME} stable" \
     >/etc/apt/sources.list.d/docker.list
 
-  wait_for_apt_lock
-  apt-get update -qq
-  apt-get install ${APT_OPTS} containerd.io
+  apt_get_retry update -qq
+  apt_get_retry install ${APT_OPTS} containerd.io
 }
 
 install_containerd_dnf() {
@@ -386,9 +420,8 @@ install_crio_apt() {
     https://pkgs.k8s.io/addons:/cri-o:/stable:/v${VERSION}/deb/ /" \
     >/etc/apt/sources.list.d/cri-o.list
 
-  wait_for_apt_lock
-  apt-get update -qq
-  apt-get install ${APT_OPTS} cri-o
+  apt_get_retry update -qq
+  apt_get_retry install ${APT_OPTS} cri-o
 }
 
 install_crio_dnf() {
@@ -716,8 +749,7 @@ configure_crio() {
     info "Repairing the CRI-O package installation."
 
     if [[ "${PKG_MGR}" == "apt" ]]; then
-      wait_for_apt_lock
-      apt-get install ${APT_OPTS} --reinstall cri-o
+      apt_get_retry install ${APT_OPTS} --reinstall cri-o
     elif [[ "${PKG_MGR}" == "dnf" ]]; then
       dnf reinstall ${DNF_OPTS} cri-o
     fi
@@ -934,8 +966,7 @@ step "3/7" "Installing kubeadm / kubelet / kubectl / cri-tools  (v${K8S_VERSION}
 K8S_MINOR="${K8S_VERSION%.*}"
 
 install_k8s_apt() {
-  wait_for_apt_lock
-  apt-get install ${APT_OPTS} apt-transport-https curl
+  apt_get_retry install ${APT_OPTS} apt-transport-https curl
 
   curl -fsSL \
     "https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/Release.key" |
@@ -947,10 +978,9 @@ install_k8s_apt() {
     https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/ /" \
     >/etc/apt/sources.list.d/kubernetes.list
 
-  wait_for_apt_lock
-  apt-get update -qq
+  apt_get_retry update -qq
 
-  apt-get install ${APT_OPTS} \
+  apt_get_retry install ${APT_OPTS} \
     kubelet="${K8S_VERSION}-*" \
     kubeadm="${K8S_VERSION}-*" \
     kubectl="${K8S_VERSION}-*" \

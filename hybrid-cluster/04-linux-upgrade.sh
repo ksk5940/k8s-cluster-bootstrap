@@ -82,6 +82,42 @@ wait_for_apt_lock() {
   warn "dpkg/apt lock still held after ${max_wait}s — proceeding anyway; the next apt-get call may fail"
 }
 
+# wait_for_apt_lock() above only reduces the common case (a lock already
+# held for a while, e.g. an apt-daily timer mid-run) — it cannot fully
+# close the race: another process can grab the lock in the gap between our
+# check returning "free" and our own apt-get call actually starting.
+# Observed in practice: "Could not get lock /var/lib/dpkg/lock-frontend"
+# firing 19ms after a passed lock check, at step [3/9]. The only complete
+# fix is to retry the ACTUAL apt-get command on a lock-related failure, not
+# just pre-check availability beforehand.
+apt_get_retry() {
+  [[ "${PKG_MGR}" == "apt" ]] || { apt-get "$@"; return $?; }
+  local attempt=1
+  local max_attempts=5
+  local output rc
+  while (( attempt <= max_attempts )); do
+    wait_for_apt_lock
+    output=$(apt-get "$@" 2>&1)
+    rc=$?
+    if [[ ${rc} -eq 0 ]]; then
+      [[ -n "${output}" ]] && echo "${output}"
+      return 0
+    fi
+    if echo "${output}" | grep -qE "Could not get lock|Unable to acquire the dpkg frontend lock|dpkg was interrupted"; then
+      echo "${output}" >&2
+      warn "apt-get $1 hit a lock conflict (attempt ${attempt}/${max_attempts}) — retrying in 5s..."
+      sleep 5
+      attempt=$((attempt + 1))
+      continue
+    fi
+    # Non-lock-related failure: surface it immediately, don't waste retries
+    echo "${output}" >&2
+    return ${rc}
+  done
+  echo "${output}" >&2
+  die "apt-get $1 failed after ${max_attempts} attempts due to persistent dpkg/apt lock contention"
+}
+
 # K8S_VERSION may be a full X.Y.Z (the final target, exact as requested) or
 # just X.Y (an intermediate hop on a multi-minor upgrade path — see note
 # below on why intermediate hops are NOT hardcoded to "X.Y.0").
@@ -110,16 +146,14 @@ step "1" "Update Kubernetes apt/dnf repository to v${K8S_MINOR}"
 # =============================================================================
 
 if [[ "${PKG_MGR}" == "apt" ]]; then
-  wait_for_apt_lock
-  apt-get install ${APT_OPTS} apt-transport-https curl ca-certificates
+  apt_get_retry install ${APT_OPTS} apt-transport-https curl ca-certificates
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/Release.key" | \
     gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --batch --yes
   echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
     https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/ /" \
     >/etc/apt/sources.list.d/kubernetes.list
-  wait_for_apt_lock
-  apt-get update -qq
+  apt_get_retry update -qq
   ok "APT repo updated to v${K8S_MINOR}"
 else
   cat >/etc/yum.repos.d/kubernetes.repo <<EOF
@@ -170,7 +204,7 @@ step "2" "Upgrade kubeadm to v${K8S_VERSION}"
 if [[ "${PKG_MGR}" == "apt" ]]; then
   wait_for_apt_lock
   apt-mark unhold kubeadm 2>/dev/null || true
-  apt-get install ${APT_OPTS} "kubeadm=${K8S_VERSION}-*"
+  apt_get_retry install ${APT_OPTS} "kubeadm=${K8S_VERSION}-*"
   apt-mark hold kubeadm
 else
   dnf install ${DNF_OPTS} --disableexcludes=kubernetes "kubeadm-${K8S_VERSION}"
@@ -267,7 +301,7 @@ step "5" "Upgrade kubelet and kubectl to v${K8S_VERSION}"
 if [[ "${PKG_MGR}" == "apt" ]]; then
   wait_for_apt_lock
   apt-mark unhold kubelet kubectl 2>/dev/null || true
-  apt-get install ${APT_OPTS} "kubelet=${K8S_VERSION}-*" "kubectl=${K8S_VERSION}-*"
+  apt_get_retry install ${APT_OPTS} "kubelet=${K8S_VERSION}-*" "kubectl=${K8S_VERSION}-*"
   apt-mark hold kubelet kubectl
 else
   dnf install ${DNF_OPTS} --disableexcludes=kubernetes \
