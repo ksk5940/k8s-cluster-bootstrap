@@ -1247,22 +1247,54 @@ wait_for_node_ready() {
     [[ "$status" == "Ready" ]] && { ok "Master node is Ready"; return 0; }
     sleep 5; elapsed=$((elapsed + 5))
   done
-  kubectl get nodes -o wide 2>/dev/null || true
+  echo "-- kubectl get nodes -o wide --" >&2
+  kubectl get nodes -o wide 2>&1 >&2 || true
+  echo "-- kubectl describe node (conditions tail) --" >&2
+  kubectl describe node 2>&1 | awk '/^Conditions:/{show=1} show && /^Events:/{show=0} show' >&2 || true
   die "Master node did not become Ready within ${timeout}s"
 }
 
+# On a CNI/system-pod rollout timeout, print enough to actually diagnose it
+# from the Jenkins log — pod status, why it's not ready (describe/events),
+# and recent logs — instead of just "did not become ready" with nothing
+# else to go on. Covers the real range of causes: still pulling images
+# (transient/environmental), CrashLoopBackOff (config problem), Pending
+# (scheduling/resource problem), etc. — the log itself should make clear
+# which one happened rather than requiring a manual SSH session to find out.
+collect_cni_diagnostics() {
+  local ns="$1" selector="$2" label="$3"
+  echo "──────────────── ${label} DIAGNOSTICS (ns=${ns}) ────────────────" >&2
+  echo "-- kubectl get pods -n ${ns} -l ${selector} -o wide --" >&2
+  kubectl -n "${ns}" get pods -l "${selector}" -o wide 2>&1 >&2 || true
+  echo "-- kubectl describe pods -n ${ns} -l ${selector} (events tail) --" >&2
+  kubectl -n "${ns}" describe pods -l "${selector}" 2>&1 |
+    awk '/^Events:/{show=1} show' >&2 || true
+  echo "-- recent container logs (each matching pod, last 30 lines) --" >&2
+  for pod in $(kubectl -n "${ns}" get pods -l "${selector}" -o name 2>/dev/null); do
+    echo "   $pod:" >&2
+    kubectl -n "${ns}" logs "${pod}" --all-containers --tail=30 2>&1 >&2 || true
+  done
+  echo "-- kubectl get events -n ${ns} --sort-by=.lastTimestamp (tail) --" >&2
+  kubectl -n "${ns}" get events --sort-by=.lastTimestamp 2>&1 | tail -30 >&2 || true
+  echo "────────────────────────────────────────────────────────────────" >&2
+}
+
 wait_for_cni() {
-  local timeout=300
+  local timeout=480
   case "${CNI_PLUGIN}" in
     calico)
-      kubectl -n kube-system rollout status daemonset/calico-node --timeout="${timeout}s" || die "Calico node DaemonSet did not become ready"
-      kubectl -n kube-system rollout status deployment/calico-kube-controllers --timeout="${timeout}s" || die "Calico controllers did not become ready"
+      kubectl -n kube-system rollout status daemonset/calico-node --timeout="${timeout}s" ||
+        { collect_cni_diagnostics "kube-system" "k8s-app=calico-node" "calico-node"; die "Calico node DaemonSet did not become ready"; }
+      kubectl -n kube-system rollout status deployment/calico-kube-controllers --timeout="${timeout}s" ||
+        { collect_cni_diagnostics "kube-system" "k8s-app=calico-kube-controllers" "calico-kube-controllers"; die "Calico controllers did not become ready"; }
       ;;
     flannel)
-      kubectl -n kube-flannel rollout status daemonset/kube-flannel-ds --timeout="${timeout}s" || die "Flannel DaemonSet did not become ready"
+      kubectl -n kube-flannel rollout status daemonset/kube-flannel-ds --timeout="${timeout}s" ||
+        { collect_cni_diagnostics "kube-flannel" "app=flannel" "kube-flannel-ds"; die "Flannel DaemonSet did not become ready"; }
       ;;
     weave)
-      kubectl -n kube-system rollout status daemonset/weave-net --timeout="${timeout}s" || die "Weave DaemonSet did not become ready"
+      kubectl -n kube-system rollout status daemonset/weave-net --timeout="${timeout}s" ||
+        { collect_cni_diagnostics "kube-system" "name=weave-net" "weave-net"; die "Weave DaemonSet did not become ready"; }
       ;;
     *) die "Unknown CNI: ${CNI_PLUGIN}" ;;
   esac
@@ -1270,9 +1302,11 @@ wait_for_cni() {
 }
 
 wait_for_system_pods() {
-  local timeout=300
-  kubectl -n kube-system rollout status deployment/coredns --timeout="${timeout}s" || die "CoreDNS did not become ready"
-  kubectl -n kube-system rollout status daemonset/kube-proxy --timeout="${timeout}s" || die "kube-proxy did not become ready"
+  local timeout=480
+  kubectl -n kube-system rollout status deployment/coredns --timeout="${timeout}s" ||
+    { collect_cni_diagnostics "kube-system" "k8s-app=kube-dns" "coredns"; die "CoreDNS did not become ready"; }
+  kubectl -n kube-system rollout status daemonset/kube-proxy --timeout="${timeout}s" ||
+    { collect_cni_diagnostics "kube-system" "k8s-app=kube-proxy" "kube-proxy"; die "kube-proxy did not become ready"; }
   ok "CoreDNS and kube-proxy are ready"
 }
 
