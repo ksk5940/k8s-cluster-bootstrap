@@ -265,7 +265,7 @@ purge_paths \
 step "4/11" "Remove containerd — packages · config · data · sockets · logs"
 # =============================================================================
 
-if containerd_present; then
+if [[ -z "${RUNTIME}" || "${RUNTIME}" == "containerd" ]] && containerd_present; then
   stop_service containerd
 
   if [[ "${PKG_MGR}" == "apt" ]]; then
@@ -299,6 +299,8 @@ if containerd_present; then
     /usr/sbin/runc
 
   ok "containerd fully removed"
+elif [[ -n "${RUNTIME}" && "${RUNTIME}" != "containerd" ]]; then
+  info "RUNTIME=${RUNTIME} selected — leaving containerd untouched (not removing a runtime you did not select)"
 else
   info "containerd not present on this node — nothing to remove"
 fi
@@ -307,7 +309,7 @@ fi
 step "5/11" "Remove CRI-O — packages · config · data · sockets · logs"
 # =============================================================================
 
-if crio_present; then
+if [[ -z "${RUNTIME}" || "${RUNTIME}" == "crio" ]] && crio_present; then
   # Stop processes and unmount overlay storage BEFORE package removal/path purge.
   cleanup_crio_storage_mounts
 
@@ -354,6 +356,8 @@ if crio_present; then
   fi
   verify_no_mounts_under /var/lib/containers/storage || die "CRI-O storage mounts remain after cleanup"
   [[ ! -e /var/lib/containers/storage ]] || die "CRI-O storage still exists after cleanup"
+elif [[ -n "${RUNTIME}" && "${RUNTIME}" != "crio" ]]; then
+  info "RUNTIME=${RUNTIME} selected — leaving CRI-O untouched (not removing a runtime you did not select)"
 else
   info "CRI-O not present on this node — nothing to remove"
 fi
